@@ -13,7 +13,7 @@ use crate::app::{
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 
-pub fn render(f: &mut Frame, app: &App) {
+pub fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -37,8 +37,8 @@ pub fn render(f: &mut Frame, app: &App) {
     }
     render_status(f, chunks[2], app);
 
-    if let Some(overlay) = &app.overlay {
-        render_overlay(f, app, overlay);
+    if app.overlay.is_some() {
+        render_overlay(f, app);
     }
 }
 
@@ -350,11 +350,42 @@ pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
     Some(lines)
 }
 
+enum FlowItem {
+    Line(Line<'static>),
+    Image { key: String },
+}
+
+enum DisplayRow {
+    Line(Line<'static>),
+    Image { key: String, height: u16 },
+}
+
+impl DisplayRow {
+    fn height(&self) -> u16 {
+        match self {
+            DisplayRow::Line(_) => 1,
+            DisplayRow::Image { height, .. } => (*height).max(1),
+        }
+    }
+}
+
 /// Lines of the open Teams conversation, plus the starting line index of each
 /// message. `selectable` adds the `▶` cursor and selection highlight (off in
 /// copy mode so the text copies cleanly).
 pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, Vec<usize>) {
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let (flow, starts) = conversation_flow(app, selectable);
+    let lines = flow
+        .into_iter()
+        .map(|item| match item {
+            FlowItem::Line(l) => l,
+            FlowItem::Image { .. } => Line::from("[image]"),
+        })
+        .collect();
+    (lines, starts)
+}
+
+fn conversation_flow(app: &App, selectable: bool) -> (Vec<FlowItem>, Vec<usize>) {
+    let mut flow: Vec<FlowItem> = Vec::new();
     let mut starts: Vec<usize> = Vec::with_capacity(app.teams.messages.len());
     // Emit a "Today"/"Yesterday"/date separator whenever the day changes.
     let mut last_day: Option<chrono::NaiveDate> = None;
@@ -369,9 +400,9 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
             let day = when.date_naive();
             if last_day != Some(day) {
                 if last_day.is_some() {
-                    lines.push(Line::from(""));
+                    flow.push(FlowItem::Line(Line::from("")));
                 }
-                lines.push(day_separator(&day_label(day)));
+                flow.push(FlowItem::Line(day_separator(&day_label(day))));
                 last_day = Some(day);
                 day_changed = true;
             }
@@ -379,7 +410,7 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
         // Record the start *after* any separator, so scrolling to a message
         // puts the message itself at the top — the pinned header carries the
         // date, and we avoid showing the same date twice.
-        starts.push(lines.len());
+        starts.push(flow.len());
         let selected = selectable && i == app.teams.msg_sel;
         let marker = if !selectable {
             ""
@@ -406,10 +437,10 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
         };
 
         if m.deleted_date_time.is_some() {
-            lines.push(lead(vec![Span::styled(
+            flow.push(FlowItem::Line(lead(vec![Span::styled(
                 "(message deleted)",
                 Style::default().fg(DIM),
-            )]));
+            )])));
             prev = None; // a deletion breaks the run
             continue;
         }
@@ -443,7 +474,7 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
 
         match (grouped, quote) {
             // Grouped reply: the quote takes the lead line, the text follows.
-            (true, Some(quote)) => lines.push(lead(quote)),
+            (true, Some(quote)) => flow.push(FlowItem::Line(lead(quote))),
             // Grouped message: the text starts right after the time.
             (true, None) => {
                 let first = if body.is_empty() {
@@ -451,11 +482,11 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
                 } else {
                     body.remove(0).spans
                 };
-                lines.push(lead(first));
+                flow.push(FlowItem::Line(lead(first)));
             }
             // New author: name on the lead line, then the quote if there is one.
             (false, quote) => {
-                lines.push(lead(vec![Span::styled(
+                flow.push(FlowItem::Line(lead(vec![Span::styled(
                     author.clone(),
                     Style::default()
                         .fg(if selected {
@@ -464,11 +495,11 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
                             Color::LightGreen
                         })
                         .add_modifier(Modifier::BOLD),
-                )]));
+                )])));
                 if let Some(quote) = quote {
                     let mut spans = vec![Span::raw(gutter.clone())];
                     spans.extend(quote);
-                    lines.push(Line::from(spans));
+                    flow.push(FlowItem::Line(Line::from(spans)));
                 }
             }
         }
@@ -476,25 +507,108 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
         for line in body {
             let mut spans = vec![Span::raw(gutter.clone())];
             spans.extend(line.spans);
-            lines.push(Line::from(spans));
+            flow.push(FlowItem::Line(Line::from(spans)));
         }
         for att in &m.attachments {
             if let Some(name) = &att.name {
-                lines.push(Line::from(vec![
+                flow.push(FlowItem::Line(Line::from(vec![
                     Span::raw(gutter.clone()),
                     Span::styled(format!("📎 {name}"), Style::default().fg(Color::LightBlue)),
-                ]));
+                ])));
+            }
+        }
+        if let Some(imgs) = app.teams.messages_images.get(i) {
+            for img in imgs {
+                let hosted = crate::termimg::hosted_content_id(&img.src);
+                let key = crate::termimg::cache_key(&img.src, hosted);
+                flow.push(FlowItem::Image { key });
             }
         }
         if let Some(reactions) = m.reactions_summary() {
-            lines.push(Line::from(vec![
+            flow.push(FlowItem::Line(Line::from(vec![
                 Span::raw(gutter.clone()),
                 Span::styled(reactions, Style::default().fg(DIM)),
-            ]));
+            ])));
         }
         prev = Some((author, when));
     }
-    (lines, starts)
+    (flow, starts)
+}
+
+fn wrap_flow(app: &App, items: &[FlowItem], width: usize) -> (Vec<DisplayRow>, Vec<usize>) {
+    let mut rows = Vec::new();
+    let mut starts = Vec::with_capacity(items.len());
+    for item in items {
+        starts.push(display_row_count(&rows));
+        match item {
+            FlowItem::Line(l) => {
+                for row in crate::wrap::wrap_line(l, width) {
+                    rows.push(DisplayRow::Line(row));
+                }
+            }
+            FlowItem::Image { key } => rows.push(DisplayRow::Image {
+                key: key.clone(),
+                height: app.image_display_rows(key),
+            }),
+        }
+    }
+    (rows, starts)
+}
+
+fn display_row_count(rows: &[DisplayRow]) -> usize {
+    rows.iter().map(|r| r.height() as usize).sum()
+}
+
+fn render_display_rows(
+    f: &mut Frame,
+    area: ratatui::layout::Rect,
+    rows: &[DisplayRow],
+    scroll: u16,
+    app: &mut App,
+) {
+    let mut y_off = 0u16;
+    for row in rows {
+        let h = row.height();
+        let start = y_off;
+        y_off = y_off.saturating_add(h);
+        if y_off <= scroll || start >= scroll.saturating_add(area.height) {
+            continue;
+        }
+        if start < scroll {
+            continue;
+        }
+        let dest_y = area.y + (start - scroll);
+        if dest_y >= area.bottom() {
+            break;
+        }
+        let draw_h = h.min(area.bottom().saturating_sub(dest_y));
+        let dest = ratatui::layout::Rect {
+            x: area.x,
+            y: dest_y,
+            width: area.width,
+            height: draw_h,
+        };
+        match row {
+            DisplayRow::Line(l) => {
+                f.render_widget(Paragraph::new(l.clone()), dest);
+            }
+            DisplayRow::Image { key, .. } => {
+                if let Some(img) = app.image_cache.get_mut(key) {
+                    crate::termimg::render(f, dest, img);
+                } else {
+                    let label = if app.image_loading.contains(key) {
+                        "  [image…]"
+                    } else {
+                        "  [image unavailable]"
+                    };
+                    f.render_widget(
+                        Paragraph::new(Span::styled(label, Style::default().fg(DIM))),
+                        dest,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Width of the `HH:MM` timestamp column.
@@ -525,7 +639,7 @@ const RUN_GAP_MINUTES: i64 = 15;
 // Teams
 // ---------------------------------------------------------------------------
 
-fn render_teams(f: &mut Frame, area: Rect, app: &App) {
+fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(32), Constraint::Min(20)])
@@ -579,41 +693,42 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     let composer_rows = app.teams.composer.wrap(composer_width).len().clamp(1, 6) as u16;
     // One extra row while a reply is being composed, for the quoted banner.
     let reply_row = u16::from(app.teams.replying_to.is_some());
-    let staged_row = u16::from(!app.teams.images.is_empty());
+    let preview_h = composer_preview_height(app);
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
-            Constraint::Length(composer_rows + reply_row + staged_row + 2),
+            Constraint::Length(composer_rows + reply_row + preview_h + 2),
         ])
         .split(cols[1]);
 
     let focused = app.teams.focus == TeamsFocus::Messages;
-    let (mut lines, msg_starts) = conversation_lines(app, focused);
-    if lines.is_empty() {
-        lines.push(Line::styled(
+    let (mut flow, msg_starts) = conversation_flow(app, focused);
+    if flow.is_empty() {
+        flow.push(FlowItem::Line(Line::styled(
             "Select a conversation and press Enter.",
             Style::default().fg(DIM),
-        ));
+        )));
     }
     // Wrap here rather than letting `Paragraph` do it: scrolling needs the exact
     // row count, and `Paragraph` won't report one. Estimating it undercounts —
     // words don't fill a row — which left the newest messages below the edge.
     let inner_w = right[0].width.saturating_sub(2).max(1) as usize;
     let pane_h = right[0].height.saturating_sub(3).max(1) as usize; // borders + date header
-    let (rows, row_of_line) = crate::wrap::wrap_all(&lines, inner_w);
+    let (rows, row_of_item) = wrap_flow(app, &flow, inner_w);
+    let total_h = display_row_count(&rows);
     // Where each message begins, in rendered rows.
     let msg_rows: Vec<usize> = msg_starts
         .iter()
-        .map(|&l| row_of_line.get(l).copied().unwrap_or(rows.len()))
+        .map(|&l| row_of_item.get(l).copied().unwrap_or(total_h))
         .collect();
     let sel_end = msg_rows
         .get(app.teams.msg_sel + 1)
         .copied()
-        .unwrap_or(rows.len());
+        .unwrap_or(total_h);
     let scroll = sel_end
         .saturating_sub(pane_h)
-        .min(rows.len().saturating_sub(pane_h)) as u16;
+        .min(total_h.saturating_sub(pane_h)) as u16;
     // Flag messages that arrived while the user was reading further back.
     let title = if app.teams.unseen > 0 {
         format!("Conversation — ▼ {} new (g to jump)", app.teams.unseen)
@@ -637,8 +752,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     if let Some(label) = sticky_day_label(app, &msg_rows, scroll) {
         f.render_widget(Paragraph::new(day_separator(&label)), pane[0]);
     }
-    // Already wrapped, so no `Wrap` here — the rows are exactly what's drawn.
-    f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), pane[1]);
+    render_display_rows(f, pane[1], &rows, scroll, app);
 
     let composing = app.teams.focus == TeamsFocus::Composer;
     let title = if composing {
@@ -683,36 +797,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         );
     }
 
-    if !app.teams.images.is_empty() {
-        let banner = Rect {
-            height: 1,
-            ..composer_inner
-        };
-        composer_inner = Rect {
-            y: composer_inner.y + 1,
-            height: composer_inner.height.saturating_sub(1),
-            ..composer_inner
-        };
-        let names: Vec<String> = app
-            .teams
-            .images
-            .iter()
-            .map(|img| {
-                format!(
-                    "📎 {} ({})",
-                    img.name,
-                    crate::images::human_size(img.bytes.len() as u64)
-                )
-            })
-            .collect();
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                truncate(&names.join(" · "), composer_inner.width as usize),
-                Style::default().fg(Color::LightBlue),
-            )),
-            banner,
-        );
-    }
+    render_composer_previews(f, &mut composer_inner, app);
 
     app.text_width_hint
         .set(composer_inner.width.max(1) as usize);
@@ -734,7 +819,86 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 // Overlays
 // ---------------------------------------------------------------------------
 
-fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
+fn composer_preview_height(app: &App) -> u16 {
+    if app.teams.images.is_empty() {
+        return 0;
+    }
+    if app.teams.composer_previews.is_empty() {
+        return app.teams.images.len() as u16;
+    }
+    app.teams
+        .composer_previews
+        .iter()
+        .map(|p| p.as_ref().map(|img| img.rows).unwrap_or(1))
+        .sum()
+}
+
+fn render_composer_previews(f: &mut Frame, composer_inner: &mut Rect, app: &mut App) {
+    if app.teams.images.is_empty() {
+        return;
+    }
+    if app.teams.composer_previews.is_empty() {
+        let n = app.teams.images.len() as u16;
+        let banner = Rect {
+            height: n.min(composer_inner.height),
+            ..*composer_inner
+        };
+        *composer_inner = Rect {
+            y: composer_inner.y + banner.height,
+            height: composer_inner.height.saturating_sub(banner.height),
+            ..*composer_inner
+        };
+        let labels: Vec<Line> = app
+            .teams
+            .images
+            .iter()
+            .map(|img| {
+                Line::from(Span::styled(
+                    format!("[image unavailable] {}", img.name),
+                    Style::default().fg(DIM),
+                ))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(labels), banner);
+        return;
+    }
+    let n = app.teams.composer_previews.len();
+    for i in 0..n {
+        let rows = app.teams.composer_previews[i]
+            .as_ref()
+            .map(|img| img.rows)
+            .unwrap_or(1)
+            .min(composer_inner.height);
+        if rows == 0 {
+            break;
+        }
+        let dest = Rect {
+            height: rows,
+            ..*composer_inner
+        };
+        *composer_inner = Rect {
+            y: composer_inner.y + rows,
+            height: composer_inner.height.saturating_sub(rows),
+            ..*composer_inner
+        };
+        if let Some(img) = app.teams.composer_previews[i].as_mut() {
+            crate::termimg::render(f, dest, img);
+        } else {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "[image unavailable]",
+                    Style::default().fg(DIM),
+                )),
+                dest,
+            );
+        }
+    }
+}
+
+fn render_overlay(f: &mut Frame, app: &App) {
+    let Some(overlay) = &app.overlay else {
+        return;
+    };
     match overlay {
         Overlay::Help => {
             let area = centered(60, 60, f.area());

@@ -24,6 +24,15 @@ const CODE_BG: Color = Color::Rgb(40, 40, 52);
 pub struct RenderedBody {
     pub text: Text<'static>,
     pub links: Vec<String>,
+    /// `<img>` tags, in document order. Pixel rendering happens elsewhere.
+    pub images: Vec<BodyImage>,
+}
+
+/// An image referenced from a message body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyImage {
+    pub alt: String,
+    pub src: String,
 }
 
 /// Render a Graph body to styled text. HTML is parsed and walked; plain text is
@@ -42,6 +51,7 @@ pub fn render_body(content_type: Option<&str>, raw: &str) -> RenderedBody {
                     .collect::<Vec<_>>(),
             ),
             links: Vec::new(),
+            images: Vec::new(),
         }
     }
 }
@@ -61,9 +71,11 @@ pub fn render_html(html: &str) -> RenderedBody {
     let mut r = Renderer::default();
     r.walk(&dom.document, Style::default());
     let links = r.links.clone();
+    let images = r.images.clone();
     RenderedBody {
         text: r.finish(),
         links,
+        images,
     }
 }
 
@@ -79,6 +91,7 @@ struct Renderer {
     /// Link targets in numbering order; the inline text shows `[n]` instead of
     /// the URL, which keeps huge Safelinks out of the reading flow.
     links: Vec<String>,
+    images: Vec<BodyImage>,
 }
 
 impl Renderer {
@@ -301,8 +314,10 @@ impl Renderer {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .unwrap_or("image");
-                self.push_text(&format!("[{label}]"), style.fg(DIM));
+                    .unwrap_or("image")
+                    .to_string();
+                let src = attr(attrs, "src").unwrap_or_default();
+                self.images.push(BodyImage { alt: label, src });
             }
             "tr" => {
                 self.walk_children(node, style);
@@ -449,6 +464,20 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn collects_img_tags_without_embedding_bytes() {
+        let out = render_html(
+            "<p>hi <img alt=\"shot.png\" src=\"../hostedContents/1/$value\"> there</p>",
+        );
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].alt, "shot.png");
+        assert_eq!(out.images[0].src, "../hostedContents/1/$value");
+        let s = flat(&out.text);
+        assert!(s.contains("hi"));
+        assert!(s.contains("there"));
+        assert!(!s.contains("hostedContents"));
     }
 
     #[test]

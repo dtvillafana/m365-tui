@@ -81,6 +81,14 @@ pub enum AppMessage {
         name: String,
         bytes: Vec<u8>,
     },
+    /// Bytes of a Teams hosted image, ready to decode.
+    HostedImage {
+        key: String,
+        bytes: Vec<u8>,
+    },
+    HostedImageFailed {
+        key: String,
+    },
     /// Push-notification health, for the status bar.
     Push(PushState),
     /// Lightweight timer: refresh memory usage and expire stale status text.
@@ -356,6 +364,8 @@ pub struct TeamsState {
     pub messages_rendered: Vec<Text<'static>>,
     /// Links per message, index-aligned with `messages`.
     pub messages_links: Vec<Vec<String>>,
+    /// Inline images per message, index-aligned with `messages`.
+    pub messages_images: Vec<Vec<content::BodyImage>>,
     /// Selected message index in the conversation pane (drives scroll + react).
     pub msg_sel: usize,
     /// `@odata.nextLink` for older messages in the open conversation.
@@ -371,6 +381,8 @@ pub struct TeamsState {
     pub composer: TextInput,
     /// Clipboard / data-URI images staged for the next send.
     pub images: Vec<crate::images::InlineImage>,
+    /// Pixel previews for `images`, when the terminal can draw them.
+    pub composer_previews: Vec<Option<crate::termimg::ReadyImage>>,
     /// True while a send is in flight, so Enter cannot fire twice.
     pub sending: bool,
     /// Composer snapshot to restore if the in-flight send fails.
@@ -391,6 +403,7 @@ impl Default for TeamsState {
             messages: Vec::new(),
             messages_rendered: Vec::new(),
             messages_links: Vec::new(),
+            messages_images: Vec::new(),
             msg_sel: 0,
             messages_next: None,
             loading_more: false,
@@ -400,6 +413,7 @@ impl Default for TeamsState {
             open_channel: None,
             composer: TextInput::new(),
             images: Vec::new(),
+            composer_previews: Vec::new(),
             sending: false,
             pending_restore: None,
             focus: TeamsFocus::List,
@@ -451,6 +465,11 @@ pub struct App {
     pub copy_mode: bool,
     pub copy_scroll: u16,
     pub should_quit: bool,
+    /// Terminal graphics protocol, if the terminal can draw pixels.
+    pub graphics: Option<crate::termimg::Graphics>,
+    pub image_cache: std::collections::HashMap<String, crate::termimg::ReadyImage>,
+    pub image_loading: std::collections::HashSet<String>,
+    pub image_failed: std::collections::HashSet<String>,
 }
 
 /// Palette command identifiers.
@@ -493,7 +512,19 @@ impl App {
             copy_mode: false,
             copy_scroll: 0,
             should_quit: false,
+            graphics: None,
+            image_cache: std::collections::HashMap::new(),
+            image_loading: std::collections::HashSet::new(),
+            image_failed: std::collections::HashSet::new(),
         }
+    }
+
+    pub fn set_graphics(&mut self, graphics: Option<crate::termimg::Graphics>) {
+        self.graphics = graphics;
+    }
+
+    pub fn image_display_rows(&self, key: &str) -> u16 {
+        self.image_cache.get(key).map(|img| img.rows).unwrap_or(1)
     }
 
     /// Kick off the initial data loads.
@@ -981,6 +1012,7 @@ impl App {
                     if self.teams.composer.is_empty() && self.teams.images.is_empty() {
                         self.teams.composer = TextInput::from(text.as_str());
                         self.teams.images = images;
+                        self.rebuild_composer_previews();
                     }
                 }
                 self.status = format!("error: {}", m365_core::util::graph_error_summary(&e));
@@ -1032,6 +1064,25 @@ impl App {
                         .filter(|a| !a.is_inline.unwrap_or(false))
                         .collect();
                 }
+            }
+            AppMessage::HostedImage { key, bytes } => {
+                self.image_loading.remove(&key);
+                let decoded = self
+                    .graphics
+                    .as_ref()
+                    .and_then(|g| g.decode(&bytes, crate::termimg::CONVO_IMAGE_ROWS).ok());
+                match decoded {
+                    Some(img) => {
+                        self.image_cache.insert(key, img);
+                    }
+                    None => {
+                        self.image_failed.insert(key);
+                    }
+                }
+            }
+            AppMessage::HostedImageFailed { key } => {
+                self.image_loading.remove(&key);
+                self.image_failed.insert(key);
             }
             AppMessage::Downloaded { name, bytes } => {
                 let size = bytes.len();
@@ -1222,7 +1273,9 @@ impl App {
                 links
             })
             .collect();
+        self.teams.messages_images = rendered.iter().map(|r| r.images.clone()).collect();
         self.teams.messages_rendered = rendered.into_iter().map(|r| r.text).collect();
+        self.fetch_message_images();
 
         let last = self.teams.messages.len().saturating_sub(1);
         self.teams.msg_sel = match mode {
@@ -1868,6 +1921,7 @@ impl App {
                     self.teams.messages.clear();
                     self.teams.messages_rendered.clear();
                     self.teams.messages_links.clear();
+                    self.teams.messages_images.clear();
                     self.teams.msg_sel = 0;
                     self.teams.messages_next = None;
                     self.teams.loading_more = false;
@@ -1893,6 +1947,7 @@ impl App {
                     self.teams.messages.clear();
                     self.teams.messages_rendered.clear();
                     self.teams.messages_links.clear();
+                    self.teams.messages_images.clear();
                     self.teams.msg_sel = 0;
                     self.teams.messages_next = None;
                     self.teams.loading_more = false;
@@ -1928,6 +1983,7 @@ impl App {
         self.teams.pending_restore = Some((text, staged));
         self.teams.composer.clear();
         self.teams.images.clear();
+        self.teams.composer_previews.clear();
         self.teams.sending = true;
         let replying_to = self.teams.replying_to.take();
         self.status = match n_images {
@@ -2003,6 +2059,7 @@ impl App {
         if let Some((text, images)) = self.teams.pending_restore.take() {
             self.teams.composer = TextInput::from(text.as_str());
             self.teams.images = images;
+            self.rebuild_composer_previews();
         }
     }
 
@@ -2053,12 +2110,81 @@ impl App {
             img.name,
             crate::images::human_size(img.bytes.len() as u64)
         );
+        let preview = self.graphics.as_ref().and_then(|g| {
+            g.decode(&img.bytes, crate::termimg::COMPOSER_IMAGE_ROWS)
+                .ok()
+        });
         self.teams.images.push(img);
+        if self.graphics.is_some() {
+            self.teams.composer_previews.push(preview);
+        }
     }
 
     fn unstage_teams_image(&mut self) {
         if let Some(img) = self.teams.images.pop() {
+            self.teams.composer_previews.pop();
             self.status = format!("removed {}", img.name);
+        }
+    }
+
+    fn rebuild_composer_previews(&mut self) {
+        self.teams.composer_previews = match &self.graphics {
+            Some(g) => self
+                .teams
+                .images
+                .iter()
+                .map(|img| {
+                    g.decode(&img.bytes, crate::termimg::COMPOSER_IMAGE_ROWS)
+                        .ok()
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+    }
+
+    fn fetch_message_images(&mut self) {
+        if self.graphics.is_none() {
+            return;
+        }
+        let chat = self.teams.open_chat_id.clone();
+        let channel = self.teams.open_channel.clone();
+        let jobs: Vec<(String, String)> = self
+            .teams
+            .messages
+            .iter()
+            .zip(self.teams.messages_images.iter())
+            .flat_map(|(msg, imgs)| {
+                let chat = chat.clone();
+                let channel = channel.clone();
+                imgs.iter().filter_map(move |img| {
+                    let hosted = crate::termimg::hosted_content_id(&img.src);
+                    let key = crate::termimg::cache_key(&img.src, hosted);
+                    let path = crate::termimg::fetch_path(
+                        &img.src,
+                        hosted,
+                        &msg.id,
+                        chat.as_deref(),
+                        channel.as_ref(),
+                    )?;
+                    Some((key, path))
+                })
+            })
+            .collect();
+        for (key, path) in jobs {
+            if self.image_cache.contains_key(&key)
+                || self.image_failed.contains(&key)
+                || self.image_loading.contains(&key)
+            {
+                continue;
+            }
+            self.image_loading.insert(key.clone());
+            let s = self.session.clone();
+            self.spawn(async move {
+                match s.graph.get_bytes(&path).await {
+                    Ok(bytes) => Ok(AppMessage::HostedImage { key, bytes }),
+                    Err(_) => Ok(AppMessage::HostedImageFailed { key }),
+                }
+            });
         }
     }
 

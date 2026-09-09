@@ -194,13 +194,18 @@ Graph has no “attach this file to a chat message” upload. Images are sent as
 `<img alt="…" src="../hostedContents/{id}/$value">` and a matching
 `hostedContents` entry holding base64 bytes and a `@microsoft.graph.temporaryId`.
 
-The composer collects them in two ways: `Ctrl+V` reads `image/*` from
-`wl-paste`/`xclip` (bracketed paste is UTF-8 text, so it only becomes an image
-when the paste is a `data:image/…;base64,` URI), and `@path` tokens that look
+The composer collects them in two ways: `Ctrl+V` reads `image/*` bytes from
+`wl-paste`, then `xclip` if that helper is missing, errors, or has no image
+(crossterm's bracketed paste is lossy UTF-8, so it cannot carry PNG/JPEG
+bytes; a `data:image/…;base64,` URI still works), and `@path` tokens that look
 like filesystem paths (`@~/…`, `@./…`, `@/…`, or anything containing `/`).
 `Tab` completes those tokens; spaces in the path are backslash-escaped.
 Non-images are rejected. Arbitrary files would need a OneDrive/SharePoint
 upload and `Files.ReadWrite`, which this path does not request.
+
+Incoming `<img>` tags are fetched from Graph (`…/hostedContents/{id}/$value`)
+and drawn with Kitty, Sixel, or iTerm2 via `ratatui-image`. Half-block /
+ASCII fallbacks are not used.
 
 ## Rendering message bodies
 

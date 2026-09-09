@@ -22,7 +22,7 @@ const IMAGE_TYPES: &[&str] = &[
     "image/webp",
 ];
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ImagePasteError {
     /// Neither `wl-paste` nor `xclip` is available.
     NoHelper,
@@ -84,7 +84,20 @@ fn via_osc52(text: &str) -> Result<()> {
     Ok(())
 }
 
-enum Probe {
+/// Read an image from the system clipboard, if one is there.
+///
+/// `wl-paste` is tried first; if it is missing, errors, or has no image,
+/// `xclip` is tried next. Failure is only reported after both have been tried.
+pub fn image_bytes() -> Result<(String, Vec<u8>), ImagePasteError> {
+    let wl = from_wl_paste();
+    if let Probe::Image(mime, bytes) = wl {
+        return Ok((mime, bytes));
+    }
+    combine_probes(wl, from_xclip())
+}
+
+#[derive(Debug)]
+pub(crate) enum Probe {
     /// Binary not installed.
     Missing,
     /// Helper ran but the clipboard has no image (or an empty one).
@@ -93,21 +106,35 @@ enum Probe {
     Failed(String),
 }
 
-/// Read an image from the system clipboard, if one is there.
-pub fn image_bytes() -> Result<(String, Vec<u8>), ImagePasteError> {
-    let mut saw_helper = false;
-    for probe in [from_wl_paste, from_xclip] {
-        match probe() {
-            Probe::Missing => {}
-            Probe::Empty => saw_helper = true,
-            Probe::Image(mime, bytes) => return Ok((mime, bytes)),
-            Probe::Failed(e) => return Err(ImagePasteError::Failed(e)),
-        }
+pub(crate) fn combine_probes(
+    wl: Probe,
+    xclip: Probe,
+) -> Result<(String, Vec<u8>), ImagePasteError> {
+    if let Probe::Image(mime, bytes) = wl {
+        return Ok((mime, bytes));
     }
-    if saw_helper {
+    if let Probe::Image(mime, bytes) = xclip {
+        return Ok((mime, bytes));
+    }
+    let wl_missing = matches!(wl, Probe::Missing);
+    let x_missing = matches!(xclip, Probe::Missing);
+    if wl_missing && x_missing {
+        return Err(ImagePasteError::NoHelper);
+    }
+    if matches!(wl, Probe::Empty) || matches!(xclip, Probe::Empty) {
+        return Err(ImagePasteError::NoImage);
+    }
+    let mut parts = Vec::new();
+    if let Probe::Failed(e) = wl {
+        parts.push(format!("wl-paste: {e}"));
+    }
+    if let Probe::Failed(e) = xclip {
+        parts.push(format!("xclip: {e}"));
+    }
+    if parts.is_empty() {
         Err(ImagePasteError::NoImage)
     } else {
-        Err(ImagePasteError::NoHelper)
+        Err(ImagePasteError::Failed(parts.join("; ")))
     }
 }
 
@@ -167,5 +194,84 @@ fn run_stdout(bin: &str, args: &[&str]) -> Option<Result<Vec<u8>, String>> {
         Ok(st) if st.success() => Some(Ok(buf)),
         Ok(_) => Some(Err(format!("{bin} exited with an error"))),
         Err(e) => Some(Err(format!("{bin}: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xclip_is_used_when_wl_paste_fails() {
+        let got = combine_probes(
+            Probe::Failed("no wayland".into()),
+            Probe::Image("image/png".into(), b"\x89PNG".to_vec()),
+        )
+        .unwrap();
+        assert_eq!(got.0, "image/png");
+        assert_eq!(got.1, b"\x89PNG");
+    }
+
+    #[test]
+    fn xclip_is_used_when_wl_paste_is_missing() {
+        let got = combine_probes(
+            Probe::Missing,
+            Probe::Image("image/jpeg".into(), vec![0xFF, 0xD8, 0xFF]),
+        )
+        .unwrap();
+        assert_eq!(got.0, "image/jpeg");
+    }
+
+    #[test]
+    fn xclip_is_used_when_wl_paste_has_no_image() {
+        let got = combine_probes(
+            Probe::Empty,
+            Probe::Image("image/png".into(), b"png".to_vec()),
+        )
+        .unwrap();
+        assert_eq!(got.1, b"png");
+    }
+
+    #[test]
+    fn no_helper_only_when_both_are_missing() {
+        assert_eq!(
+            combine_probes(Probe::Missing, Probe::Missing).unwrap_err(),
+            ImagePasteError::NoHelper
+        );
+    }
+
+    #[test]
+    fn no_image_when_a_helper_ran_and_found_none() {
+        assert_eq!(
+            combine_probes(Probe::Empty, Probe::Missing).unwrap_err(),
+            ImagePasteError::NoImage
+        );
+        assert_eq!(
+            combine_probes(Probe::Failed("err".into()), Probe::Empty).unwrap_err(),
+            ImagePasteError::NoImage
+        );
+    }
+
+    #[test]
+    fn combines_failures_from_both_helpers() {
+        let err = combine_probes(Probe::Failed("wayland".into()), Probe::Failed("x11".into()))
+            .unwrap_err();
+        match err {
+            ImagePasteError::Failed(s) => {
+                assert!(s.contains("wl-paste"), "{s}");
+                assert!(s.contains("xclip"), "{s}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wl_paste_success_does_not_need_xclip() {
+        let got = combine_probes(
+            Probe::Image("image/gif".into(), b"GIF89a".to_vec()),
+            Probe::Failed("should not be used".into()),
+        )
+        .unwrap();
+        assert_eq!(got.0, "image/gif");
     }
 }

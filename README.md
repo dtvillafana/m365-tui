@@ -231,12 +231,17 @@ field, type a file path (`~` works) and press `Enter` to stage it. `Ctrl+X`
 removes the last one. Files over 3 MB upload in chunks automatically; Graph's
 own ceiling is 150 MB per message.
 
-**Images in Teams.** Paste an image with `Ctrl+V` (needs `wl-paste` or `xclip`
-on the local machine — a terminal cannot receive raw image bytes). A pasted
-`data:image/png;base64,…` URI is decoded too. Type `@~/Pictures/shot.png` in
-the composer and press `Tab` to complete paths; spaces are written as `\ `
-(`@/tmp/My\ Image.png`). PNG, JPEG, GIF and WebP only, 3 MB total. Non-image
-paths are rejected. `Ctrl+X` removes the last pasted image.
+**Images in Teams.** Paste an image with `Ctrl+V`. That reads real `image/*`
+bytes from the clipboard via `wl-paste`, then `xclip` if Wayland paste fails.
+A pasted `data:image/png;base64,…` URI is decoded too. Type
+`@~/Pictures/shot.png` in the composer and press `Tab` to complete paths;
+spaces are written as `\ ` (`@/tmp/My\ Image.png`). PNG, JPEG, GIF and WebP
+only, 3 MB total. Non-image paths are rejected. `Ctrl+X` removes the last
+pasted image.
+
+Inline images are drawn with the terminal's graphics protocol (Kitty, Sixel,
+or iTerm2). Terminals without one show `[image unavailable]` instead of
+Unicode art.
 
 **Saving attachments.** Messages with attachments show 📎. Press `A`, then a
 number, to save to your Downloads folder. Files are never overwritten.

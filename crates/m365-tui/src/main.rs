@@ -20,6 +20,7 @@ mod images;
 mod navigation;
 mod notify;
 mod opener;
+mod termimg;
 mod ui;
 mod wrap;
 
@@ -195,8 +196,10 @@ async fn run_tui(session: Session) -> Result<()> {
     let mut app = App::new(session, tx);
     app.bootstrap();
 
-    // Terminal setup.
+    // Terminal setup. Query graphics *after* raw mode so DA1 replies are
+    // readable, but *before* the alternate screen so the query isn't lost.
     enable_raw_mode()?;
+    app.set_graphics(crate::termimg::Graphics::detect());
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
