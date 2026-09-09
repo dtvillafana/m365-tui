@@ -4,8 +4,9 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::graph::{DeltaPage, GraphClient};
-use crate::util::html_escape;
+use crate::hosted::{images_of, outgoing_payload, with_hosted_contents, OutgoingBody};
 use crate::models::{Chat, ChatMessage};
+use crate::util::html_escape;
 
 /// List the signed-in user's chats, most-recently-updated first, with member
 /// names and a last-message preview expanded for display.
@@ -49,11 +50,17 @@ pub async fn delta_messages(
     graph.delta(&path).await
 }
 
-/// Send a plain-text message to a chat.
-pub async fn send_message(graph: &GraphClient, chat_id: &str, text: &str) -> Result<ChatMessage> {
-    let payload = json!({ "body": { "contentType": "text", "content": text } });
+/// Send a message to a chat — plain text, or HTML with inline images.
+pub async fn send_message(
+    graph: &GraphClient,
+    chat_id: &str,
+    body: OutgoingBody<'_>,
+) -> Result<ChatMessage> {
     graph
-        .post_json(&format!("me/chats/{chat_id}/messages"), &payload)
+        .post_json(
+            &format!("me/chats/{chat_id}/messages"),
+            &outgoing_payload(body),
+        )
         .await
 }
 
@@ -67,10 +74,12 @@ pub async fn send_reply(
     graph: &GraphClient,
     chat_id: &str,
     original: &ChatMessage,
-    text: &str,
+    body: OutgoingBody<'_>,
 ) -> Result<ChatMessage> {
     let message_id = &original.id;
     let preview: String = original.text_preview(250);
+    let inner = body.inner_html();
+    let images = images_of(body);
     let sender = json!({
         "user": {
             "userIdentityType": "aadUser",
@@ -85,20 +94,22 @@ pub async fn send_reply(
     })
     .to_string();
 
-    let payload = json!({
-        "body": {
-            "contentType": "html",
-            "content": format!(
-                "<attachment id=\"{message_id}\"></attachment><p>{}</p>",
-                html_escape(text)
-            ),
-        },
-        "attachments": [{
-            "id": message_id,
-            "contentType": "messageReference",
-            "content": reference,
-        }],
-    });
+    let payload = with_hosted_contents(
+        json!({
+            "body": {
+                "contentType": "html",
+                "content": format!(
+                    "<attachment id=\"{message_id}\"></attachment><p>{inner}</p>",
+                ),
+            },
+            "attachments": [{
+                "id": message_id,
+                "contentType": "messageReference",
+                "content": reference,
+            }],
+        }),
+        images,
+    );
 
     match graph
         .post_json(&format!("me/chats/{chat_id}/messages"), &payload)
@@ -110,15 +121,17 @@ pub async fn send_reply(
         Err(e) => {
             tracing::warn!("native reply rejected, sending as a quote instead: {e:#}");
             let quoted = format!(
-                "<blockquote><b>{}</b><br>{}</blockquote><p>{}</p>",
+                "<blockquote><b>{}</b><br>{}</blockquote><p>{inner}</p>",
                 html_escape(&original.author()),
                 html_escape(&preview),
-                html_escape(text),
             );
             graph
                 .post_json(
                     &format!("me/chats/{chat_id}/messages"),
-                    &json!({ "body": { "contentType": "html", "content": quoted } }),
+                    &outgoing_payload(OutgoingBody::Html {
+                        html: &quoted,
+                        images,
+                    }),
                 )
                 .await
         }

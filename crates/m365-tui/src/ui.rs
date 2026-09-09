@@ -3,13 +3,11 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{
-    filter_commands, App, Compose, Overlay, OutlookFocus, PushState, Screen, TeamsFocus, TeamsMode,
+    filter_commands, App, Compose, OutlookFocus, Overlay, PushState, Screen, TeamsFocus, TeamsMode,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -55,7 +53,10 @@ fn render_copy_mode(f: &mut Frame, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " COPY MODE — drag to select · y yank all · j/k scroll · z/Esc exit ",
-            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
         ))),
         rows[0],
     );
@@ -79,7 +80,10 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         if active {
             Span::styled(
                 format!(" {name} "),
-                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled(format!(" {name} "), Style::default().fg(DIM))
@@ -188,7 +192,7 @@ fn context_hints(app: &App) -> &'static str {
         Screen::Teams => match app.teams.focus {
             TeamsFocus::List => "j/k move · l open · t chats/channels",
             TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
-            TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
+            TeamsFocus::Composer => "Enter send · Ctrl+V image · @path Tab · Esc leave",
         },
     }
 }
@@ -239,7 +243,11 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         .map(|m| {
             let unread = !m.is_read.unwrap_or(true);
             let marker = if unread { "●" } else { " " };
-            let clip = if m.has_attachments.unwrap_or(false) { "📎" } else { "" };
+            let clip = if m.has_attachments.unwrap_or(false) {
+                "📎"
+            } else {
+                ""
+            };
             let subject = m.subject.clone().unwrap_or_else(|| "(no subject)".into());
             let line = Line::from(vec![
                 Span::styled(format!("{marker} "), Style::default().fg(ACCENT)),
@@ -269,7 +277,11 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         format!("Messages ({})", app.outlook.messages.len())
     };
     f.render_stateful_widget(
-        selectable_list(msgs, &msg_title, app.outlook_focus == OutlookFocus::Messages),
+        selectable_list(
+            msgs,
+            &msg_title,
+            app.outlook_focus == OutlookFocus::Messages,
+        ),
         cols[1],
         &mut mstate,
     );
@@ -324,7 +336,13 @@ pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
             .iter()
             .map(|a| format!("{} ({})", a.display_name(), a.human_size()))
             .collect();
-        lines.insert(3, kv("Attach", &format!("📎 {}  — press A to save", names.join(", "))));
+        lines.insert(
+            3,
+            kv(
+                "Attach",
+                &format!("📎 {}  — press A to save", names.join(", ")),
+            ),
+        );
     }
     if let Some(body) = &app.outlook.reading_body {
         lines.extend(body.lines.iter().cloned());
@@ -440,7 +458,11 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
                 lines.push(lead(vec![Span::styled(
                     author.clone(),
                     Style::default()
-                        .fg(if selected { Color::Cyan } else { Color::LightGreen })
+                        .fg(if selected {
+                            Color::Cyan
+                        } else {
+                            Color::LightGreen
+                        })
                         .add_modifier(Modifier::BOLD),
                 )]));
                 if let Some(quote) = quote {
@@ -460,10 +482,7 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
             if let Some(name) = &att.name {
                 lines.push(Line::from(vec![
                     Span::raw(gutter.clone()),
-                    Span::styled(
-                        format!("📎 {name}"),
-                        Style::default().fg(Color::LightBlue),
-                    ),
+                    Span::styled(format!("📎 {name}"), Style::default().fg(Color::LightBlue)),
                 ]));
             }
         }
@@ -560,11 +579,12 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     let composer_rows = app.teams.composer.wrap(composer_width).len().clamp(1, 6) as u16;
     // One extra row while a reply is being composed, for the quoted banner.
     let reply_row = u16::from(app.teams.replying_to.is_some());
+    let staged_row = u16::from(!app.teams.images.is_empty());
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
-            Constraint::Length(composer_rows + reply_row + 2),
+            Constraint::Length(composer_rows + reply_row + staged_row + 2),
         ])
         .split(cols[1]);
 
@@ -622,7 +642,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 
     let composing = app.teams.focus == TeamsFocus::Composer;
     let title = if composing {
-        "Message (Enter send · Shift/Alt+Enter newline)"
+        "Message (Enter send · Ctrl+V image · @path Tab)"
     } else {
         "Message"
     };
@@ -632,7 +652,10 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 
     // Show what's being replied to, so the quote isn't a surprise on send.
     if let Some(idx) = app.teams.replying_to {
-        let banner = Rect { height: 1, ..composer_inner };
+        let banner = Rect {
+            height: 1,
+            ..composer_inner
+        };
         composer_inner = Rect {
             y: composer_inner.y + 1,
             height: composer_inner.height.saturating_sub(1),
@@ -660,9 +683,40 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         );
     }
 
+    if !app.teams.images.is_empty() {
+        let banner = Rect {
+            height: 1,
+            ..composer_inner
+        };
+        composer_inner = Rect {
+            y: composer_inner.y + 1,
+            height: composer_inner.height.saturating_sub(1),
+            ..composer_inner
+        };
+        let names: Vec<String> = app
+            .teams
+            .images
+            .iter()
+            .map(|img| {
+                format!(
+                    "📎 {} ({})",
+                    img.name,
+                    crate::images::human_size(img.bytes.len() as u64)
+                )
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                truncate(&names.join(" · "), composer_inner.width as usize),
+                Style::default().fg(Color::LightBlue),
+            )),
+            banner,
+        );
+    }
+
     app.text_width_hint
         .set(composer_inner.width.max(1) as usize);
-    if app.teams.composer.is_empty() && !composing {
+    if app.teams.composer.is_empty() && app.teams.images.is_empty() && !composing {
         f.render_widget(
             Paragraph::new(Span::styled(
                 "press i to type · Enter to send",
@@ -670,8 +724,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             )),
             composer_inner,
         );
-    } else if let Some((x, y)) =
-        render_text_area(f, composer_inner, &app.teams.composer, composing)
+    } else if let Some((x, y)) = render_text_area(f, composer_inner, &app.teams.composer, composing)
     {
         f.set_cursor_position((x, y));
     }
@@ -705,7 +758,8 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
           / search · g calendar · in the reading pane j/k scroll\n\
  \n\
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
-          i type message · r reply to selected · Enter send\n\
+          i type · r reply · Enter send · Ctrl+V paste image\n\
+          @path Tab complete image · Ctrl+X remove last image\n\
  \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
@@ -714,7 +768,9 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  \n\
  Press Esc to close.";
             f.render_widget(
-                Paragraph::new(text).block(popup_block("Help")).wrap(Wrap { trim: false }),
+                Paragraph::new(text)
+                    .block(popup_block("Help"))
+                    .wrap(Wrap { trim: false }),
                 area,
             );
         }
@@ -732,23 +788,34 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                         .map(|s| s.date_time.replace('T', " "))
                         .unwrap_or_default();
                     let subj = e.subject.clone().unwrap_or_default();
-                    let online = if e.is_online_meeting.unwrap_or(false) { " 🔗" } else { "" };
+                    let online = if e.is_online_meeting.unwrap_or(false) {
+                        " 🔗"
+                    } else {
+                        ""
+                    };
                     ListItem::new(format!("{start}  {subj}{online}"))
                 })
                 .collect();
             let list = if items.is_empty() {
-                List::new(vec![ListItem::new("No events in the next 7 days (or still loading).")])
+                List::new(vec![ListItem::new(
+                    "No events in the next 7 days (or still loading).",
+                )])
             } else {
                 List::new(items)
             };
-            f.render_widget(list.block(popup_block("Calendar — next 7 days (Esc to close)")), area);
+            f.render_widget(
+                list.block(popup_block("Calendar — next 7 days (Esc to close)")),
+                area,
+            );
         }
         Overlay::Search { query } => {
             let area = centered(60, 20, f.area());
             f.render_widget(Clear, area);
             f.render_widget(
-                Paragraph::new(format!("Search mail:\n\n> {query}▏\n\nEnter to search · Esc to cancel"))
-                    .block(popup_block("Search")),
+                Paragraph::new(format!(
+                    "Search mail:\n\n> {query}▏\n\nEnter to search · Esc to cancel"
+                ))
+                .block(popup_block("Search")),
                 area,
             );
         }
@@ -772,7 +839,10 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             st.select(Some(*sel));
             f.render_stateful_widget(
                 List::new(items).highlight_style(
-                    Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 rows[1],
                 &mut st,
@@ -788,9 +858,11 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 .map(|(i, e)| format!("{}  {e}   ", i + 1))
                 .collect();
             f.render_widget(
-                Paragraph::new(format!("React to the selected message:\n\n{picks}\n\nPress 1-7 · Esc cancel"))
-                    .wrap(Wrap { trim: false })
-                    .block(popup_block("Add reaction")),
+                Paragraph::new(format!(
+                    "React to the selected message:\n\n{picks}\n\nPress 1-7 · Esc cancel"
+                ))
+                .wrap(Wrap { trim: false })
+                .block(popup_block("Add reaction")),
                 area,
             );
         }
@@ -814,7 +886,11 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                         ),
                         Span::raw(a.display_name()),
                         Span::styled(
-                            format!("  {}  {}", a.human_size(), a.content_type.clone().unwrap_or_default()),
+                            format!(
+                                "  {}  {}",
+                                a.human_size(),
+                                a.content_type.clone().unwrap_or_default()
+                            ),
                             Style::default().fg(DIM),
                         ),
                     ]))
@@ -822,7 +898,11 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 .collect();
             f.render_widget(List::new(items), inner);
             let hint = format!("saves to {}", crate::files::download_dir().display());
-            let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+            let hint_area = Rect {
+                y: inner.y + inner.height.saturating_sub(1),
+                height: 1,
+                ..inner
+            };
             f.render_widget(
                 Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
                 hint_area,
@@ -850,10 +930,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                         Span::styled(host_of(url), Style::default().fg(Color::LightGreen)),
                     ])];
                     for chunk in chunks_of(url, width) {
-                        lines.push(Line::styled(
-                            format!("  {chunk}"),
-                            Style::default().fg(DIM),
-                        ));
+                        lines.push(Line::styled(format!("  {chunk}"), Style::default().fg(DIM)));
                     }
                     ListItem::new(lines)
                 })
@@ -864,7 +941,11 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let area = centered(46, 55, f.area());
             f.render_widget(Clear, area);
             let mut body = String::new();
-            if let Some(a) = app.my_presence.as_ref().and_then(|p| p.availability.as_deref()) {
+            if let Some(a) = app
+                .my_presence
+                .as_ref()
+                .and_then(|p| p.availability.as_deref())
+            {
                 body.push_str(&format!("Current: {a}\n\n"));
             }
             for (i, opt) in crate::app::PRESENCE_OPTIONS.iter().enumerate() {
@@ -884,7 +965,6 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
     }
 }
-
 
 /// Render a wrapped, vertically-scrolling text area. Returns the on-screen
 /// cursor position when focused. Shared by the compose body and the Teams
@@ -1022,10 +1102,7 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default(),
                     ),
-                    Span::styled(
-                        format!("  {}", human_size(*size)),
-                        Style::default().fg(DIM),
-                    ),
+                    Span::styled(format!("  {}", human_size(*size)), Style::default().fg(DIM)),
                 ])
             })
             .collect();
@@ -1126,10 +1203,7 @@ fn day_separator(label: &str) -> Line<'static> {
             label.to_string(),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            " ".to_string() + &"─".repeat(40),
-            Style::default().fg(DIM),
-        ),
+        Span::styled(" ".to_string() + &"─".repeat(40), Style::default().fg(DIM)),
     ])
 }
 
@@ -1255,7 +1329,7 @@ mod tests {
         assert_eq!(topmost_message_index(&starts, 11), 1);
         assert_eq!(topmost_message_index(&starts, 12), 2);
         assert_eq!(topmost_message_index(&starts, 99), 2); // clamped past the end
-        // A separator above the first message must not select a negative index.
+                                                           // A separator above the first message must not select a negative index.
         assert_eq!(topmost_message_index(&[3, 9], 0), 0);
         assert_eq!(topmost_message_index(&[], 7), 0);
     }

@@ -38,6 +38,22 @@ impl TextInput {
         self.cursor
     }
 
+    pub fn chars(&self) -> &[char] {
+        &self.chars
+    }
+
+    /// Replace `start..end` (character indices) and leave the cursor after the
+    /// inserted text.
+    pub fn replace_range(&mut self, start: usize, end: usize, s: &str) {
+        let start = start.min(self.chars.len());
+        let end = end.min(self.chars.len()).max(start);
+        self.chars.drain(start..end);
+        for (i, c) in s.chars().enumerate() {
+            self.chars.insert(start + i, c);
+        }
+        self.cursor = start + s.chars().count();
+    }
+
     pub fn clear(&mut self) {
         self.chars.clear();
         self.cursor = 0;
@@ -278,10 +294,7 @@ fn wrap_segment(seg: &[char], offset: usize, width: usize, rows: &mut Vec<Row>) 
 
 fn cursor_rowcol(rows: &[Row], cursor: usize) -> (usize, usize) {
     // The cursor belongs to the last row that starts at or before it.
-    let idx = rows
-        .iter()
-        .rposition(|r| r.start <= cursor)
-        .unwrap_or(0);
+    let idx = rows.iter().rposition(|r| r.start <= cursor).unwrap_or(0);
     let row = &rows[idx];
     let len = row.text.chars().count();
     (idx, (cursor.saturating_sub(row.start)).min(len))
@@ -414,5 +427,13 @@ mod tests {
         let mut t = TextInput::new();
         t.insert_str("line one\r\nline two");
         assert_eq!(t.text(), "line one\nline two");
+    }
+
+    #[test]
+    fn replace_range_updates_the_cursor() {
+        let mut t = TextInput::from("see @./sh please");
+        t.replace_range(4, 9, "@./shot.png");
+        assert_eq!(t.text(), "see @./shot.png please");
+        assert_eq!(t.cursor(), 4 + "@./shot.png".chars().count());
     }
 }

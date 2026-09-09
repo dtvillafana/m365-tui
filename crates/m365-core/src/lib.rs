@@ -12,6 +12,7 @@ pub mod chats;
 pub mod config;
 pub mod events;
 pub mod graph;
+pub mod hosted;
 pub mod mail;
 pub mod models;
 pub mod people;
@@ -25,6 +26,7 @@ use anyhow::Result;
 pub use auth::{Authenticator, DeviceCodePrompt};
 pub use config::Config;
 pub use graph::GraphClient;
+pub use hosted::{HostedImage, OutgoingBody};
 
 /// Everything a frontend needs: config, auth, and a Graph client.
 #[derive(Clone)]

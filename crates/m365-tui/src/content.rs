@@ -121,7 +121,8 @@ impl Renderer {
             prefix.push_str("  ");
         }
         if !prefix.is_empty() {
-            self.spans.push(Span::styled(prefix, Style::default().fg(DIM)));
+            self.spans
+                .push(Span::styled(prefix, Style::default().fg(DIM)));
         }
     }
 
@@ -213,8 +214,10 @@ impl Renderer {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 self.ensure_blank();
                 let hashes = "#".repeat(tag[1..].parse::<usize>().unwrap_or(1));
-                self.spans
-                    .push(Span::styled(format!("{hashes} "), Style::default().fg(ACCENT)));
+                self.spans.push(Span::styled(
+                    format!("{hashes} "),
+                    Style::default().fg(ACCENT),
+                ));
                 self.walk_children(node, style.fg(ACCENT).add_modifier(Modifier::BOLD));
                 self.ensure_blank();
             }
@@ -293,11 +296,13 @@ impl Renderer {
                 }
             }
             "img" => {
-                if let Some(alt) = attr(attrs, "alt") {
-                    if !alt.is_empty() {
-                        self.push_text(&format!("[{alt}]"), style.fg(DIM));
-                    }
-                }
+                let alt = attr(attrs, "alt");
+                let label = alt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("image");
+                self.push_text(&format!("[{label}]"), style.fg(DIM));
             }
             "tr" => {
                 self.walk_children(node, style);
@@ -305,7 +310,8 @@ impl Renderer {
             }
             "td" | "th" => {
                 self.walk_children(node, style);
-                self.spans.push(Span::styled("  ", Style::default().fg(DIM)));
+                self.spans
+                    .push(Span::styled("  ", Style::default().fg(DIM)));
             }
             // Inline/neutral wrappers: keep the current style.
             _ => self.walk_children(node, style),
@@ -488,7 +494,10 @@ mod tests {
         let text = flat(&out.text);
         // The anchor text stays, the URL does not appear in the flow.
         assert!(text.contains("login"));
-        assert!(!text.contains("https://example.com/login"), "url leaked: {text}");
+        assert!(
+            !text.contains("https://example.com/login"),
+            "url leaked: {text}"
+        );
         // Markers are numbered, and the repeated target reuses its number.
         assert!(text.contains("[1]"), "{text}");
         assert!(text.contains("[2]"), "{text}");
@@ -509,7 +518,10 @@ mod tests {
         let out = render_html(html);
         let text = flat(&out.text);
         // Both the quoted original and the reply itself must survive.
-        assert!(text.contains("Alex Rivera"), "quoted author missing: {text}");
+        assert!(
+            text.contains("Alex Rivera"),
+            "quoted author missing: {text}"
+        );
         assert!(
             text.contains("Sounds good to me"),
             "quoted text missing: {text}"
@@ -521,14 +533,16 @@ mod tests {
 
     #[test]
     fn attachment_tag_body_still_renders_its_text() {
-        let out = render_html(r#"<attachment id="1785858892876"></attachment><p>Confirma por favor</p>"#);
+        let out =
+            render_html(r#"<attachment id="1785858892876"></attachment><p>Confirma por favor</p>"#);
         let s = flat(&out.text);
         assert!(s.contains("Confirma por favor"), "reply text lost: {s:?}");
     }
 
     #[test]
     fn script_and_style_are_dropped() {
-        let out = render_html("<style>.x{color:red}</style><p>visible</p><script>alert(1)</script>");
+        let out =
+            render_html("<style>.x{color:red}</style><p>visible</p><script>alert(1)</script>");
         let s = flat(&out.text);
         assert!(s.contains("visible"));
         assert!(!s.contains("alert"));

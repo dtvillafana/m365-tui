@@ -13,7 +13,7 @@ use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
     Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence, Team, User,
 };
-use m365_core::{calendar, channels, chats, mail, people, Session};
+use m365_core::{calendar, channels, chats, mail, people, OutgoingBody, Session};
 use ratatui::text::Text;
 use tokio::sync::mpsc;
 
@@ -56,6 +56,10 @@ pub enum AppMessage {
     },
     /// A send/action completed; optional status text and refresh hint.
     Done(String),
+    /// A Teams message (with optional images) was posted.
+    TeamsSent(String),
+    /// A Teams send failed; restore the composer if it is still empty.
+    TeamsSendFailed(String),
     /// Result of a cross-navigation request to open a chat by email.
     OpenChat(Option<String>),
     /// The signed-in user's presence (status), for the tab-bar indicator.
@@ -365,6 +369,12 @@ pub struct TeamsState {
     pub open_chat_id: Option<String>,
     pub open_channel: Option<(String, String)>,
     pub composer: TextInput,
+    /// Clipboard / data-URI images staged for the next send.
+    pub images: Vec<crate::images::InlineImage>,
+    /// True while a send is in flight, so Enter cannot fire twice.
+    pub sending: bool,
+    /// Composer snapshot to restore if the in-flight send fails.
+    pending_restore: Option<(String, Vec<crate::images::InlineImage>)>,
     pub focus: TeamsFocus,
 }
 
@@ -389,6 +399,9 @@ impl Default for TeamsState {
             open_chat_id: None,
             open_channel: None,
             composer: TextInput::new(),
+            images: Vec::new(),
+            sending: false,
+            pending_restore: None,
             focus: TeamsFocus::List,
         }
     }
@@ -781,19 +794,30 @@ impl App {
         });
     }
 
-    fn send_chat_message(&self, chat_id: String, text: String) {
+    fn send_chat_message(&self, chat_id: String, prepared: crate::images::Prepared) {
         let s = self.session.clone();
         self.spawn(async move {
-            chats::send_message(&s.graph, &chat_id, &text).await?;
-            Ok(AppMessage::Done("message sent".into()))
+            let body = prepared_body(&prepared);
+            match chats::send_message(&s.graph, &chat_id, body).await {
+                Ok(_) => Ok(AppMessage::TeamsSent("message sent".into())),
+                Err(e) => Ok(AppMessage::TeamsSendFailed(format!("{e:#}"))),
+            }
         });
     }
 
-    fn send_channel_message(&self, team_id: String, channel_id: String, text: String) {
+    fn send_channel_message(
+        &self,
+        team_id: String,
+        channel_id: String,
+        prepared: crate::images::Prepared,
+    ) {
         let s = self.session.clone();
         self.spawn(async move {
-            channels::send_message(&s.graph, &team_id, &channel_id, &text).await?;
-            Ok(AppMessage::Done("message posted".into()))
+            let body = prepared_body(&prepared);
+            match channels::send_message(&s.graph, &team_id, &channel_id, body).await {
+                Ok(_) => Ok(AppMessage::TeamsSent("message posted".into())),
+                Err(e) => Ok(AppMessage::TeamsSendFailed(format!("{e:#}"))),
+            }
         });
     }
 
@@ -944,6 +968,22 @@ impl App {
             AppMessage::Done(s) => {
                 self.status = s;
                 self.refresh_current();
+            }
+            AppMessage::TeamsSent(s) => {
+                self.teams.sending = false;
+                self.teams.pending_restore = None;
+                self.status = s;
+                self.refresh_current();
+            }
+            AppMessage::TeamsSendFailed(e) => {
+                self.teams.sending = false;
+                if let Some((text, images)) = self.teams.pending_restore.take() {
+                    if self.teams.composer.is_empty() && self.teams.images.is_empty() {
+                        self.teams.composer = TextInput::from(text.as_str());
+                        self.teams.images = images;
+                    }
+                }
+                self.status = format!("error: {}", m365_core::util::graph_error_summary(&e));
             }
             AppMessage::OpenChat(Some(id)) => {
                 self.screen = Screen::Teams;
@@ -1662,40 +1702,45 @@ impl App {
         // Composer captures typing when focused.
         if self.teams.focus == TeamsFocus::Composer {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            let input = &mut self.teams.composer;
             match key.code {
                 KeyCode::Esc => {
                     self.teams.replying_to = None;
                     self.teams.focus = TeamsFocus::Messages;
                 }
-                KeyCode::Tab => self.teams.focus = TeamsFocus::List,
+                KeyCode::Tab => {
+                    if !self.complete_teams_path() {
+                        self.teams.focus = TeamsFocus::List;
+                    }
+                }
+                KeyCode::Char('v') if ctrl => self.paste_clipboard_image(),
+                KeyCode::Char('x') if ctrl => self.unstage_teams_image(),
                 // Enter sends; Shift/Alt+Enter inserts a newline instead.
                 KeyCode::Enter
                     if key
                         .modifiers
                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
-                    input.insert('\n')
+                    self.teams.composer.insert('\n')
                 }
                 KeyCode::Enter => self.teams_send(),
-                KeyCode::Up => input.move_row(-1, self.text_width_hint.get()),
-                KeyCode::Down => input.move_row(1, self.text_width_hint.get()),
-                KeyCode::Backspace => input.backspace(),
-                KeyCode::Delete => input.delete(),
-                KeyCode::Char('w') if ctrl => input.delete_word_before(),
-                KeyCode::Char('u') if ctrl => input.delete_to_line_start(),
-                KeyCode::Char('k') if ctrl => input.delete_to_line_end(),
-                KeyCode::Left if ctrl => input.word_left(),
-                KeyCode::Right if ctrl => input.word_right(),
-                KeyCode::Left => input.left(),
-                KeyCode::Right => input.right(),
-                KeyCode::Home if ctrl => input.start_of_text(),
-                KeyCode::End if ctrl => input.end_of_text(),
-                KeyCode::Char('a') if ctrl => input.home(),
-                KeyCode::Char('e') if ctrl => input.end(),
-                KeyCode::Home => input.home(),
-                KeyCode::End => input.end(),
-                KeyCode::Char(c) if !ctrl => input.insert(c),
+                KeyCode::Up => self.teams.composer.move_row(-1, self.text_width_hint.get()),
+                KeyCode::Down => self.teams.composer.move_row(1, self.text_width_hint.get()),
+                KeyCode::Backspace => self.teams.composer.backspace(),
+                KeyCode::Delete => self.teams.composer.delete(),
+                KeyCode::Char('w') if ctrl => self.teams.composer.delete_word_before(),
+                KeyCode::Char('u') if ctrl => self.teams.composer.delete_to_line_start(),
+                KeyCode::Char('k') if ctrl => self.teams.composer.delete_to_line_end(),
+                KeyCode::Left if ctrl => self.teams.composer.word_left(),
+                KeyCode::Right if ctrl => self.teams.composer.word_right(),
+                KeyCode::Left => self.teams.composer.left(),
+                KeyCode::Right => self.teams.composer.right(),
+                KeyCode::Home if ctrl => self.teams.composer.start_of_text(),
+                KeyCode::End if ctrl => self.teams.composer.end_of_text(),
+                KeyCode::Char('a') if ctrl => self.teams.composer.home(),
+                KeyCode::Char('e') if ctrl => self.teams.composer.end(),
+                KeyCode::Home => self.teams.composer.home(),
+                KeyCode::End => self.teams.composer.end(),
+                KeyCode::Char(c) if !ctrl => self.teams.composer.insert(c),
                 _ => {}
             }
             return;
@@ -1861,12 +1906,35 @@ impl App {
     }
 
     fn teams_send(&mut self) {
-        let text = self.teams.composer.text().trim().to_string();
-        if text.is_empty() {
+        if self.teams.sending {
+            self.status = "already sending…".into();
             return;
         }
+        let text = self.teams.composer.text();
+        let staged = self.teams.images.clone();
+        let prepared = match crate::images::prepare_message(&text, &staged) {
+            Ok(Some(p)) => p,
+            Ok(None) => return,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+
+        let n_images = match &prepared {
+            crate::images::Prepared::Text(_) => 0,
+            crate::images::Prepared::Html { images, .. } => images.len(),
+        };
+        self.teams.pending_restore = Some((text, staged));
         self.teams.composer.clear();
+        self.teams.images.clear();
+        self.teams.sending = true;
         let replying_to = self.teams.replying_to.take();
+        self.status = match n_images {
+            0 => "sending…".into(),
+            1 => "sending image…".into(),
+            n => format!("sending {n} images…"),
+        };
 
         match (replying_to, self.teams.mode) {
             // Replying in a chat: quote the original in the body, which is how
@@ -1876,6 +1944,7 @@ impl App {
                     self.teams.open_chat_id.clone(),
                     self.teams.messages.get(idx),
                 ) else {
+                    self.restore_teams_composer();
                     return;
                 };
                 let author = original.author();
@@ -1883,8 +1952,11 @@ impl App {
                 let s = self.session.clone();
                 self.status = format!("replying to {author}…");
                 self.spawn(async move {
-                    chats::send_reply(&s.graph, &chat_id, &original, &text).await?;
-                    Ok(AppMessage::Done("reply sent".into()))
+                    let body = prepared_body(&prepared);
+                    match chats::send_reply(&s.graph, &chat_id, &original, body).await {
+                        Ok(_) => Ok(AppMessage::TeamsSent("reply sent".into())),
+                        Err(e) => Ok(AppMessage::TeamsSendFailed(format!("{e:#}"))),
+                    }
                 });
             }
             // Channels have a real replies collection, so the reply threads.
@@ -1893,27 +1965,100 @@ impl App {
                     self.teams.open_channel.clone(),
                     self.teams.messages.get(idx),
                 ) else {
+                    self.restore_teams_composer();
                     return;
                 };
                 let message_id = original.id.clone();
                 let s = self.session.clone();
                 self.status = "replying…".into();
                 self.spawn(async move {
-                    channels::send_reply(&s.graph, &team_id, &channel_id, &message_id, &text)
-                        .await?;
-                    Ok(AppMessage::Done("reply sent".into()))
+                    let body = prepared_body(&prepared);
+                    match channels::send_reply(&s.graph, &team_id, &channel_id, &message_id, body)
+                        .await
+                    {
+                        Ok(_) => Ok(AppMessage::TeamsSent("reply sent".into())),
+                        Err(e) => Ok(AppMessage::TeamsSendFailed(format!("{e:#}"))),
+                    }
                 });
             }
             (None, TeamsMode::Chats) => {
                 if let Some(id) = self.teams.open_chat_id.clone() {
-                    self.send_chat_message(id, text);
+                    self.send_chat_message(id, prepared);
+                } else {
+                    self.restore_teams_composer();
                 }
             }
             (None, TeamsMode::Channels) => {
                 if let Some((t, c)) = self.teams.open_channel.clone() {
-                    self.send_channel_message(t, c, text);
+                    self.send_channel_message(t, c, prepared);
+                } else {
+                    self.restore_teams_composer();
                 }
             }
+        }
+    }
+
+    fn restore_teams_composer(&mut self) {
+        self.teams.sending = false;
+        if let Some((text, images)) = self.teams.pending_restore.take() {
+            self.teams.composer = TextInput::from(text.as_str());
+            self.teams.images = images;
+        }
+    }
+
+    fn complete_teams_path(&mut self) -> bool {
+        let Some(token) =
+            crate::images::token_at(self.teams.composer.chars(), self.teams.composer.cursor())
+        else {
+            return false;
+        };
+        let Some(completion) = crate::images::complete(&token) else {
+            return false;
+        };
+        self.teams
+            .composer
+            .replace_range(token.start, token.end, &completion.replacement);
+        self.status = completion.status;
+        true
+    }
+
+    fn paste_clipboard_image(&mut self) {
+        match crate::clipboard::image_bytes() {
+            Ok((_mime, bytes)) => {
+                let ext = crate::images::image_extension(&bytes).unwrap_or("png");
+                let name = crate::images::unique_paste_name(&self.teams.images, ext);
+                match crate::images::InlineImage::from_bytes(name, bytes) {
+                    Ok(img) => self.stage_teams_image(img),
+                    Err(e) => self.status = e,
+                }
+            }
+            Err(crate::clipboard::ImagePasteError::NoHelper) => {
+                self.status =
+                    "clipboard image paste needs wl-paste or xclip on this machine".into();
+            }
+            Err(crate::clipboard::ImagePasteError::NoImage) => {
+                self.status =
+                    "clipboard has no image — copy an image, or paste text with the terminal paste"
+                        .into();
+            }
+            Err(crate::clipboard::ImagePasteError::Failed(e)) => {
+                self.status = format!("clipboard: {e}");
+            }
+        }
+    }
+
+    fn stage_teams_image(&mut self, img: crate::images::InlineImage) {
+        self.status = format!(
+            "attached {} ({})",
+            img.name,
+            crate::images::human_size(img.bytes.len() as u64)
+        );
+        self.teams.images.push(img);
+    }
+
+    fn unstage_teams_image(&mut self) {
+        if let Some(img) = self.teams.images.pop() {
+            self.status = format!("removed {}", img.name);
         }
     }
 
@@ -2122,6 +2267,24 @@ impl App {
 
     /// Bracketed-paste text from the terminal.
     pub fn on_paste(&mut self, text: String) {
+        if self.overlay.is_none()
+            && self.screen == Screen::Teams
+            && self.teams.focus == TeamsFocus::Composer
+        {
+            match crate::images::from_data_uri(text.trim()) {
+                Some(Ok(mut img)) => {
+                    let ext = crate::images::image_extension(&img.bytes).unwrap_or("png");
+                    img.name = crate::images::unique_paste_name(&self.teams.images, ext);
+                    self.stage_teams_image(img);
+                    return;
+                }
+                Some(Err(e)) => {
+                    self.status = e;
+                    return;
+                }
+                None => {}
+            }
+        }
         match self.overlay.take() {
             Some(Overlay::Compose(mut c)) => {
                 c.active_mut().insert_str(&text);
@@ -2366,6 +2529,13 @@ fn prev_field(fields: &[usize], current: usize) -> usize {
 
 fn empty_compose() -> Compose {
     Compose::new(ComposeKind::NewMail, 0)
+}
+
+fn prepared_body(prepared: &crate::images::Prepared) -> OutgoingBody<'_> {
+    match prepared {
+        crate::images::Prepared::Text(text) => OutgoingBody::Text(text),
+        crate::images::Prepared::Html { html, images } => OutgoingBody::Html { html, images },
+    }
 }
 
 /// Move a selection index by `delta`, clamped to `[0, len)`.

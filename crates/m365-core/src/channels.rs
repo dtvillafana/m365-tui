@@ -4,17 +4,22 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::graph::GraphClient;
+use crate::hosted::{outgoing_payload, OutgoingBody};
 use crate::models::{Channel, ChatMessage, Team};
 
 /// Teams the signed-in user has joined.
 pub async fn joined_teams(graph: &GraphClient) -> Result<Vec<Team>> {
-    graph.get_collection("me/joinedTeams?$select=id,displayName,description").await
+    graph
+        .get_collection("me/joinedTeams?$select=id,displayName,description")
+        .await
 }
 
 /// Channels within a team.
 pub async fn list_channels(graph: &GraphClient, team_id: &str) -> Result<Vec<Channel>> {
     graph
-        .get_collection(&format!("teams/{team_id}/channels?$select=id,displayName,description"))
+        .get_collection(&format!(
+            "teams/{team_id}/channels?$select=id,displayName,description"
+        ))
         .await
 }
 
@@ -45,13 +50,12 @@ pub async fn send_reply(
     team_id: &str,
     channel_id: &str,
     message_id: &str,
-    text: &str,
+    body: OutgoingBody<'_>,
 ) -> Result<ChatMessage> {
-    let payload = json!({ "body": { "contentType": "text", "content": text } });
     graph
         .post_json(
             &format!("teams/{team_id}/channels/{channel_id}/messages/{message_id}/replies"),
-            &payload,
+            &outgoing_payload(body),
         )
         .await
 }
@@ -72,18 +76,17 @@ pub async fn set_reaction(
         .await
 }
 
-/// Post a plain-text message to a channel.
+/// Post a message to a channel — plain text, or HTML with inline images.
 pub async fn send_message(
     graph: &GraphClient,
     team_id: &str,
     channel_id: &str,
-    text: &str,
+    body: OutgoingBody<'_>,
 ) -> Result<ChatMessage> {
-    let payload = json!({ "body": { "contentType": "text", "content": text } });
     graph
         .post_json(
             &format!("teams/{team_id}/channels/{channel_id}/messages"),
-            &payload,
+            &outgoing_payload(body),
         )
         .await
 }

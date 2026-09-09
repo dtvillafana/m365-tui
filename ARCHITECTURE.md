@@ -187,6 +187,21 @@ the line that would otherwise carry it.
 Sending falls back to a plain `<blockquote>` if a tenant rejects the reference
 attachment, so a reply is never lost to a failed post.
 
+### Inline images
+
+Graph has no “attach this file to a chat message” upload. Images are sent as
+`hostedContents`: the body is HTML with
+`<img alt="…" src="../hostedContents/{id}/$value">` and a matching
+`hostedContents` entry holding base64 bytes and a `@microsoft.graph.temporaryId`.
+
+The composer collects them in two ways: `Ctrl+V` reads `image/*` from
+`wl-paste`/`xclip` (bracketed paste is UTF-8 text, so it only becomes an image
+when the paste is a `data:image/…;base64,` URI), and `@path` tokens that look
+like filesystem paths (`@~/…`, `@./…`, `@/…`, or anything containing `/`).
+`Tab` completes those tokens; spaces in the path are backslash-escaped.
+Non-images are rejected. Arbitrary files would need a OneDrive/SharePoint
+upload and `Files.ReadWrite`, which this path does not request.
+
 ## Rendering message bodies
 
 Mail and Teams bodies arrive as HTML. `content.rs` parses it with `html5ever`

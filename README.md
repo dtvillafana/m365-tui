@@ -206,7 +206,7 @@ Press `?` in the app for this list at any time.
 | **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · arrows work the same · `Tab` cycles |
 | **Outlook** | `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
 | **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `h` back to the list |
-| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `r` reply · `i` write · `Enter` send |
+| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `r` reply · `i` write · `Enter` send · `Ctrl+V` paste image · `@path` `Tab` complete |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
@@ -226,10 +226,17 @@ message, which clears itself after a few seconds.
 
 ## Things worth knowing
 
-**Sending attachments.** In the compose window, `Tab` to the `Attach:` field,
-type a file path (`~` works) and press `Enter` to stage it. `Ctrl+X` removes the
-last one. Files over 3 MB upload in chunks automatically; Graph's own ceiling is
-150 MB per message.
+**Sending attachments.** In the Outlook compose window, `Tab` to the `Attach:`
+field, type a file path (`~` works) and press `Enter` to stage it. `Ctrl+X`
+removes the last one. Files over 3 MB upload in chunks automatically; Graph's
+own ceiling is 150 MB per message.
+
+**Images in Teams.** Paste an image with `Ctrl+V` (needs `wl-paste` or `xclip`
+on the local machine — a terminal cannot receive raw image bytes). A pasted
+`data:image/png;base64,…` URI is decoded too. Type `@~/Pictures/shot.png` in
+the composer and press `Tab` to complete paths; spaces are written as `\ `
+(`@/tmp/My\ Image.png`). PNG, JPEG, GIF and WebP only, 3 MB total. Non-image
+paths are rejected. `Ctrl+X` removes the last pasted image.
 
 **Saving attachments.** Messages with attachments show 📎. Press `A`, then a
 number, to save to your Downloads folder. Files are never overwritten.
