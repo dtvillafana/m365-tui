@@ -8,13 +8,36 @@ use crate::models::{Attachment, MailFolder, MailMessage};
 use crate::util::{base64_encode, html_escape};
 use bytes::Bytes;
 
-/// List mail folders (Inbox, Sent Items, custom folders, ...).
+/// List all mail folders, including hidden folders and nested custom folders.
+/// Nested display names include their parent path.
 pub async fn list_folders(graph: &GraphClient) -> Result<Vec<MailFolder>> {
-    graph
-        .get_collection(
-            "me/mailFolders?$top=100&$select=id,displayName,unreadItemCount,totalItemCount",
-        )
-        .await
+    let query = "$top=100&includeHiddenFolders=true\
+                 &$select=id,displayName,unreadItemCount,totalItemCount,childFolderCount";
+    let mut pending: Vec<MailFolder> = graph
+        .get_collection(&format!("me/mailFolders?{query}"))
+        .await?;
+    pending.reverse();
+    let mut folders = Vec::new();
+    while let Some(folder) = pending.pop() {
+        if folder.child_folder_count.unwrap_or(0) > 0 {
+            let children: Vec<MailFolder> = graph
+                .get_collection(&format!(
+                    "me/mailFolders/{}/childFolders?{query}",
+                    folder.id
+                ))
+                .await?;
+            for mut child in children.into_iter().rev() {
+                child.display_name = Some(format!(
+                    "{} / {}",
+                    folder.display_name.as_deref().unwrap_or_default(),
+                    child.display_name.as_deref().unwrap_or_default()
+                ));
+                pending.push(child);
+            }
+        }
+        folders.push(folder);
+    }
+    Ok(folders)
 }
 
 /// List the first page of messages in a folder, newest first. Returns the page
