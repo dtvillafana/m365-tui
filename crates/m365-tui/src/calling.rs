@@ -5,6 +5,7 @@
 //! plays the far end and captures the microphone. There is no Linux client
 //! Calling SDK; this is the REST equivalent.
 
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -552,7 +553,8 @@ fn outbound_audio(pcm: &[u8]) -> String {
 }
 
 fn spawn_sox_play() -> Result<Child> {
-    Command::new("sox")
+    let mut command = sox_command();
+    command
         .args([
             "-q",
             "--buffer",
@@ -580,7 +582,8 @@ fn spawn_sox_play() -> Result<Child> {
 }
 
 fn spawn_sox_rec() -> Result<Child> {
-    Command::new("sox")
+    let mut command = sox_command();
+    command
         .args([
             "-q",
             "--buffer",
@@ -605,6 +608,14 @@ fn spawn_sox_rec() -> Result<Child> {
         .kill_on_drop(true)
         .spawn()
         .context("spawning sox (record)")
+}
+
+fn sox_command() -> Command {
+    let mut command = Command::new("sox");
+    // Terminal signals such as SIGWINCH otherwise interrupt sox's blocking
+    // audio reads and make it exit while reporting a successful status.
+    command.as_std_mut().process_group(0);
+    command
 }
 
 async fn spawn_cloudflared(port: u16) -> Result<(String, Child)> {
