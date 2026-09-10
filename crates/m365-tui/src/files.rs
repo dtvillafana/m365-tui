@@ -29,10 +29,7 @@ pub fn save(name: &str, bytes: &[u8]) -> Result<PathBuf> {
 /// Strips any directory components, so `../../.ssh/authorized_keys` becomes
 /// `authorized_keys` and can only ever land inside the download directory.
 pub fn safe_file_name(name: &str) -> String {
-    let base = name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default();
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
     let cleaned: String = base
         .chars()
         .filter(|c| !c.is_control() && *c != '\0')
@@ -75,9 +72,15 @@ mod tests {
 
     #[test]
     fn strips_path_traversal() {
-        assert_eq!(safe_file_name("../../.ssh/authorized_keys"), "authorized_keys");
+        assert_eq!(
+            safe_file_name("../../.ssh/authorized_keys"),
+            "authorized_keys"
+        );
         assert_eq!(safe_file_name("/etc/passwd"), "passwd");
-        assert_eq!(safe_file_name(r"..\..\windows\system32\evil.dll"), "evil.dll");
+        assert_eq!(
+            safe_file_name(r"..\..\windows\system32\evil.dll"),
+            "evil.dll"
+        );
         assert_eq!(safe_file_name(".."), "attachment");
         assert_eq!(safe_file_name("."), "attachment");
         assert_eq!(safe_file_name(""), "attachment");
@@ -87,12 +90,18 @@ mod tests {
     #[test]
     fn keeps_ordinary_names() {
         assert_eq!(safe_file_name("report.pdf"), "report.pdf");
-        assert_eq!(safe_file_name("Relatório final.docx"), "Relatório final.docx");
+        assert_eq!(
+            safe_file_name("Relatório final.docx"),
+            "Relatório final.docx"
+        );
     }
 
     #[test]
     fn drops_control_characters() {
-        assert_eq!(safe_file_name("evil\n\r\u{1b}[2Jname.txt"), "evil[2Jname.txt");
+        assert_eq!(
+            safe_file_name("evil\n\r\u{1b}[2Jname.txt"),
+            "evil[2Jname.txt"
+        );
     }
 
     #[test]

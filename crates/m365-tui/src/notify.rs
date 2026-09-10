@@ -59,9 +59,13 @@ fn body_mentions_name(body_html: &str, my_name: &str) -> bool {
     let mut rest = lower.as_str();
     while let Some(start) = rest.find("<at") {
         rest = &rest[start..];
-        let Some(open_end) = rest.find('>') else { break };
+        let Some(open_end) = rest.find('>') else {
+            break;
+        };
         let after = &rest[open_end + 1..];
-        let Some(close) = after.find("</at>") else { break };
+        let Some(close) = after.find("</at>") else {
+            break;
+        };
         let text = after[..close].trim();
         if !text.is_empty() && (me == text || me.starts_with(text) || text.starts_with(&me)) {
             return true;
@@ -75,7 +79,12 @@ fn body_mentions_name(body_html: &str, my_name: &str) -> bool {
 pub fn send(title: &str, body: &str) {
     let body = summarise(body);
     let spawned = Command::new("notify-send")
-        .args(["--app-name=m365-tui", "--icon=mail-message-new", title, &body])
+        .args([
+            "--app-name=m365-tui",
+            "--icon=mail-message-new",
+            title,
+            &body,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

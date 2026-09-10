@@ -8,8 +8,8 @@ between the two with `F2`.
 - **Outlook** — read mail with proper HTML rendering, compose / reply /
   reply-all / forward, send and save attachments, search, and a 7-day calendar
   with RSVP.
-- **Teams** — chats and channels, emoji reactions, shared files, and your
-  presence status.
+- **Teams** — chats and channels, emoji reactions, shared files, your
+  presence status, and audio calling (ACS + sox).
 - **Live** — refreshes every 20 seconds out of the box; add a tunnel for
   instant push notifications.
 
@@ -40,11 +40,13 @@ nothing breaks if one is missing.
 | Open links (`o`) | `xdg-open` | `xdg-utils` | Links can still be copied |
 | Copy (`y`, `Y`) | `wl-copy` (Wayland), or `xclip` / `xsel` (X11) | `wl-clipboard`, `xclip`, `xsel` | Falls back to the OSC 52 escape, which most modern terminals accept |
 | Notifications | `notify-send` | `libnotify` (Debian/Ubuntu: `libnotify-bin`) | Falls back to the terminal bell |
+| Teams calling (`c`) | `sox` | `sox` | Calling is unavailable |
+| Teams calling (`c`) | `cloudflared` | `cloudflared` | Not needed if `M365_CALL_PUBLIC_URL` is set |
 
 Check what you have:
 
 ```sh
-for c in xdg-open wl-copy xclip xsel notify-send; do
+for c in xdg-open wl-copy xclip xsel notify-send sox cloudflared; do
   command -v "$c" >/dev/null && echo "✓ $c" || echo "✗ $c"
 done
 ```
@@ -206,7 +208,7 @@ Press `?` in the app for this list at any time.
 | **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · arrows work the same · `Tab` cycles |
 | **Outlook** | `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
 | **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `h` back to the list |
-| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `r` reply · `i` write · `Enter` send · `Ctrl+V` paste image · `@path` `Tab` complete |
+| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `r` reply · `i` write · `Enter` send · `c` call · `m` mute · `C` hang up · `Ctrl+V` paste image · `@path` `Tab` complete |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
@@ -401,11 +403,28 @@ publishes one tarball per architecture, with [`deploy/`](deploy/) packaged insid
 it as `realtime/`. That's what the install step above downloads. Design notes and
 internals live in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+**Calling.** In a 1:1 or group chat press `c` to ring the other people; in a
+meeting chat it joins the meeting. Audio is 16 kHz PCM through `sox` (`-d` is
+your default mic and speaker). `m` mutes, `C` hangs up. This is opt-in and
+needs three things:
+
+1. An [Azure Communication Services](https://learn.microsoft.com/azure/communication-services/)
+   resource whose connection string is in `M365_ACS_CONNECTION_STRING`.
+2. `sox` on `PATH`.
+3. A public HTTPS URL ACS can open a WebSocket to. `cloudflared` on `PATH`
+   is enough — a throwaway `trycloudflare.com` tunnel is spawned for the
+   call. Or set `M365_CALL_PUBLIC_URL` to a tunnel you already run, forwarding
+   to `127.0.0.1:${M365_CALL_BIND:-8788}`.
+
+There is no Linux client Calling SDK, so the TUI uses ACS Call Automation
+(REST) and appears in Teams as an ACS / external participant using your
+display name. 1:1 calls to Teams users also need the ACS resource authorised
+for Teams interop in the Teams admin centre. Video is not supported.
+
 ## Not supported
 
-Joining Teams calls or meetings (audio/video isn't a terminal thing — you can
-still list and schedule them), and bulk chat export, which needs separately
-approved Graph permissions.
+Video in calls, and bulk chat export, which needs separately approved Graph
+permissions.
 
 ## License
 

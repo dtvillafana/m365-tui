@@ -74,7 +74,10 @@ pub async fn renew(graph: &GraphClient, id: &str, expiration_minutes: i64) -> Re
     let expiry = (Utc::now() + Duration::minutes(expiration_minutes))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     graph
-        .patch(&format!("subscriptions/{id}"), &json!({ "expirationDateTime": expiry }))
+        .patch(
+            &format!("subscriptions/{id}"),
+            &json!({ "expirationDateTime": expiry }),
+        )
         .await
 }
 

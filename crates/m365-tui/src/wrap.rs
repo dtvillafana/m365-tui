@@ -52,10 +52,7 @@ pub fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
                 if rest.len() <= avail {
                     if !rest.is_empty() {
                         cur_w += rest.len();
-                        cur.push(Span::styled(
-                            rest.iter().collect::<String>(),
-                            span.style,
-                        ));
+                        cur.push(Span::styled(rest.iter().collect::<String>(), span.style));
                     }
                     break;
                 }
@@ -162,7 +159,10 @@ mod tests {
         for r in plain(&rows) {
             assert!(r.chars().count() <= 10, "row too wide: {r:?}");
         }
-        assert_eq!(plain(&rows).join(" ").replace("  ", " ").trim(), "the quick brown fox jumps");
+        assert_eq!(
+            plain(&rows).join(" ").replace("  ", " ").trim(),
+            "the quick brown fox jumps"
+        );
     }
 
     #[test]

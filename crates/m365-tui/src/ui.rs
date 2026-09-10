@@ -7,7 +7,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    filter_commands, App, Compose, OutlookFocus, Overlay, PushState, Screen, TeamsFocus, TeamsMode,
+    filter_commands, App, CallPhase, Compose, OutlookFocus, Overlay, PushState, Screen, TeamsFocus,
+    TeamsMode,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -113,9 +114,20 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         None => "⟳ …".to_string(),
     };
     let sep = || Span::styled(" · ", Style::default().fg(DIM));
-    let state = Line::from(vec![
+    let mut state_spans = vec![
         Span::styled(format!("{dot} {avail}"), presence_style(app)),
         sep(),
+    ];
+    if let Some(call) = &app.call {
+        let (label, colour) = match call.phase {
+            CallPhase::Connecting => ("☎ …", Color::Yellow),
+            CallPhase::Live if call.muted => ("☎ muted", Color::Yellow),
+            CallPhase::Live => ("☎ in call", Color::Green),
+        };
+        state_spans.push(Span::styled(label, Style::default().fg(colour)));
+        state_spans.push(sep());
+    }
+    state_spans.extend([
         Span::styled(push_label, Style::default().fg(push_colour)),
         sep(),
         Span::styled(format!("rss {ram}"), Style::default().fg(Color::Gray)),
@@ -123,6 +135,7 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(sync, Style::default().fg(Color::Green)),
         Span::raw(" "),
     ]);
+    let state = Line::from(state_spans);
 
     let state_w = line_width(&state).min(area.width);
     let cols = Layout::default()
@@ -189,11 +202,21 @@ fn context_hints(app: &App) -> &'static str {
             OutlookFocus::Messages => "j/k move · l read · h back · c compose · r reply · / search",
             OutlookFocus::Reading => "j/k scroll · h back · o links · A attach · y copy",
         },
-        Screen::Teams => match app.teams.focus {
-            TeamsFocus::List => "j/k move · l open · t chats/channels",
-            TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
-            TeamsFocus::Composer => "Enter send · Ctrl+V image · @path Tab · Esc leave",
-        },
+        Screen::Teams => {
+            if app.call.is_some() {
+                match app.teams.focus {
+                    TeamsFocus::List => "C hang up · m mute · j/k move · l open",
+                    TeamsFocus::Messages => "C hang up · m mute · j/k select · i write",
+                    TeamsFocus::Composer => "Enter send · Esc leave · C hang up",
+                }
+            } else {
+                match app.teams.focus {
+                    TeamsFocus::List => "j/k move · l open · t chats/channels · c call",
+                    TeamsFocus::Messages => "j/k select · h back · r reply · e react · c call",
+                    TeamsFocus::Composer => "Enter send · Ctrl+V image · @path Tab · Esc leave",
+                }
+            }
+        }
     }
 }
 
@@ -635,11 +658,51 @@ fn continues_run(
 /// A pause this long starts a fresh header even for the same person.
 const RUN_GAP_MINUTES: i64 = 15;
 
+fn render_call_bar(f: &mut Frame, area: Rect, app: &App) {
+    let Some(call) = &app.call else {
+        return;
+    };
+    let phase = match call.phase {
+        CallPhase::Connecting => "connecting".to_string(),
+        CallPhase::Live => {
+            let secs = call.since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            format!("{:02}:{:02}", secs / 60, secs % 60)
+        }
+    };
+    let mic = if call.muted { "muted" } else { "unmuted" };
+    let bg = if call.phase == CallPhase::Live && !call.muted {
+        Color::Green
+    } else {
+        Color::Yellow
+    };
+    let text = format!(" ☎  {}  {phase}  {mic}   m mute · C hang up ", call.label);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(Color::Black)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        area,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Teams
 // ---------------------------------------------------------------------------
 
 fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
+    let area = if app.call.is_some() {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        render_call_bar(f, rows[0], app);
+        rows[1]
+    } else {
+        area
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(32), Constraint::Min(20)])
@@ -924,6 +987,7 @@ fn render_overlay(f: &mut Frame, app: &App) {
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
           i type · r reply · Enter send · Ctrl+V paste image\n\
           @path Tab complete image · Ctrl+X remove last image\n\
+           c call / join meeting · m mute · C hang up (needs ACS + sox)\n\
  \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\

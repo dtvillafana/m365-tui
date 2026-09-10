@@ -107,7 +107,10 @@ impl Authenticator {
         let dc: DeviceCodeResponse = self
             .http
             .post(&self.devicecode_endpoint)
-            .form(&[("client_id", self.client_id.as_str()), ("scope", &self.scope)])
+            .form(&[
+                ("client_id", self.client_id.as_str()),
+                ("scope", &self.scope),
+            ])
             .send()
             .await
             .context("requesting device code")?

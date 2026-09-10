@@ -83,12 +83,12 @@ impl GraphClient {
                 continue;
             }
 
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status.is_server_error()
-            {
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                 if attempt >= MAX_RETRIES {
                     let text = resp.text().await.unwrap_or_default();
-                    anyhow::bail!("Graph request failed after {MAX_RETRIES} retries ({status}): {text}");
+                    anyhow::bail!(
+                        "Graph request failed after {MAX_RETRIES} retries ({status}): {text}"
+                    );
                 }
                 let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
                 attempt += 1;
@@ -157,9 +157,7 @@ impl GraphClient {
 
     pub async fn post_json<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
         let url = self.url(path);
-        let bytes = self
-            .send(reqwest::Method::POST, &url, Some(body))
-            .await?;
+        let bytes = self.send(reqwest::Method::POST, &url, Some(body)).await?;
         if bytes.is_empty() {
             // Some POSTs (e.g. sendMail) return 202 with no body.
             return serde_json::from_value(Value::Null).context("empty response");
@@ -213,8 +211,8 @@ impl GraphClient {
         let mut next = Some(self.url(path));
         while let Some(url) = next {
             let bytes = self.send(reqwest::Method::GET, &url, None).await?;
-            let page: ODataPage<T> = serde_json::from_slice(&bytes)
-                .context("deserializing Graph collection page")?;
+            let page: ODataPage<T> =
+                serde_json::from_slice(&bytes).context("deserializing Graph collection page")?;
             out.extend(page.value);
             next = page.next_link;
         }
@@ -231,8 +229,8 @@ impl GraphClient {
         let mut delta_link = None;
         while let Some(url) = next {
             let bytes = self.send(reqwest::Method::GET, &url, None).await?;
-            let page: ODataDeltaPage<T> = serde_json::from_slice(&bytes)
-                .context("deserializing Graph delta page")?;
+            let page: ODataDeltaPage<T> =
+                serde_json::from_slice(&bytes).context("deserializing Graph delta page")?;
             items.extend(page.value);
             delta_link = page.delta_link.or(delta_link);
             next = page.next_link;

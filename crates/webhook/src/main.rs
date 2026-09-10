@@ -30,12 +30,16 @@ struct AppState {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let redis_url =
         std::env::var("M365_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let expected_state = std::env::var("M365_CLIENT_STATE").ok().filter(|s| !s.is_empty());
+    let expected_state = std::env::var("M365_CLIENT_STATE")
+        .ok()
+        .filter(|s| !s.is_empty());
     let bind: SocketAddr = std::env::var("WEBHOOK_BIND")
         .unwrap_or_else(|_| "0.0.0.0:8080".into())
         .parse()
@@ -51,7 +55,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("M365_CLIENT_STATE not set — clientState verification is DISABLED");
     }
 
-    let state = AppState { redis, expected_state };
+    let state = AppState {
+        redis,
+        expected_state,
+    };
 
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -166,7 +173,11 @@ async fn handle_batch(mut state: AppState, body: String, is_lifecycle: bool) -> 
             resource: n.resource.unwrap_or_default(),
             change_type: n.change_type.unwrap_or_default(),
             subscription_id: n.subscription_id,
-            lifecycle_event: if is_lifecycle { n.lifecycle_event } else { None },
+            lifecycle_event: if is_lifecycle {
+                n.lifecycle_event
+            } else {
+                None
+            },
         };
 
         match serde_json::to_string(&event) {

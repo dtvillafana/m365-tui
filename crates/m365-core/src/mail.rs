@@ -4,14 +4,16 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::graph::{DeltaPage, GraphClient};
+use crate::models::{Attachment, MailFolder, MailMessage};
 use crate::util::{base64_encode, html_escape};
 use bytes::Bytes;
-use crate::models::{Attachment, MailFolder, MailMessage};
 
 /// List mail folders (Inbox, Sent Items, custom folders, ...).
 pub async fn list_folders(graph: &GraphClient) -> Result<Vec<MailFolder>> {
     graph
-        .get_collection("me/mailFolders?$top=100&$select=id,displayName,unreadItemCount,totalItemCount")
+        .get_collection(
+            "me/mailFolders?$top=100&$select=id,displayName,unreadItemCount,totalItemCount",
+        )
         .await
 }
 
@@ -64,9 +66,8 @@ pub async fn delta_messages(
 /// List a message's attachments. `$select` keeps `contentBytes` out of the
 /// response so listing stays cheap regardless of attachment size.
 pub async fn list_attachments(graph: &GraphClient, message_id: &str) -> Result<Vec<Attachment>> {
-    let path = format!(
-        "me/messages/{message_id}/attachments?$select=id,name,contentType,size,isInline"
-    );
+    let path =
+        format!("me/messages/{message_id}/attachments?$select=id,name,contentType,size,isInline");
     graph.get_collection(&path).await
 }
 
@@ -101,7 +102,12 @@ pub async fn mark_read(graph: &GraphClient, id: &str, read: bool) -> Result<()> 
 }
 
 /// Send a new message.
-pub async fn send_mail(graph: &GraphClient, to: &[String], subject: &str, body: &str) -> Result<()> {
+pub async fn send_mail(
+    graph: &GraphClient,
+    to: &[String],
+    subject: &str,
+    body: &str,
+) -> Result<()> {
     let recipients: Vec<_> = to
         .iter()
         .map(|addr| json!({ "emailAddress": { "address": addr } }))
@@ -120,14 +126,20 @@ pub async fn send_mail(graph: &GraphClient, to: &[String], subject: &str, body: 
 /// Reply to a message (Graph fills quoting + recipients automatically).
 pub async fn reply(graph: &GraphClient, id: &str, comment: &str) -> Result<()> {
     graph
-        .post_action(&format!("me/messages/{id}/reply"), &json!({ "comment": comment }))
+        .post_action(
+            &format!("me/messages/{id}/reply"),
+            &json!({ "comment": comment }),
+        )
         .await
 }
 
 /// Reply-all to a message.
 pub async fn reply_all(graph: &GraphClient, id: &str, comment: &str) -> Result<()> {
     graph
-        .post_action(&format!("me/messages/{id}/replyAll"), &json!({ "comment": comment }))
+        .post_action(
+            &format!("me/messages/{id}/replyAll"),
+            &json!({ "comment": comment }),
+        )
         .await
 }
 

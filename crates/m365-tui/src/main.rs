@@ -12,6 +12,7 @@
 //! prompt for asking what the flags are.
 
 mod app;
+mod calling;
 mod clipboard;
 mod content;
 mod editor;
@@ -215,6 +216,9 @@ async fn run_tui(session: Session) -> Result<()> {
     )
     .ok();
     terminal.show_cursor().ok();
+
+    // Leave any in-progress call so ACS doesn't keep the leg open.
+    app.hangup_call();
 
     // Drop our presence session on the way out, otherwise the user would keep
     // showing the status we published for up to the session lease.

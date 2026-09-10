@@ -28,6 +28,7 @@ The webhook shares the core only for its event types.
 | `config.rs` | Environment-driven settings, scope selection, Graph endpoint |
 | `models.rs` | Serde structs for the Graph resources actually rendered |
 | `mail.rs` `calendar.rs` `chats.rs` `channels.rs` `people.rs` | Endpoint wrappers |
+| `acs.rs` | Azure Communication Services HMAC client and Call Automation REST |
 | `subscriptions.rs` | Change-notification lifecycle |
 | `events.rs` | Redis subscriber → typed UI events |
 | `util.rs` | base64, HTML escaping |
@@ -42,6 +43,7 @@ The webhook shares the core only for its event types.
 | `editor.rs` | Text buffer with cursor, wrapping, and editing operations |
 | `wrap.rs` | Exact word wrapping, so scrolling can trust the row count |
 | `clipboard.rs` `opener.rs` `files.rs` `notify.rs` | System integration |
+| `calling.rs` | Teams audio calls: local HTTP/WebSocket server, sox, cloudflared |
 | `navigation.rs` | Cross-links between the Outlook and Teams sides |
 
 ## Authentication
@@ -61,6 +63,10 @@ therefore opt-in rather than added to the defaults:
 |---|---|---|
 | `Team.ReadBasic.All` | `M365_TEAMS_CHANNELS` | Channels are unavailable; chats work |
 | `Presence.ReadWrite` | `M365_PRESENCE_WRITE` | The status picker is read-only |
+
+Calling does not add Graph scopes. It is keyed off `M365_ACS_CONNECTION_STRING`
+(an Azure Communication Services resource) and uses ACS HMAC, not the Entra
+token.
 
 Capabilities behind an opt-in scope check `Config::can_*` before calling, so the
 UI explains what's missing instead of surfacing a Graph 403.
@@ -393,6 +399,7 @@ subprocess, each with a fallback so a missing tool degrades rather than fails:
 | `opener.rs` | `xdg-open`, `open` | Error reported in the status bar |
 | `clipboard.rs` | `wl-copy`, `xclip`, `xsel` | OSC 52 escape sequence |
 | `notify.rs` | `notify-send` | Terminal bell |
+| `calling.rs` | `sox`, `cloudflared` | Calling disabled; `cloudflared` is skipped when `M365_CALL_PUBLIC_URL` is set |
 
 Only the push path needs services, and those are containers rather than host
 installs: Redis, the webhook itself, and `cloudflared`. So its one real
@@ -404,7 +411,8 @@ skips verification rather than failing.
 
 The Rust dependency set is deliberately small: `tokio` and `reqwest` (rustls)
 for I/O, `ratatui`/`crossterm` for the terminal, `html5ever` for message bodies,
-`redis` for the event bus, `axum` for the webhook, plus `serde`, `chrono`,
+`redis` for the event bus, `axum` for the webhook and the calling media
+server, `hmac`/`sha2` for ACS request signing, plus `serde`, `chrono`,
 `anyhow` and `tracing`. Base64, HTML escaping and the text editor are
 hand-rolled in `util.rs` and `editor.rs` rather than pulling in crates for a few
 dozen lines.
@@ -461,7 +469,13 @@ Two places take data from anyone who can send you a message:
   outranks the app's session, and the session vocabulary is narrower than the
   preference one (`Busy` must be `InACall`, `DoNotDisturb` must be
   `Presenting`).
-- **No call media.** Joining Teams audio/video is not a terminal capability.
+- **Calling is audio-only, via ACS Call Automation + sox.** The client
+  Calling SDK (WebRTC) has no Linux target, so a call is a REST `connect` /
+  `createCall` plus bidirectional PCM 16 kHz over a WebSocket ACS opens to a
+  local axum server. sox plays and records; `cloudflared` (or
+  `M365_CALL_PUBLIC_URL`) publishes that server. The participant shows in
+  Teams as an ACS / external user, not as a native Teams client. Video is
+  not carried.
 
 ## Releases
 

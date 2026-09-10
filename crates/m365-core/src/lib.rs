@@ -5,6 +5,7 @@
 //! modules are thin endpoint wrappers over that client; `subscriptions` and
 //! `events` implement the notify-then-delta real-time path.
 
+pub mod acs;
 pub mod auth;
 pub mod calendar;
 pub mod channels;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+pub use acs::{AcsClient, AcsConfig, CallConnection, CallTarget};
 pub use auth::{Authenticator, DeviceCodePrompt};
 pub use config::Config;
 pub use graph::GraphClient;
