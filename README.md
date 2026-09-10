@@ -431,10 +431,13 @@ app with `nix develop -c cargo run -p m365-tui --bin m365`.
 Before dialing, the app waits for the public tunnel to reach the local server
 and checks that the audio processes start. ACS failures retain their HTTP status,
 error body, and callback result codes instead of being reduced to “Invalid request”.
-If readiness fails with a DNS lookup error, check that this machine can resolve
-the generated `*.trycloudflare.com` hostname. A connected cloudflared process alone
-does not guarantee local DNS resolution; fix the resolver or use a resolvable
-named tunnel through `M365_CALL_PUBLIC_URL`.
+Auto-generated calling tunnels get up to two minutes to become reachable. If the
+local resolver cannot resolve the new hostname (for example, due to negative DNS
+caching), the calling health check falls back to Cloudflare DNS-over-HTTPS for
+that hostname, retaining HTTPS certificate validation. Hangup cancels the wait.
+Custom `M365_CALL_PUBLIC_URL` tunnels use the system resolver and a 30-second
+readiness timeout. Persistent failures report the URL and actual local port;
+check DNS resolution and tunnel forwarding for that address.
 An integration check can exercise a real quick tunnel without placing a call:
 
 ```sh

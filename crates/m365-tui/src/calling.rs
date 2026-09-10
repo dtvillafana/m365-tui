@@ -165,7 +165,10 @@ pub async fn run_call(
         }
     };
     let public = public.trim_end_matches('/').to_string();
-    wait_for_public_url(&public, &probe).await?;
+    tokio::select! {
+        result = wait_for_public_url(&public, &probe, local_port, tunnel.is_some()) => { result?; }
+        _ = hangup.changed() => return Ok(()),
+    }
     let callback_uri = format!("{public}/callback");
     let media_ws_uri = http_to_ws(&public) + "/media";
 
@@ -282,7 +285,82 @@ async fn wait_until_done(
     }
 }
 
-async fn wait_for_public_url(public: &str, probe: &str) -> Result<()> {
+/// New quick-tunnel records can be hidden by a local resolver's negative cache.
+/// Fall back only for this call's generated hostname; TLS still verifies it.
+struct QuickTunnelDns {
+    host: String,
+    http: reqwest::Client,
+}
+
+impl reqwest::dns::Resolve for QuickTunnelDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = self.host.clone();
+        let http = self.http.clone();
+        Box::pin(async move {
+            let local = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::net::lookup_host((name.as_str(), 0)),
+            )
+            .await;
+            match local {
+                Ok(Ok(addrs)) => {
+                    let addrs: Vec<_> = addrs.collect();
+                    if !addrs.is_empty() {
+                        return Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs);
+                    }
+                }
+                Ok(Err(error)) if name.as_str() != host => return Err(error.into()),
+                Err(error) if name.as_str() != host => return Err(error.into()),
+                _ => {}
+            }
+            if name.as_str() != host {
+                return Err(std::io::Error::other("DNS returned no addresses").into());
+            }
+
+            tracing::debug!(%host, "local DNS lookup failed; trying DNS-over-HTTPS for calling tunnel");
+            let response: serde_json::Value = http
+                .get("https://cloudflare-dns.com/dns-query")
+                .header("Accept", "application/dns-json")
+                .query(&[("name", host.as_str()), ("type", "A")])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let addrs: Vec<std::net::SocketAddr> = response
+                .get("Answer")
+                .and_then(|answers| answers.as_array())
+                .into_iter()
+                .flatten()
+                .filter(|answer| answer.get("type").and_then(|ty| ty.as_u64()) == Some(1))
+                .filter_map(|answer| {
+                    answer
+                        .get("data")?
+                        .as_str()?
+                        .parse::<std::net::Ipv4Addr>()
+                        .ok()
+                })
+                .map(|ip| std::net::SocketAddr::from((ip, 0)))
+                .collect();
+            if response.get("Status").and_then(|status| status.as_u64()) != Some(0)
+                || addrs.is_empty()
+            {
+                return Err(std::io::Error::other(format!(
+                    "DNS-over-HTTPS returned no addresses for {host}"
+                ))
+                .into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+async fn wait_for_public_url(
+    public: &str,
+    probe: &str,
+    local_port: u16,
+    quick_tunnel: bool,
+) -> Result<reqwest::Client> {
     let url = reqwest::Url::parse(public).context("invalid M365_CALL_PUBLIC_URL")?;
     anyhow::ensure!(
         url.scheme() == "https"
@@ -291,12 +369,21 @@ async fn wait_for_public_url(public: &str, probe: &str) -> Result<()> {
             && url.fragment().is_none(),
         "calling requires a public HTTPS base URL without a query or fragment"
     );
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none());
+    if quick_tunnel {
+        builder = builder.dns_resolver(Arc::new(QuickTunnelDns {
+            host: url.host_str().unwrap().to_string(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()?,
+        }));
+    }
+    let http = builder.build()?;
     let mut last_error = "no response".to_string();
-    let ready = tokio::time::timeout(Duration::from_secs(30), async {
+    let wait = Duration::from_secs(if quick_tunnel { 120 } else { 30 });
+    let ready = tokio::time::timeout(wait, async {
         loop {
             match http.get(format!("{public}{probe}")).send().await {
                 Ok(response) => {
@@ -314,7 +401,8 @@ async fn wait_for_public_url(public: &str, probe: &str) -> Result<()> {
         }
     })
     .await;
-    ready.with_context(|| format!("calling tunnel is not reachable ({last_error}): public HTTPS must forward to the local calling port (default 8788), including /media WebSocket upgrades"))
+    ready.with_context(|| format!("calling tunnel {public} is not reachable after {} seconds ({last_error}): check DNS resolution and forwarding to 127.0.0.1:{local_port} for /health/*, /callback, and /media (WebSocket upgrades)", wait.as_secs()))?;
+    Ok(http)
 }
 
 async fn check_audio(play: &mut Child, rec: &mut Child) -> Result<()> {
@@ -693,8 +781,8 @@ mod tests {
         ));
         let (public, mut tunnel) = spawn_cloudflared(port).await.unwrap();
         let result = async {
-            wait_for_public_url(&public, "/health/test").await?;
-            let response = reqwest::Client::new()
+            let http = wait_for_public_url(&public, "/health/test", port, true).await?;
+            let response = http
                 .get(format!("{public}/media"))
                 .timeout(Duration::from_secs(10))
                 .header("Connection", "Upgrade")
