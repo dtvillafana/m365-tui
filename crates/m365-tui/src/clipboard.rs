@@ -33,23 +33,25 @@ pub enum ImagePasteError {
 
 /// Copy `text` to the clipboard. Returns the mechanism used, for the status line.
 pub fn copy(text: &str) -> Result<&'static str> {
-    if let Some(tool) = via_helper(text) {
+    if let Some(tool) = via_helpers(text, COPY_HELPERS) {
         return Ok(tool);
     }
     via_osc52(text)?;
     Ok("OSC 52")
 }
 
-fn via_helper(text: &str) -> Option<&'static str> {
-    const CANDIDATES: &[(&str, &[&str])] = &[
-        ("wl-copy", &[]),
-        ("xclip", &["-selection", "clipboard"]),
-        ("xsel", &["--clipboard", "--input"]),
-    ];
+type CopyHelper<'a> = (&'static str, &'a str, &'a [&'a str]);
 
-    for (bin, args) in CANDIDATES {
+const COPY_HELPERS: &[CopyHelper<'_>] = &[
+    ("wl-copy", "wl-copy", &[]),
+    ("xclip", "xclip", &["-selection", "clipboard"]),
+    ("xsel", "xsel", &["--clipboard", "--input"]),
+];
+
+fn via_helpers(text: &str, helpers: &[CopyHelper<'_>]) -> Option<&'static str> {
+    for &(name, bin, args) in helpers {
         let Ok(mut child) = Command::new(bin)
-            .args(*args)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -61,12 +63,16 @@ fn via_helper(text: &str) -> Option<&'static str> {
         if let Some(mut stdin) = child.stdin.take() {
             if stdin.write_all(text.as_bytes()).is_err() {
                 let _ = child.kill();
+                let _ = child.wait();
                 continue;
             }
         }
-        // wl-copy daemonizes to hold the selection, so this returns promptly.
-        let _ = child.wait();
-        return Some(bin);
+        // wl-copy/xclip daemonize to hold the selection, so this returns
+        // promptly. A launched helper is not necessarily usable (for example,
+        // wl-copy without a Wayland display), so only stop on a zero exit.
+        if child.wait().is_ok_and(|status| status.success()) {
+            return Some(name);
+        }
     }
     None
 }
@@ -74,13 +80,18 @@ fn via_helper(text: &str) -> Option<&'static str> {
 /// Terminal-native clipboard write. Safe to emit while in raw mode.
 fn via_osc52(text: &str) -> Result<()> {
     let mut out = std::io::stdout();
+    write_osc52(&mut out, text)?;
+    out.flush().context("flushing OSC 52 sequence")?;
+    Ok(())
+}
+
+fn write_osc52(mut out: impl Write, text: &str) -> Result<()> {
     write!(
         out,
         "\x1b]52;c;{}\x07",
         m365_core::util::base64_encode(text.as_bytes())
     )
     .context("writing OSC 52 sequence")?;
-    out.flush().context("flushing OSC 52 sequence")?;
     Ok(())
 }
 
@@ -200,6 +211,22 @@ fn run_stdout(bin: &str, args: &[&str]) -> Option<Result<Vec<u8>, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_copy_tries_next_helper_after_nonzero_exit() {
+        let helpers: &[CopyHelper<'_>] = &[
+            ("broken", "sh", &["-c", "cat >/dev/null; exit 1"]),
+            ("working", "sh", &["-c", "cat >/dev/null"]),
+        ];
+        assert_eq!(via_helpers("https://example.com", helpers), Some("working"));
+    }
+
+    #[test]
+    fn osc52_encodes_clipboard_text() {
+        let mut output = Vec::new();
+        write_osc52(&mut output, "https://example.com").unwrap();
+        assert_eq!(output, b"\x1b]52;c;aHR0cHM6Ly9leGFtcGxlLmNvbQ==\x07");
+    }
 
     #[test]
     fn xclip_is_used_when_wl_paste_fails() {
