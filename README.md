@@ -205,7 +205,7 @@ Press `?` in the app for this list at any time.
 | Scope | Keys |
 |---|---|
 | **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `?` help · `q` quit |
-| **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · arrows work the same · `Tab` cycles |
+| **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · `Shift+H`/`Shift+L` resize Outlook folders · arrows work the same · `Tab` cycles |
 | **Outlook** | `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
 | **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `h` back to the list |
 | **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `r` reply · `i` write · `Enter` send · `c` call · `m` mute · `C` hang up · `Ctrl+V` paste image · `@path` `Tab` complete |

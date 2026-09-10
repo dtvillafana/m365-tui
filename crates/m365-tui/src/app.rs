@@ -17,7 +17,7 @@ use m365_core::models::{
 use m365_core::{
     calendar, channels, chats, mail, people, AcsClient, CallTarget, OutgoingBody, Session,
 };
-use ratatui::text::Text;
+use ratatui::text::{Line, Text};
 use tokio::sync::mpsc;
 
 use crate::content;
@@ -353,6 +353,9 @@ impl Compose {
 pub struct OutlookState {
     pub folders: Vec<MailFolder>,
     pub folder_sel: usize,
+    /// Width of the folders panel. `None` until the first folder list arrives,
+    /// at which point it is fitted to the rendered folder labels.
+    pub folder_width: Option<u16>,
     pub messages: Vec<MailMessage>,
     pub msg_sel: usize,
     /// `@odata.nextLink` for the current folder listing (Some = more to load).
@@ -1034,6 +1037,9 @@ impl App {
             }
             AppMessage::Folders(f) => {
                 let first_load = self.outlook.folders.is_empty();
+                if self.outlook.folder_width.is_none() && !f.is_empty() {
+                    self.outlook.folder_width = Some(folder_panel_width(&f));
+                }
                 self.outlook.folders = f;
                 if first_load {
                     // Prefer Inbox as the initial selection, then load it.
@@ -1788,6 +1794,14 @@ impl App {
 
     fn on_key_outlook(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Char('H') => self.resize_folder_panel(-1),
+            KeyCode::Char('L') => self.resize_folder_panel(1),
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.resize_folder_panel(-1)
+            }
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.resize_folder_panel(1)
+            }
             KeyCode::Tab => {
                 self.outlook_focus = match self.outlook_focus {
                     OutlookFocus::Folders => OutlookFocus::Messages,
@@ -1824,6 +1838,20 @@ impl App {
             KeyCode::Enter => self.outlook_enter(),
             _ => {}
         }
+    }
+
+    fn resize_folder_panel(&mut self, delta: i16) {
+        let Some(width) = self.outlook.folder_width else {
+            return;
+        };
+        let width = if delta < 0 {
+            width.saturating_sub(delta.unsigned_abs())
+        } else {
+            width.saturating_add(delta as u16)
+        }
+        .max(MIN_FOLDER_PANEL_WIDTH);
+        self.outlook.folder_width = Some(width);
+        self.status = format!("Folders width: {width}");
     }
 
     fn load_calendar_and_show(&mut self) {
@@ -2848,6 +2876,29 @@ fn step(idx: usize, delta: i32, len: usize) -> usize {
     }
 }
 
+pub const DEFAULT_FOLDER_PANEL_WIDTH: u16 = 26;
+const MIN_FOLDER_PANEL_WIDTH: u16 = 11;
+
+pub(crate) fn mail_folder_label(folder: &MailFolder) -> String {
+    let name = folder.display_name.clone().unwrap_or_default();
+    match folder.unread_item_count.unwrap_or(0) {
+        unread if unread > 0 => format!("{name} ({unread})"),
+        _ => name,
+    }
+}
+
+fn folder_panel_width(folders: &[MailFolder]) -> u16 {
+    // Two border columns and one selected-row marker sit beside the label.
+    folders
+        .iter()
+        .map(mail_folder_label)
+        .map(|label| u16::try_from(Line::from(label).width()).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(3)
+        .max(MIN_FOLDER_PANEL_WIDTH)
+}
+
 /// Palette fuzzy-ish filter (case-insensitive substring on label or id).
 pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
     let q = query.to_ascii_lowercase();
@@ -2862,7 +2913,7 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_newest_first, next_field, parse_recipients, step};
+    use super::{folder_panel_width, merge_newest_first, next_field, parse_recipients, step};
 
     #[test]
     fn messages_sort_chronologically_regardless_of_arrival_order() {
@@ -2946,6 +2997,21 @@ mod tests {
         assert_eq!(step(4, 1, 5), 4);
         assert_eq!(step(2, 1, 5), 3);
         assert_eq!(step(0, 1, 0), 0, "empty list stays at 0");
+    }
+
+    #[test]
+    fn folder_panel_fits_rendered_labels() {
+        let folder = |name: &str, unread: i64| {
+            serde_json::from_value(serde_json::json!({
+                "id": name,
+                "displayName": name,
+                "unreadItemCount": unread
+            }))
+            .unwrap()
+        };
+        assert_eq!(folder_panel_width(&[]), 11, "title remains visible");
+        assert_eq!(folder_panel_width(&[folder("Inbox", 0)]), 11);
+        assert_eq!(folder_panel_width(&[folder("Long folder", 12)]), 19);
     }
 
     #[test]

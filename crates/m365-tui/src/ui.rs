@@ -7,8 +7,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    filter_commands, App, CallPhase, Compose, OutlookFocus, Overlay, PushState, Screen, TeamsFocus,
-    TeamsMode,
+    filter_commands, mail_folder_label, App, CallPhase, Compose, OutlookFocus, Overlay, PushState,
+    Screen, TeamsFocus, TeamsMode, DEFAULT_FOLDER_PANEL_WIDTH,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -198,7 +198,7 @@ fn context_hints(app: &App) -> &'static str {
     }
     match app.screen {
         Screen::Outlook => match app.outlook_focus {
-            OutlookFocus::Folders => "j/k move · l open folder",
+            OutlookFocus::Folders => "j/k move · l open · H/L resize",
             OutlookFocus::Messages => "j/k move · l read · h back · c compose · r reply · / search",
             OutlookFocus::Reading => "j/k scroll · h back · o links · A attach · y copy",
         },
@@ -228,7 +228,11 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(26),
+            Constraint::Length(
+                app.outlook
+                    .folder_width
+                    .unwrap_or(DEFAULT_FOLDER_PANEL_WIDTH),
+            ),
             Constraint::Percentage(40),
             Constraint::Min(20),
         ])
@@ -239,16 +243,7 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         .outlook
         .folders
         .iter()
-        .map(|folder| {
-            let unread = folder.unread_item_count.unwrap_or(0);
-            let name = folder.display_name.clone().unwrap_or_default();
-            let label = if unread > 0 {
-                format!("{name} ({unread})")
-            } else {
-                name
-            };
-            ListItem::new(label)
-        })
+        .map(|folder| ListItem::new(mail_folder_label(folder)))
         .collect();
     let mut fstate = ListState::default();
     fstate.select(Some(app.outlook.folder_sel));
@@ -980,6 +975,7 @@ fn render_overlay(f: &mut Frame, app: &App) {
  \n\
  Moving:  h/← out a pane · l/→ into it (opens what's selected)\n\
           j/k or ↑/↓ move · arrows work everywhere hjkl does\n\
+          Outlook: Shift+H/L resize the Folders panel\n\
  \n\
  Outlook: Enter open · c compose · r reply · a reply-all · f forward\n\
           / search · g calendar · in the reading pane j/k scroll\n\
