@@ -27,7 +27,6 @@ markup5ever_rcdom = "0.38"
 directories.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
-axum = { version = "0.8", features = ["ws"] }
 
 [dev-dependencies]
 serde_json.workspace = true

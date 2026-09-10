@@ -4,8 +4,6 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::acs::AcsConfig;
-
 /// Microsoft Graph base URL (v1.0 endpoint).
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
@@ -73,13 +71,6 @@ pub struct Config {
     pub client_state: String,
     /// Desktop notifications for direct messages and `@mentions`.
     pub notifications: bool,
-    /// Azure Communication Services resource, for Teams calling. `None`
-    /// disables calling; chats and mail still work.
-    pub acs: Option<AcsConfig>,
-    /// Public HTTPS base ACS can reach for call callbacks and media, e.g.
-    /// `https://call.example.com`. When unset, a throwaway `cloudflared`
-    /// tunnel is spawned for the duration of each call.
-    pub call_public_url: Option<String>,
 }
 
 impl Config {
@@ -130,16 +121,6 @@ impl Config {
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         );
 
-        let acs = match std::env::var("M365_ACS_CONNECTION_STRING") {
-            Ok(s) if !s.trim().is_empty() => Some(AcsConfig::from_connection_string(&s)?),
-            _ => None,
-        };
-
-        let call_public_url = std::env::var("M365_CALL_PUBLIC_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().trim_end_matches('/').to_string());
-
         Ok(Self {
             client_id,
             tenant_id,
@@ -149,8 +130,6 @@ impl Config {
             token_cache_path,
             client_state,
             notifications,
-            acs,
-            call_public_url,
         })
     }
 
@@ -172,11 +151,6 @@ impl Config {
     /// Whether the token we request can enumerate teams and channels.
     pub fn can_read_teams(&self) -> bool {
         self.has_scope(TEAMS_READ_SCOPE)
-    }
-
-    /// Whether an ACS resource is configured, so calling can be attempted.
-    pub fn can_call(&self) -> bool {
-        self.acs.is_some()
     }
 
     fn has_scope(&self, scope: &str) -> bool {
@@ -256,8 +230,6 @@ mod tests {
             token_cache_path: PathBuf::from("/tmp/x.json"),
             client_state: "secret".into(),
             notifications: true,
-            acs: None,
-            call_public_url: None,
         }
     }
 

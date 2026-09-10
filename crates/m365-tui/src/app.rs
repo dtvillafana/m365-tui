@@ -11,12 +11,9 @@ use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
-    Attachment, Chat, ChatCall, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence,
-    Team, User,
+    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence, Team, User,
 };
-use m365_core::{
-    calendar, channels, chats, mail, people, AcsClient, CallTarget, OutgoingBody, Session,
-};
+use m365_core::{calendar, channels, chats, mail, people, OutgoingBody, Session};
 use ratatui::text::{Line, Text};
 use tokio::sync::mpsc;
 
@@ -98,10 +95,6 @@ pub enum AppMessage {
     Tick,
     /// Periodic tick: refresh the current view from the server.
     Poll,
-    /// The call's audio path is up.
-    CallLive,
-    /// The call ended or failed; `reason` is shown in the status bar.
-    CallEnded(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -135,19 +128,6 @@ pub enum TeamsFocus {
     List,
     Messages,
     Composer,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum CallPhase {
-    Connecting,
-    Live,
-}
-
-pub struct ActiveCall {
-    pub label: String,
-    pub phase: CallPhase,
-    pub muted: bool,
-    pub since: Option<std::time::Instant>,
 }
 
 /// A transient full-screen/modal overlay.
@@ -493,9 +473,6 @@ pub struct App {
     pub image_cache: std::collections::HashMap<String, crate::termimg::ReadyImage>,
     pub image_loading: std::collections::HashSet<String>,
     pub image_failed: std::collections::HashSet<String>,
-    /// In-progress Teams call, when there is one.
-    pub call: Option<ActiveCall>,
-    call_controls: Option<crate::calling::CallControls>,
 }
 
 /// Palette command identifiers.
@@ -506,7 +483,6 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("calendar", "Open calendar (today)"),
     ("chat-sender", "Teams: chat with selected email's sender"),
     ("refresh", "Refresh current view"),
-    ("call", "Teams: call the selected chat / join the meeting"),
     ("help", "Show help"),
     ("quit", "Quit"),
 ];
@@ -543,8 +519,6 @@ impl App {
             image_cache: std::collections::HashMap::new(),
             image_loading: std::collections::HashSet::new(),
             image_failed: std::collections::HashSet::new(),
-            call: None,
-            call_controls: None,
         }
     }
 
@@ -893,132 +867,6 @@ impl App {
         });
     }
 
-    fn current_chat(&self) -> Option<&Chat> {
-        if let Some(id) = &self.teams.open_chat_id {
-            if let Some(c) = self.teams.chats.iter().find(|c| &c.id == id) {
-                return Some(c);
-            }
-        }
-        if self.teams.mode == TeamsMode::Chats {
-            self.teams.chats.get(self.teams.chat_sel)
-        } else {
-            None
-        }
-    }
-
-    fn start_call(&mut self) {
-        if self.call.is_some() {
-            self.status = "already in a call — C to hang up".into();
-            return;
-        }
-        let Some(acs_cfg) = self.session.config.acs.clone() else {
-            self.status = "calling needs an Azure Communication Services resource — set M365_ACS_CONNECTION_STRING".into();
-            return;
-        };
-        if !crate::calling::sox_available() {
-            self.status = "calling needs sox on PATH (play/record PCM)".into();
-            return;
-        }
-        if self.session.config.call_public_url.is_none() && !crate::calling::can_publish() {
-            self.status =
-                "calling needs cloudflared, or M365_CALL_PUBLIC_URL pointing at this machine"
-                    .into();
-            return;
-        }
-        let Some(chat) = self.current_chat() else {
-            self.status = "open a chat to call, or a meeting chat to join".into();
-            return;
-        };
-        let me_id = self.me.as_ref().map(|m| m.id.as_str());
-        let Some(target) = chat.call_target(me_id) else {
-            self.status = "this chat has no one to call".into();
-            return;
-        };
-        let (label, call_target) = match target {
-            ChatCall::Meeting { .. } => {
-                self.status = "Teams meeting links are not supported by ACS Call Automation — open the meeting in Teams".into();
-                return;
-            }
-            ChatCall::Users { ids, label } => (label, CallTarget::Users { ids }),
-        };
-        let display_name = self
-            .me
-            .as_ref()
-            .and_then(|u| u.display_name.clone())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "m365-tui".into());
-        let public_url = self.session.config.call_public_url.clone();
-        let (controls, hangup_rx, muted_rx) = crate::calling::new_controls();
-        self.call_controls = Some(controls);
-        self.call = Some(ActiveCall {
-            label: label.clone(),
-            phase: CallPhase::Connecting,
-            muted: false,
-            since: None,
-        });
-        self.status = format!("calling {label}…");
-
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(4);
-            let runner = crate::calling::run_call(
-                crate::calling::CallOpts {
-                    acs: AcsClient::new(acs_cfg),
-                    target: call_target,
-                    display_name,
-                    public_url,
-                },
-                ev_tx,
-                hangup_rx,
-                muted_rx,
-            );
-            tokio::pin!(runner);
-            loop {
-                tokio::select! {
-                    ev = ev_rx.recv() => {
-                        if let Some(crate::calling::CallEvent::Live) = ev {
-                            let _ = tx.send(AppMessage::CallLive).await;
-                        }
-                    }
-                    result = &mut runner => {
-                        let msg = match result {
-                            Ok(()) => AppMessage::CallEnded("call ended".into()),
-                            Err(e) => AppMessage::CallEnded(format!("call failed: {e:#}")),
-                        };
-                        let _ = tx.send(msg).await;
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    pub fn hangup_call(&mut self) {
-        if let Some(ctl) = self.call_controls.take() {
-            ctl.hangup();
-        }
-        if let Some(call) = self.call.as_mut() {
-            call.phase = CallPhase::Connecting;
-            self.status = format!("hanging up {}…", call.label);
-        }
-    }
-
-    fn toggle_mute(&mut self) {
-        let Some(call) = self.call.as_mut() else {
-            self.status = "not in a call".into();
-            return;
-        };
-        call.muted = !call.muted;
-        if let Some(ctl) = &self.call_controls {
-            ctl.set_muted(call.muted);
-        }
-        self.status = if call.muted {
-            "muted".into()
-        } else {
-            "unmuted".into()
-        };
-    }
-
     // -- applying background results --------------------------------------
 
     pub fn apply(&mut self, msg: AppMessage) {
@@ -1257,18 +1105,6 @@ impl App {
                     self.status = format!("push unavailable, using 20s polling — {reason}");
                 }
                 self.push = state;
-            }
-            AppMessage::CallLive => {
-                if let Some(call) = self.call.as_mut() {
-                    call.phase = CallPhase::Live;
-                    call.since = Some(std::time::Instant::now());
-                    self.status = format!("in call with {}", call.label);
-                }
-            }
-            AppMessage::CallEnded(reason) => {
-                self.call = None;
-                self.call_controls = None;
-                self.status = reason;
             }
             AppMessage::Tick => {
                 self.rss_kb = read_rss_kb();
@@ -2025,9 +1861,6 @@ impl App {
                 };
             }
             KeyCode::Char('i') => self.teams.focus = TeamsFocus::Composer,
-            KeyCode::Char('c') => self.start_call(),
-            KeyCode::Char('C') => self.hangup_call(),
-            KeyCode::Char('m') => self.toggle_mute(),
             // Reply to the selected message: same composer, quoted on send.
             KeyCode::Char('r')
                 if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
@@ -2731,10 +2564,6 @@ impl App {
                 }
             }
             "refresh" => self.refresh_current(),
-            "call" => {
-                self.screen = Screen::Teams;
-                self.start_call();
-            }
             "help" => self.overlay = Some(Overlay::Help),
             "quit" => self.should_quit = true,
             _ => {}

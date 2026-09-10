@@ -21,5 +21,3 @@ dotenvy.workspace = true
 redis.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
-hmac = "0.12"
-sha2 = "0.10"

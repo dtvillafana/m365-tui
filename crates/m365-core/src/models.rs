@@ -184,23 +184,6 @@ pub struct Chat {
     pub members: Vec<ConversationMember>,
     #[serde(default)]
     pub last_message_preview: Option<LastMessagePreview>,
-    #[serde(default)]
-    pub online_meeting_info: Option<ChatOnlineMeetingInfo>,
-}
-
-/// Join information on a meeting chat (`chatType` is `meeting`).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatOnlineMeetingInfo {
-    #[serde(default)]
-    pub join_web_url: Option<String>,
-}
-
-/// Who a chat's `c` (call) key should ring, or which meeting to join.
-#[derive(Debug, Clone)]
-pub enum ChatCall {
-    Meeting { join_url: String, label: String },
-    Users { ids: Vec<String>, label: String },
 }
 
 impl Chat {
@@ -223,39 +206,6 @@ impl Chat {
             self.chat_type.clone().unwrap_or_else(|| "chat".into())
         } else {
             names.join(", ")
-        }
-    }
-
-    /// A call target for this chat: a meeting join URL if it is a meeting
-    /// chat, otherwise the other members' Entra ids.
-    pub fn call_target(&self, me_id: Option<&str>) -> Option<ChatCall> {
-        let label = self.label(me_id);
-        if let Some(url) = self
-            .online_meeting_info
-            .as_ref()
-            .and_then(|o| o.join_web_url.as_deref())
-            .filter(|s| !s.is_empty())
-        {
-            return Some(ChatCall::Meeting {
-                join_url: url.to_string(),
-                label,
-            });
-        }
-        let ids: Vec<String> = self
-            .members
-            .iter()
-            .filter(|m| {
-                me_id
-                    .map(|id| m.user_id.as_deref() != Some(id))
-                    .unwrap_or(true)
-            })
-            .filter_map(|m| m.user_id.clone())
-            .filter(|id| !id.is_empty())
-            .collect();
-        if ids.is_empty() {
-            None
-        } else {
-            Some(ChatCall::Users { ids, label })
         }
     }
 }
@@ -619,47 +569,6 @@ mod tests {
         }))
         .unwrap();
         assert!(plain.quoted().is_none());
-    }
-
-    #[test]
-    fn call_target_prefers_a_meeting_join_url() {
-        let chat: Chat = serde_json::from_value(serde_json::json!({
-            "id": "19:meeting",
-            "topic": "Standup",
-            "chatType": "meeting",
-            "onlineMeetingInfo": {
-                "joinWebUrl": "https://teams.microsoft.com/l/meetup-join/abc"
-            },
-            "members": [{ "userId": "me", "displayName": "Me" }]
-        }))
-        .unwrap();
-        match chat.call_target(Some("me")) {
-            Some(ChatCall::Meeting { join_url, label }) => {
-                assert!(join_url.contains("meetup-join"));
-                assert_eq!(label, "Standup");
-            }
-            other => panic!("expected a meeting, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn call_target_on_a_one_to_one_chat_is_the_other_person() {
-        let chat: Chat = serde_json::from_value(serde_json::json!({
-            "id": "19:chat",
-            "chatType": "oneOnOne",
-            "members": [
-                { "userId": "me", "displayName": "Me" },
-                { "userId": "them", "displayName": "Alex Rivera" }
-            ]
-        }))
-        .unwrap();
-        match chat.call_target(Some("me")) {
-            Some(ChatCall::Users { ids, label }) => {
-                assert_eq!(ids, vec!["them".to_string()]);
-                assert_eq!(label, "Alex Rivera");
-            }
-            other => panic!("expected users, got {other:?}"),
-        }
     }
 
     #[test]
