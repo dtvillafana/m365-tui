@@ -932,7 +932,10 @@ impl App {
             return;
         };
         let (label, call_target) = match target {
-            ChatCall::Meeting { join_url, label } => (label, CallTarget::Meeting { join_url }),
+            ChatCall::Meeting { .. } => {
+                self.status = "Teams meeting links are not supported by ACS Call Automation — open the meeting in Teams".into();
+                return;
+            }
             ChatCall::Users { ids, label } => (label, CallTarget::Users { ids }),
         };
         let display_name = self
@@ -977,10 +980,7 @@ impl App {
                     result = &mut runner => {
                         let msg = match result {
                             Ok(()) => AppMessage::CallEnded("call ended".into()),
-                            Err(e) => AppMessage::CallEnded(format!(
-                                "call failed: {}",
-                                m365_core::util::graph_error_summary(&format!("{e:#}"))
-                            )),
+                            Err(e) => AppMessage::CallEnded(format!("call failed: {e:#}")),
                         };
                         let _ = tx.send(msg).await;
                         break;

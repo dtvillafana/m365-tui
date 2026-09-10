@@ -37,7 +37,12 @@
       };
 
       mkBin =
-        { pname, cratePkg, description, mainProgram }:
+        {
+          pname,
+          cratePkg,
+          description,
+          mainProgram,
+        }:
         pkgs.rustPlatform.buildRustPackage (
           common
           // {
@@ -81,6 +86,8 @@
           cargo
           rustfmt
           clippy
+          sox
+          cloudflared
           # Editors pick rust-analyzer up from PATH. Supplying it here keeps it on
           # the same toolchain as the compiler: a rust-analyzer that cannot reach
           # a working rustc reports errors that `cargo check` does not, because it

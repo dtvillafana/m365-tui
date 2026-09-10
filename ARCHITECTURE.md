@@ -470,12 +470,13 @@ Two places take data from anyone who can send you a message:
   preference one (`Busy` must be `InACall`, `DoNotDisturb` must be
   `Presenting`).
 - **Calling is audio-only, via ACS Call Automation + sox.** The client
-  Calling SDK (WebRTC) has no Linux target, so a call is a REST `connect` /
+  Calling SDK (WebRTC) has no Linux target, so a call is a REST
   `createCall` plus bidirectional PCM 16 kHz over a WebSocket ACS opens to a
   local axum server. sox plays and records; `cloudflared` (or
   `M365_CALL_PUBLIC_URL`) publishes that server. The participant shows in
   Teams as an ACS / external user, not as a native Teams client. Video is
-  not carried.
+  not carried. Teams meeting-link locators are not supported by the configured
+  Call Automation API (2025-06-15), so meeting chats cannot be joined this way.
 
 ## Releases
 

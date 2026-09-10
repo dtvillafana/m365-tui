@@ -1,8 +1,8 @@
 //! Azure Communication Services: HMAC-signed REST for Call Automation.
 //!
 //! The client Calling SDK (WebRTC) is browser / Windows / mobile only. On
-//! Linux the equivalent is this REST surface: join a Teams meeting or place a
-//! call to Teams users, then stream PCM over a WebSocket that ACS opens to us.
+//! Linux this REST surface can place a call to Teams users, then stream PCM
+//! over a WebSocket that ACS opens to us. Teams meeting links are unsupported.
 //! Audio devices are someone else's problem (the TUI uses sox).
 
 use anyhow::{Context, Result};
@@ -94,13 +94,14 @@ impl AcsClient {
         Self {
             http: reqwest::Client::builder()
                 .user_agent("m365-tui/0.1")
+                .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("building reqwest client"),
             config,
         }
     }
 
-    /// Join a Teams meeting, or place a 1:1 / group call to Teams users.
+    /// Place a 1:1 / group call to Teams users. Meeting links are unsupported.
     ///
     /// `callback_uri` and `media_ws_uri` must be reachable from ACS (HTTPS /
     /// WSS). Media streaming is bidirectional PCM 16 kHz mono.
@@ -113,32 +114,11 @@ impl AcsClient {
     ) -> Result<CallConnection> {
         let media = media_streaming_options(media_ws_uri);
         match target {
-            CallTarget::Meeting { join_url } => {
-                let body = json!({
-                    "callbackUri": callback_uri,
-                    "sourceDisplayName": display_name,
-                    "callLocator": {
-                        "kind": "teamsMeetingLink",
-                        "teamsMeetingLink": join_url,
-                    },
-                    "mediaStreamingOptions": media,
-                });
-                self.post("/calling/callConnections:connect", &body)
-                    .await
-                    .map(parse_connection)
-                    .and_then(|r| r)
+            CallTarget::Meeting { .. } => {
+                anyhow::bail!("Teams meeting links are not supported by ACS Call Automation API {API_VERSION}; open the meeting in Teams")
             }
             CallTarget::Users { ids } => {
-                let targets: Vec<Value> = ids
-                    .iter()
-                    .map(|id| {
-                        json!({
-                            "kind": "microsoftTeamsUser",
-                            "microsoftTeamsUserId": id,
-                            "cloud": "public",
-                        })
-                    })
-                    .collect();
+                let targets = teams_targets(ids)?;
                 let body = json!({
                     "callbackUri": callback_uri,
                     "sourceDisplayName": display_name,
@@ -196,6 +176,23 @@ impl AcsClient {
         }
         Ok(bytes.to_vec())
     }
+}
+
+fn teams_targets(ids: &[String]) -> Result<Vec<Value>> {
+    anyhow::ensure!(!ids.is_empty(), "no Teams users to call");
+    ids.iter()
+        .map(|id| {
+            uuid::Uuid::parse_str(id).context("Teams target must be an Entra object UUID")?;
+            Ok(json!({
+                "kind": "microsoftTeamsUser",
+                "microsoftTeamsUser": {
+                    "userId": id,
+                    "isAnonymous": false,
+                    "cloud": "public",
+                },
+            }))
+        })
+        .collect()
 }
 
 fn media_streaming_options(media_ws_uri: &str) -> Value {
@@ -311,5 +308,16 @@ mod tests {
     #[test]
     fn rejects_a_connection_string_without_an_endpoint() {
         assert!(AcsConfig::from_connection_string("accesskey=qq==").is_err());
+    }
+
+    #[test]
+    fn teams_identifier_matches_rest_schema_not_calling_sdk_shape() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        let targets = teams_targets(&[id.into()]).unwrap();
+        assert_eq!(targets[0]["microsoftTeamsUser"]["userId"], id);
+        assert_eq!(targets[0]["microsoftTeamsUser"]["cloud"], "public");
+        assert!(targets[0].get("microsoftTeamsUserId").is_none());
+        assert!(teams_targets(&[]).is_err());
+        assert!(teams_targets(&["user@example.com".into()]).is_err());
     }
 }

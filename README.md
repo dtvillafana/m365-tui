@@ -403,23 +403,43 @@ publishes one tarball per architecture, with [`deploy/`](deploy/) packaged insid
 it as `realtime/`. That's what the install step above downloads. Design notes and
 internals live in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-**Calling.** In a 1:1 or group chat press `c` to ring the other people; in a
-meeting chat it joins the meeting. Audio is 16 kHz PCM through `sox` (`-d` is
+**Calling.** In a 1:1 or group chat press `c` to ring the other people.
+Teams meeting-link joining is not supported by the configured ACS Call Automation
+API (2025-06-15); open meeting chats in Teams instead. Audio is 16 kHz PCM through `sox` (`-d` is
 your default mic and speaker). `m` mutes, `C` hangs up. This is opt-in and
 needs three things:
 
 1. An [Azure Communication Services](https://learn.microsoft.com/azure/communication-services/)
    resource whose connection string is in `M365_ACS_CONNECTION_STRING`.
-2. `sox` on `PATH`.
+2. `sox` on `PATH`, with support for your default audio devices.
 3. A public HTTPS URL ACS can open a WebSocket to. `cloudflared` on `PATH`
    is enough — a throwaway `trycloudflare.com` tunnel is spawned for the
    call. Or set `M365_CALL_PUBLIC_URL` to a tunnel you already run, forwarding
-   to `127.0.0.1:${M365_CALL_BIND:-8788}`.
+   to `127.0.0.1:${M365_CALL_BIND:-8788}`. This is the calling server, separate
+   from the Graph notification webhook. Forward `/callback`, `/media` (with
+   WebSocket upgrades), and `/health/*` without an interactive login page.
 
 There is no Linux client Calling SDK, so the TUI uses ACS Call Automation
 (REST) and appears in Teams as an ACS / external participant using your
 display name. 1:1 calls to Teams users also need the ACS resource authorised
-for Teams interop in the Teams admin centre. Video is not supported.
+for Teams interop in the Teams admin centre, and the target Teams users need
+Teams Phone licenses and voice enablement for Call Automation interoperability.
+Video is not supported.
+
+The Nix development shell includes `sox` and `cloudflared`. Start the updated
+app with `nix develop -c cargo run -p m365-tui --bin m365`.
+Before dialing, the app waits for the public tunnel to reach the local server
+and checks that the audio processes start. ACS failures retain their HTTP status,
+error body, and callback result codes instead of being reduced to “Invalid request”.
+If readiness fails with a DNS lookup error, check that this machine can resolve
+the generated `*.trycloudflare.com` hostname. A connected cloudflared process alone
+does not guarantee local DNS resolution; fix the resolver or use a resolvable
+named tunnel through `M365_CALL_PUBLIC_URL`.
+An integration check can exercise a real quick tunnel without placing a call:
+
+```sh
+nix develop -c cargo test -p m365-tui live_quick_tunnel_reaches_local_server -- --ignored
+```
 
 ## Not supported
 

@@ -987,7 +987,7 @@ fn render_overlay(f: &mut Frame, app: &App) {
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
           i type · r reply · Enter send · Ctrl+V paste image\n\
           @path Tab complete image · Ctrl+X remove last image\n\
-           c call / join meeting · m mute · C hang up (needs ACS + sox)\n\
+           c call · m mute · C hang up (needs ACS + sox)\n\
  \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\

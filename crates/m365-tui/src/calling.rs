@@ -25,6 +25,15 @@ use tokio::task::JoinHandle;
 /// 20 ms of 16 kHz 16-bit mono PCM.
 const FRAME_BYTES: usize = 640;
 
+// Dropping a JoinHandle detaches it; call-scoped tasks must stop on every exit.
+struct CallTask<T>(JoinHandle<T>);
+
+impl<T> Drop for CallTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Mid-call signal back to the UI. The function returns when the call is over.
 pub enum CallEvent {
     /// Audio is flowing.
@@ -104,7 +113,7 @@ pub async fn run_call(
     let (to_speaker_tx, to_speaker_rx) = mpsc::channel::<Vec<u8>>(32);
     let (from_mic_tx, from_mic_rx) = mpsc::channel::<Vec<u8>>(32);
     let ws_live = Arc::new(Notify::new());
-    let failed = Arc::new(Mutex::new(None::<String>));
+    let failed = Arc::new(Mutex::new(None::<Result<(), String>>));
 
     let state = CallHttp {
         to_speaker: to_speaker_tx,
@@ -118,9 +127,9 @@ pub async fn run_call(
     // user is pointing their own tunnel at us.
     let bind = if opts.public_url.is_some() {
         let port: u16 = std::env::var("M365_CALL_BIND")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8788);
+            .unwrap_or_else(|_| "8788".into())
+            .parse()
+            .context("M365_CALL_BIND must be a port number")?;
         format!("127.0.0.1:{port}")
     } else {
         "127.0.0.1:0".into()
@@ -130,19 +139,21 @@ pub async fn run_call(
         .with_context(|| format!("binding the local calling server on {bind}"))?;
     let local_port = listener.local_addr()?.port();
 
+    let probe = format!("/health/{local_port}");
     let app = Router::new()
+        .route(&probe, get(|| async { "m365-call-ready" }))
         .route("/callback", post(callback))
         .route("/media", get(media))
         .with_state(state);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
+    let _server = CallTask(tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
             .await
-    });
+    }));
 
     let mut tunnel = None;
     let public = match opts.public_url.clone() {
@@ -154,6 +165,7 @@ pub async fn run_call(
         }
     };
     let public = public.trim_end_matches('/').to_string();
+    wait_for_public_url(&public, &probe).await?;
     let callback_uri = format!("{public}/callback");
     let media_ws_uri = http_to_ws(&public) + "/media";
 
@@ -162,22 +174,29 @@ pub async fn run_call(
     let mut play_in = play.stdin.take().context("sox play stdin")?;
     let mut rec_out = rec.stdout.take().context("sox rec stdout")?;
 
-    let play_task = tokio::spawn(async move {
+    // Device failures usually happen just after spawn; report them before ringing.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    check_audio(&mut play, &mut rec).await?;
+    if *hangup.borrow() {
+        return Ok(());
+    }
+
+    let play_task = CallTask(tokio::spawn(async move {
         let mut rx = to_speaker_rx;
         while let Some(frame) = rx.recv().await {
             if play_in.write_all(&frame).await.is_err() {
                 break;
             }
         }
-    });
-    let rec_task = tokio::spawn(async move {
+    }));
+    let rec_task = CallTask(tokio::spawn(async move {
         let mut buf = vec![0u8; FRAME_BYTES];
         while rec_out.read_exact(&mut buf).await.is_ok() {
             if from_mic_tx.send(buf.clone()).await.is_err() {
                 break;
             }
         }
-    });
+    }));
 
     let started = opts
         .acs
@@ -197,20 +216,27 @@ pub async fn run_call(
             if let Some(mut t) = tunnel {
                 let _ = t.kill().await;
             }
-            play_task.abort();
-            rec_task.abort();
-            let _ = server.await;
             return Err(e);
         }
     };
 
     let acs = opts.acs.clone();
     let conn_id = connection.call_connection_id.clone();
-    tokio::spawn(async move {
-        ws_live.notified().await;
-        let _ = events.send(CallEvent::Live).await;
-    });
-    let outcome = wait_until_done(&mut hangup, &mut play, &mut rec, &failed).await;
+    let stream_failed = failed.clone();
+    let live_task = CallTask(tokio::spawn(async move {
+        if tokio::time::timeout(Duration::from_secs(90), ws_live.notified())
+            .await
+            .is_ok()
+        {
+            let _ = events.send(CallEvent::Live).await;
+        } else {
+            let mut outcome = stream_failed.lock().await;
+            if outcome.is_none() {
+                *outcome = Some(Err("ACS did not open the media WebSocket within 90 seconds; check tunnel routing and Teams interop".into()));
+            }
+        }
+    }));
+    let outcome = wait_until_done(&mut hangup, &mut play, &mut rec, &mut tunnel, &failed).await;
 
     let _ = acs.hangup(&conn_id).await;
     let _ = shutdown_tx.send(());
@@ -219,9 +245,7 @@ pub async fn run_call(
     if let Some(mut t) = tunnel {
         let _ = t.kill().await;
     }
-    play_task.abort();
-    rec_task.abort();
-    let _ = server.await;
+    drop((play_task, rec_task, live_task));
     outcome
 }
 
@@ -229,7 +253,8 @@ async fn wait_until_done(
     hangup: &mut watch::Receiver<bool>,
     play: &mut Child,
     rec: &mut Child,
-    failed: &Arc<Mutex<Option<String>>>,
+    tunnel: &mut Option<Child>,
+    failed: &Arc<Mutex<Option<Result<(), String>>>>,
 ) -> Result<()> {
     loop {
         if *hangup.borrow() {
@@ -242,19 +267,77 @@ async fn wait_until_done(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                if play.try_wait().context("polling sox play")?.is_some() {
-                    anyhow::bail!("sox playback exited");
-                }
-                if rec.try_wait().context("polling sox rec")?.is_some() {
-                    anyhow::bail!("sox capture exited");
+                check_audio(play, rec).await?;
+                if let Some(child) = tunnel.as_mut() {
+                    if let Some(status) = child.try_wait().context("polling cloudflared")? {
+                        anyhow::bail!("cloudflared exited ({status})");
+                    }
                 }
                 let reason = failed.lock().await.clone();
                 if let Some(reason) = reason {
-                    anyhow::bail!("{reason}");
+                    return reason.map_err(anyhow::Error::msg);
                 }
             }
         }
     }
+}
+
+async fn wait_for_public_url(public: &str, probe: &str) -> Result<()> {
+    let url = reqwest::Url::parse(public).context("invalid M365_CALL_PUBLIC_URL")?;
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "calling requires a public HTTPS base URL without a query or fragment"
+    );
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut last_error = "no response".to_string();
+    let ready = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match http.get(format!("{public}{probe}")).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success()
+                        && response.text().await.unwrap_or_default() == "m365-call-ready"
+                    {
+                        return;
+                    }
+                    last_error = format!("HTTP {status}, unexpected health response");
+                }
+                Err(error) => last_error = format!("{:#}", anyhow::Error::new(error)),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await;
+    ready.with_context(|| format!("calling tunnel is not reachable ({last_error}): public HTTPS must forward to the local calling port (default 8788), including /media WebSocket upgrades"))
+}
+
+async fn check_audio(play: &mut Child, rec: &mut Child) -> Result<()> {
+    for (name, child) in [("playback", play), ("capture", rec)] {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("polling sox {name}"))?
+        {
+            anyhow::bail!(
+                "sox {name} exited ({status}): {}",
+                child_stderr(child).await
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn child_stderr(child: &mut Child) -> String {
+    let mut text = String::new();
+    if let Some(stderr) = child.stderr.take() {
+        let _ = stderr.take(8192).read_to_string(&mut text).await;
+    }
+    text.trim().to_string()
 }
 
 fn http_to_ws(url: &str) -> String {
@@ -273,7 +356,7 @@ struct CallHttp {
     from_mic: Arc<Mutex<Option<mpsc::Receiver<Vec<u8>>>>>,
     muted: watch::Receiver<bool>,
     ws_live: Arc<Notify>,
-    failed: Arc<Mutex<Option<String>>>,
+    failed: Arc<Mutex<Option<Result<(), String>>>>,
 }
 
 async fn callback(State(state): State<CallHttp>, body: String) -> impl IntoResponse {
@@ -284,7 +367,7 @@ async fn callback(State(state): State<CallHttp>, body: String) -> impl IntoRespo
 }
 
 /// Pull a failure reason out of an ACS callback payload, if any.
-fn callback_failure(body: &str) -> Option<String> {
+fn callback_failure(body: &str) -> Option<Result<(), String>> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let events = if value.is_array() {
         value.as_array()?.clone()
@@ -294,12 +377,15 @@ fn callback_failure(body: &str) -> Option<String> {
     for ev in events {
         let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
         if ty.ends_with("Failed") {
-            let detail = ev
+            let data = ev.get("data").unwrap_or(&ev);
+            let detail = data
                 .get("resultInformation")
-                .and_then(|r| r.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or(ty);
-            return Some(detail.to_string());
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "no resultInformation".into());
+            return Some(Err(format!("{ty}: {detail}")));
+        }
+        if ty.ends_with("CallDisconnected") {
+            return Some(Ok(()));
         }
     }
     None
@@ -310,7 +396,6 @@ async fn media(ws: WebSocketUpgrade, State(state): State<CallHttp>) -> impl Into
 }
 
 async fn handle_media(mut socket: WebSocket, state: CallHttp) {
-    state.ws_live.notify_one();
     let mut from_mic = {
         let mut slot = state.from_mic.lock().await;
         match slot.take() {
@@ -318,6 +403,7 @@ async fn handle_media(mut socket: WebSocket, state: CallHttp) {
             None => return, // already consumed by a previous socket
         }
     };
+    state.ws_live.notify_one();
     let mut muted = state.muted.clone();
     loop {
         tokio::select! {
@@ -345,6 +431,10 @@ async fn handle_media(mut socket: WebSocket, state: CallHttp) {
             }
             _ = muted.changed() => {}
         }
+    }
+    let mut outcome = state.failed.lock().await;
+    if outcome.is_none() {
+        *outcome = Some(Err("ACS media WebSocket closed".into()));
     }
 }
 
@@ -389,12 +479,13 @@ fn spawn_sox_play() -> Result<Child> {
             "16",
             "-c",
             "1",
+            "-L",
             "-",
             "-d",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("spawning sox (play)")
@@ -417,11 +508,12 @@ fn spawn_sox_rec() -> Result<Child> {
             "16",
             "-c",
             "1",
+            "-L",
             "-",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("spawning sox (record)")
@@ -461,9 +553,9 @@ async fn spawn_cloudflared(port: u16) -> Result<(String, Child)> {
             handles.push(tokio::spawn(async move {
                 let mut lines = BufReader::new(out).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!("cloudflared: {line}");
                     if let Some(url) = parse_tunnel_url(&line) {
-                        let _ = tx.send(url).await;
-                        return;
+                        let _ = tx.try_send(url);
                     }
                 }
             }));
@@ -473,9 +565,9 @@ async fn spawn_cloudflared(port: u16) -> Result<(String, Child)> {
             handles.push(tokio::spawn(async move {
                 let mut lines = BufReader::new(err).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!("cloudflared: {line}");
                     if let Some(url) = parse_tunnel_url(&line) {
-                        let _ = tx.send(url).await;
-                        return;
+                        let _ = tx.try_send(url);
                     }
                 }
             }));
@@ -495,7 +587,7 @@ async fn spawn_cloudflared(port: u16) -> Result<(String, Child)> {
     }
 }
 
-/// Extract the first `https://…` token, used to scrape cloudflared's logs.
+/// Only accept quick-tunnel hostnames, never documentation links in the logs.
 pub fn parse_tunnel_url(line: &str) -> Option<String> {
     let start = line.find("https://")?;
     let rest = &line[start..];
@@ -503,7 +595,12 @@ pub fn parse_tunnel_url(line: &str) -> Option<String> {
         .find(|c: char| c.is_whitespace() || matches!(c, '|' | '"' | '\'' | ')' | ']'))
         .unwrap_or(rest.len());
     let url = rest[..end].trim_end_matches('/');
-    if url.len() > "https://".len() {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.host_str()?.ends_with(".trycloudflare.com")
+        && parsed.path() == "/"
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+    {
         Some(url.to_string())
     } else {
         None
@@ -526,6 +623,8 @@ mod tests {
     #[test]
     fn ignores_lines_without_a_url() {
         assert!(parse_tunnel_url("starting tunnel").is_none());
+        assert!(parse_tunnel_url("Terms: https://www.cloudflare.com/website-terms/").is_none());
+        assert!(parse_tunnel_url("https://fake.trycloudflare.com.example.org").is_none());
     }
 
     #[test]
@@ -550,9 +649,69 @@ mod tests {
     #[test]
     fn failed_callback_is_detected() {
         let body = r#"[{"type":"Microsoft.Communication.CreateCallFailed","resultInformation":{"message":"user not found"}}]"#;
-        assert_eq!(callback_failure(body).as_deref(), Some("user not found"));
+        let failure = callback_failure(body).unwrap().unwrap_err();
+        assert!(failure.contains("CreateCallFailed"));
+        assert!(failure.contains("user not found"));
         assert!(
             callback_failure(r#"[{"type":"Microsoft.Communication.CallConnected"}]"#).is_none()
         );
+    }
+
+    #[test]
+    fn cloud_event_failure_preserves_acs_codes() {
+        let body = r#"[{"type":"Microsoft.Communication.CreateCallFailed","data":{"resultInformation":{"code":403,"subCode":12345,"message":"Forbidden"}}}]"#;
+        let reason = callback_failure(body).unwrap().unwrap_err();
+        assert!(reason.contains("403"));
+        assert!(reason.contains("12345"));
+        assert!(reason.contains("Forbidden"));
+        assert_eq!(
+            callback_failure(r#"{"type":"Microsoft.Communication.CallDisconnected","data":{}}"#),
+            Some(Ok(()))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires cloudflared and outbound network; does not place a call"]
+    async fn live_quick_tunnel_reaches_local_server() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("m365=debug")
+            .try_init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/health/test", get(|| async { "m365-call-ready" }))
+            .route(
+                "/media",
+                get(|ws: WebSocketUpgrade| async {
+                    ws.on_upgrade(|mut socket| async move {
+                        let _ = socket.send(Message::Close(None)).await;
+                    })
+                }),
+            );
+        let _server = CallTask(tokio::spawn(
+            async move { axum::serve(listener, app).await },
+        ));
+        let (public, mut tunnel) = spawn_cloudflared(port).await.unwrap();
+        let result = async {
+            wait_for_public_url(&public, "/health/test").await?;
+            let response = reqwest::Client::new()
+                .get(format!("{public}/media"))
+                .timeout(Duration::from_secs(10))
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header("Sec-WebSocket-Version", "13")
+                .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .send()
+                .await?;
+            anyhow::ensure!(
+                response.status() == StatusCode::SWITCHING_PROTOCOLS,
+                "public WebSocket upgrade failed: {}",
+                response.status()
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let _ = tunnel.kill().await;
+        result.unwrap();
     }
 }
