@@ -188,8 +188,12 @@ fn context_hints(app: &App) -> &'static str {
     match app.screen {
         Screen::Outlook => match app.outlook_focus {
             OutlookFocus::Folders => "j/k move · l open · H/L resize",
-            OutlookFocus::Messages => "j/k move · l read · h back · c compose · r reply · / search",
-            OutlookFocus::Reading => "j/k scroll · h back · o links · A attach · y copy",
+            OutlookFocus::Messages => {
+                "j/k move · l read · h back · c compose · r reply · u read/unread · / search"
+            }
+            OutlookFocus::Reading => {
+                "j/k scroll · h back · u read/unread · o links · A attach · y copy"
+            }
         },
         Screen::Teams => match app.teams.focus {
             TeamsFocus::List => "j/k move · l open · t chats/channels",
@@ -917,7 +921,7 @@ fn render_overlay(f: &mut Frame, app: &App) {
           Outlook: Shift+H/L resize the Folders panel\n\
  \n\
  Outlook: Enter open · c compose · r reply · a reply-all · f forward\n\
-          / search · g calendar · in the reading pane j/k scroll\n\
+          u read/unread · / search · g calendar · in the reading pane j/k scroll\n\
  \n\
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
           i type · r reply · Enter send · Ctrl+V paste image\n\

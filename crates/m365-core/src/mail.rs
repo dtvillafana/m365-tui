@@ -118,6 +118,7 @@ pub async fn search(graph: &GraphClient, query: &str, top: u32) -> Result<Vec<Ma
     graph.get_page(&path).await
 }
 
+/// Mark a message as read or unread.
 pub async fn mark_read(graph: &GraphClient, id: &str, read: bool) -> Result<()> {
     graph
         .patch(&format!("me/messages/{id}"), &json!({ "isRead": read }))

@@ -480,6 +480,7 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("outlook", "Switch to Outlook"),
     ("teams", "Switch to Teams"),
     ("compose", "Compose new mail"),
+    ("mark-read", "Toggle the selected mail's read/unread state"),
     ("calendar", "Open calendar (today)"),
     ("chat-sender", "Teams: chat with selected email's sender"),
     ("refresh", "Refresh current view"),
@@ -1657,6 +1658,7 @@ impl App {
             KeyCode::Char('r') => self.open_reply(ReplyMode::Reply),
             KeyCode::Char('a') => self.open_reply(ReplyMode::ReplyAll),
             KeyCode::Char('f') => self.open_reply(ReplyMode::Forward),
+            KeyCode::Char('u') => self.toggle_mail_read(),
             KeyCode::Up | KeyCode::Char('k') => self.outlook_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.outlook_move(1),
             KeyCode::PageUp => self.outlook_move(-10),
@@ -1763,6 +1765,58 @@ impl App {
 
     fn current_mail(&self) -> Option<&MailMessage> {
         self.outlook.messages.get(self.outlook.msg_sel)
+    }
+
+    /// Toggle the selected message between read and unread.
+    fn toggle_mail_read(&mut self) {
+        let Some(m) = self.current_mail() else {
+            self.status = "select a message first".into();
+            return;
+        };
+        let id = m.id.clone();
+        let read = !m.is_read.unwrap_or(false);
+        self.set_mail_read(&id, read);
+    }
+
+    fn set_mail_read(&mut self, id: &str, read: bool) {
+        let mut found = false;
+        let mut was_unread = false;
+        if let Some(m) = self.outlook.messages.iter_mut().find(|m| m.id == id) {
+            was_unread = !m.is_read.unwrap_or(false);
+            m.is_read = Some(read);
+            found = true;
+        }
+        if let Some(m) = self.outlook.reading.as_mut().filter(|m| m.id == id) {
+            m.is_read = Some(read);
+            found = true;
+        }
+        if !found {
+            return;
+        }
+        if let Some(folder) = self.outlook.folders.get_mut(self.outlook.folder_sel) {
+            if let Some(count) = folder.unread_item_count.as_mut() {
+                if read && was_unread {
+                    *count = count.saturating_sub(1);
+                } else if !read && !was_unread {
+                    *count += 1;
+                }
+            }
+        }
+        let id = id.to_string();
+        let s = self.session.clone();
+        self.status = if read {
+            "marking as read…".into()
+        } else {
+            "marking as unread…".into()
+        };
+        self.spawn(async move {
+            mail::mark_read(&s.graph, &id, read).await?;
+            Ok(AppMessage::Status(if read {
+                "marked as read".into()
+            } else {
+                "marked as unread".into()
+            }))
+        });
     }
 
     fn open_reply(&mut self, mode: ReplyMode) {
@@ -2554,6 +2608,7 @@ impl App {
             "compose" => {
                 self.overlay = Some(Overlay::Compose(empty_compose()));
             }
+            "mark-read" => self.toggle_mail_read(),
             "calendar" => self.load_calendar_and_show(),
             "chat-sender" => {
                 if let Some(addr) = self.current_mail().and_then(|m| m.sender_address()) {
