@@ -28,7 +28,7 @@ use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use app::{App, AppMessage, PushState};
+use app::{format_compose_file, parse_compose_file, App, AppMessage, PushState};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
 };
@@ -236,29 +236,100 @@ async fn event_loop(
     app_rx: &mut mpsc::Receiver<AppMessage>,
     change_rx: &mut mpsc::Receiver<ChangeEvent>,
 ) -> Result<()> {
-    let mut reader = EventStream::new();
     loop {
-        terminal.draw(|f| ui::render(f, app))?;
+        {
+            let mut reader = EventStream::new();
+            loop {
+                terminal.draw(|f| ui::render(f, app))?;
 
-        tokio::select! {
-            maybe_event = reader.next() => {
-                match maybe_event {
-                    Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => app.on_key(k),
-                    Some(Ok(Event::Paste(text))) => app.on_paste(text),
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => return Err(e.into()),
-                    None => break,
+                tokio::select! {
+                    maybe_event = reader.next() => {
+                        match maybe_event {
+                            Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => app.on_key(k),
+                            Some(Ok(Event::Paste(text))) => app.on_paste(text),
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => return Err(e.into()),
+                            None => return Ok(()),
+                        }
+                    }
+                    Some(msg) = app_rx.recv() => app.apply(msg),
+                    Some(change) = change_rx.recv() => app.on_change(change),
+                }
+
+                if app.should_quit {
+                    return Ok(());
+                }
+                if app.pending_external_edit {
+                    break;
                 }
             }
-            Some(msg) = app_rx.recv() => app.apply(msg),
-            Some(change) = change_rx.recv() => app.on_change(change),
         }
+        // EventStream dropped so $EDITOR can own stdin.
+        app.pending_external_edit = false;
+        edit_compose_in_editor(terminal, app)?;
+    }
+}
 
-        if app.should_quit {
-            break;
-        }
+/// Suspend the TUI, open `$VISUAL`/`$EDITOR` on the compose subject and body,
+/// then restore the alternate screen.
+fn edit_compose_in_editor(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    let Some((subject, body)) = app.compose_edit_snapshot() else {
+        return Ok(());
+    };
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+
+    let result = run_compose_editor(&subject, &body);
+
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste
+    )?;
+    terminal.clear()?;
+    terminal.hide_cursor()?;
+
+    match result {
+        Ok((subject, body)) => app.apply_compose_edit(subject, body),
+        Err(e) => app.status = format!("editor failed: {e:#}"),
     }
     Ok(())
+}
+
+fn run_compose_editor(subject: &str, body: &str) -> Result<(Option<String>, String)> {
+    let path = std::env::temp_dir().join(format!("m365-compose-{}.txt", std::process::id()));
+    std::fs::write(&path, format_compose_file(subject, body))
+        .with_context(|| format!("writing {}", path.display()))?;
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "vi".into());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("m365-editor")
+        .arg(&path)
+        .status()
+        .with_context(|| format!("running {editor}"))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()));
+    let _ = std::fs::remove_file(&path);
+    let text = text?;
+    if !status.success() {
+        anyhow::bail!("{editor} exited {status}");
+    }
+    Ok(parse_compose_file(&text))
 }
 
 /// Subscribe to the webhook's Redis channel and keep Graph subscriptions alive.

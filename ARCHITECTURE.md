@@ -398,6 +398,7 @@ subprocess, each with a fallback so a missing tool degrades rather than fails:
 | `opener.rs` | `xdg-open`, `open` | Error reported in the status bar |
 | `clipboard.rs` | `wl-copy`, `xclip`, `xsel` | OSC 52 escape sequence |
 | `notify.rs` | `notify-send` | Terminal bell |
+| compose `Ctrl+X e` | `$VISUAL`, `$EDITOR` | `vi` |
 
 Only the push path needs services, and those are containers rather than host
 installs: Redis, the webhook itself, and `cloudflared`. So its one real

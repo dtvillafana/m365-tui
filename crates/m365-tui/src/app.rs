@@ -287,6 +287,8 @@ pub struct Compose {
     pub attachments: Vec<(std::path::PathBuf, u64)>,
     /// 0 = To, 1 = Subject, 2 = Body, 3 = Attach.
     pub field: usize,
+    /// Waiting for the second key of a Ctrl+X chord.
+    pub ctrl_x: bool,
 }
 
 impl Compose {
@@ -299,6 +301,7 @@ impl Compose {
             attach: TextInput::new(),
             attachments: Vec::new(),
             field,
+            ctrl_x: false,
         }
     }
 
@@ -474,6 +477,8 @@ pub struct App {
     /// When true, Outlook and Teams panes stack top-to-bottom instead of
     /// left-to-right.
     pub panes_vertical: bool,
+    /// Leave the TUI and open `$EDITOR` on the compose subject and body.
+    pub pending_external_edit: bool,
     pub should_quit: bool,
     /// Terminal graphics protocol, if the terminal can draw pixels.
     pub graphics: Option<crate::termimg::Graphics>,
@@ -526,6 +531,7 @@ impl App {
             copy_mode: false,
             copy_scroll: 0,
             panes_vertical: false,
+            pending_external_edit: false,
             should_quit: false,
             graphics: None,
             image_cache: std::collections::HashMap::new(),
@@ -2395,6 +2401,13 @@ impl App {
 
     fn on_key_overlay(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
+            if let Some(Overlay::Compose(c)) = &mut self.overlay {
+                if c.ctrl_x {
+                    c.ctrl_x = false;
+                    self.status.clear();
+                    return;
+                }
+            }
             self.overlay = None;
             return;
         }
@@ -2535,6 +2548,25 @@ impl App {
         // Width the body is laid out at, so Up/Down follow what's on screen.
         let width = self.text_width_hint.get();
 
+        if c.ctrl_x {
+            c.ctrl_x = false;
+            match key.code {
+                KeyCode::Char('e') => {
+                    self.pending_external_edit = true;
+                    self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
+                    return;
+                }
+                KeyCode::Char('x') => {
+                    if let Some((p, _)) = c.attachments.pop() {
+                        self.status = format!("removed {}", p.display());
+                    }
+                    self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             // -- actions --
             KeyCode::Char('s') if ctrl => {
@@ -2555,11 +2587,10 @@ impl App {
                     c.field = next_field(c.kind.fields(), c.field);
                 }
             }
-            // Drop the most recently staged attachment.
+            // Ctrl+X is a prefix: e opens $EDITOR, x unstages the last file.
             KeyCode::Char('x') if ctrl => {
-                if let Some((p, _)) = c.attachments.pop() {
-                    self.status = format!("removed {}", p.display());
-                }
+                c.ctrl_x = true;
+                self.status = "Ctrl+X — e $EDITOR · x unstage last attachment".into();
             }
 
             // -- deletion --
@@ -2749,6 +2780,29 @@ impl App {
             _ => {}
         }
     }
+
+    /// Subject and body of the open compose overlay, if any.
+    pub fn compose_edit_snapshot(&self) -> Option<(String, String)> {
+        match &self.overlay {
+            Some(Overlay::Compose(c)) => Some((c.subject.text(), c.body.text())),
+            _ => None,
+        }
+    }
+
+    pub fn apply_compose_edit(&mut self, subject: Option<String>, body: String) {
+        let Some(Overlay::Compose(c)) = &mut self.overlay else {
+            return;
+        };
+        if let Some(subject) = subject {
+            if matches!(c.kind, ComposeKind::NewMail) {
+                c.subject = TextInput::from(subject.as_str());
+            }
+        }
+        c.body = TextInput::from(body.as_str());
+        c.field = 2;
+        c.ctrl_x = false;
+        self.status = "edited in $EDITOR".into();
+    }
 }
 
 /// Fold a freshly-fetched newest page into an existing newest-first list:
@@ -2865,6 +2919,27 @@ fn empty_compose() -> Compose {
     Compose::new(ComposeKind::NewMail, 0)
 }
 
+/// Temp-file format used when composing in `$EDITOR`: a `Subject:` header,
+/// a blank line, then the body.
+pub fn format_compose_file(subject: &str, body: &str) -> String {
+    format!("Subject: {subject}\n\n{body}")
+}
+
+/// Parse the file written by [`format_compose_file`]. If the subject header is
+/// missing, the whole file is the body and the subject is left unchanged.
+pub fn parse_compose_file(s: &str) -> (Option<String>, String) {
+    let s = s.replace('\r', "");
+    let Some(rest) = s.strip_prefix("Subject:") else {
+        return (None, s);
+    };
+    let (subject, rest) = match rest.split_once('\n') {
+        Some((line, rest)) => (line.trim().to_string(), rest),
+        None => (rest.trim().to_string(), ""),
+    };
+    let body = rest.strip_prefix('\n').unwrap_or(rest).to_string();
+    (Some(subject), body)
+}
+
 fn prepared_body(prepared: &crate::images::Prepared) -> OutgoingBody<'_> {
     match prepared {
         crate::images::Prepared::Text(text) => OutgoingBody::Text(text),
@@ -2922,7 +2997,10 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{folder_panel_width, merge_newest_first, next_field, parse_recipients, step};
+    use super::{
+        folder_panel_width, format_compose_file, merge_newest_first, next_field,
+        parse_compose_file, parse_recipients, step,
+    };
 
     #[test]
     fn messages_sort_chronologically_regardless_of_arrival_order() {
@@ -3038,5 +3116,19 @@ mod tests {
             vec!["a@x.pt", "b@x.pt", "c@x.pt", "d@x.pt"]
         );
         assert!(parse_recipients("  ,; ").is_empty());
+    }
+
+    #[test]
+    fn compose_file_round_trips_subject_and_body() {
+        let file = format_compose_file("Hello", "line1\nline2");
+        assert_eq!(file, "Subject: Hello\n\nline1\nline2");
+        assert_eq!(
+            parse_compose_file(&file),
+            (Some("Hello".into()), "line1\nline2".into())
+        );
+        assert_eq!(
+            parse_compose_file("just the body\n"),
+            (None, "just the body\n".into())
+        );
     }
 }

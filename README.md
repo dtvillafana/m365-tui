@@ -210,7 +210,7 @@ Press `?` in the app for this list at any time.
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
-| **Writing** | `←→↑↓` move · `Ctrl+←→` by word · `Home`/`End` · `Ctrl+W`/`Ctrl+U`/`Ctrl+K` delete · `Ctrl+S` send · `Esc` cancel |
+| **Writing** | `←→↑↓` move · `Ctrl+←→` by word · `Home`/`End` · `Ctrl+W`/`Ctrl+U`/`Ctrl+K` delete · `Ctrl+X e` `$EDITOR` · `Ctrl+S` send · `Esc` cancel |
 
 `h` and `l` work like a file manager: `l` moves right into the pane beside you,
 opening whatever is selected, and `h` moves back out. `j`/`k` stay inside the
@@ -227,9 +227,13 @@ message, which clears itself after a few seconds.
 ## Things worth knowing
 
 **Sending attachments.** In the Outlook compose window, `Tab` to the `Attach:`
-field, type a file path (`~` works) and press `Enter` to stage it. `Ctrl+X`
+field, type a file path (`~` works) and press `Enter` to stage it. `Ctrl+X x`
 removes the last one. Files over 3 MB upload in chunks automatically; Graph's
 own ceiling is 150 MB per message.
+
+**Editing in `$EDITOR`.** While composing mail, `Ctrl+X e` (the same chord as
+the shell) leaves the TUI and opens `$VISUAL` or `$EDITOR` on the subject and
+body. Save and quit to return.
 
 **Images in Teams.** Paste an image with `Ctrl+V`. That reads real `image/*`
 bytes from the clipboard via `wl-paste`, then `xclip` if Wayland paste fails.

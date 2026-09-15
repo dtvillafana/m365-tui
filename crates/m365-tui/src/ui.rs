@@ -175,7 +175,7 @@ fn line_width(line: &Line) -> u16 {
 fn context_hints(app: &App) -> &'static str {
     if let Some(overlay) = &app.overlay {
         return match overlay {
-            Overlay::Compose(_) => "Ctrl+S send · Esc cancel",
+            Overlay::Compose(_) => "Ctrl+S send · Ctrl+X e $EDITOR · Esc cancel",
             Overlay::Links => "1-9 open · y copy · Esc close",
             Overlay::Attachments => "1-9 save · Esc close",
             Overlay::React => "1-7 react · Esc close",
@@ -965,6 +965,7 @@ fn render_overlay(f: &mut Frame, app: &App) {
           @path Tab complete image · Ctrl+X remove last image\n\
  \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
+          Ctrl+X e $EDITOR (body + subject) · Ctrl+X x unstage last file\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
           Backspace/Delete · Ctrl+W word · Ctrl+U to line start · Ctrl+K to end\n\
           Enter newline in body · paste works (bracketed paste)\n\
@@ -1337,10 +1338,12 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
     }
     i += 1;
 
-    let hint = if c.field == 3 {
-        "Enter attach file · Ctrl+X remove last · Tab field · Ctrl+S send · Esc cancel"
+    let hint = if c.ctrl_x {
+        "Ctrl+X — e $EDITOR · x unstage last attachment"
+    } else if c.field == 3 {
+        "Enter attach file · Ctrl+X x unstage · Ctrl+X e $EDITOR · Tab field · Ctrl+S send"
     } else {
-        "Tab field · ←→ move · Ctrl+←→ word · Ctrl+W/U/K delete · Ctrl+S send · Esc cancel"
+        "Tab field · Ctrl+X e $EDITOR · Ctrl+S send · Esc cancel"
     };
     f.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
