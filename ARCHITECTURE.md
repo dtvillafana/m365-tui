@@ -338,6 +338,10 @@ files, so a message with attachments takes a different route:
 
 Messages without attachments still use the simpler one-shot path.
 
+Composer text is sent as HTML in every case: Graph treats `sendMail` bodies and
+reply/forward comments as HTML, so a raw `\n` would collapse. `html_escape`
+turns newlines into `<br>` (and escapes `<>&`) before the body leaves.
+
 `send_message` takes its attachments **by value** so each file's buffer can be
 moved into `Bytes` once and then sliced per chunk without copying.
 

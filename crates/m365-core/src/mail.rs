@@ -136,6 +136,12 @@ pub async fn move_message(graph: &GraphClient, id: &str, destination_id: &str) -
         .await
 }
 
+/// Graph treats mail bodies and reply comments as HTML, so composer newlines
+/// have to become `<br>` or they collapse on the way out.
+fn html_body(text: &str) -> serde_json::Value {
+    json!({ "contentType": "HTML", "content": html_escape(text) })
+}
+
 /// Send a new message.
 pub async fn send_mail(
     graph: &GraphClient,
@@ -150,7 +156,7 @@ pub async fn send_mail(
     let payload = json!({
         "message": {
             "subject": subject,
-            "body": { "contentType": "Text", "content": body },
+            "body": html_body(body),
             "toRecipients": recipients,
         },
         "saveToSentItems": true,
@@ -163,7 +169,7 @@ pub async fn reply(graph: &GraphClient, id: &str, comment: &str) -> Result<()> {
     graph
         .post_action(
             &format!("me/messages/{id}/reply"),
-            &json!({ "comment": comment }),
+            &json!({ "comment": html_escape(comment) }),
         )
         .await
 }
@@ -173,7 +179,7 @@ pub async fn reply_all(graph: &GraphClient, id: &str, comment: &str) -> Result<(
     graph
         .post_action(
             &format!("me/messages/{id}/replyAll"),
-            &json!({ "comment": comment }),
+            &json!({ "comment": html_escape(comment) }),
         )
         .await
 }
@@ -187,7 +193,7 @@ pub async fn forward(graph: &GraphClient, id: &str, to: &[String], comment: &str
     graph
         .post_action(
             &format!("me/messages/{id}/forward"),
-            &json!({ "comment": comment, "toRecipients": recipients }),
+            &json!({ "comment": html_escape(comment), "toRecipients": recipients }),
         )
         .await
 }
@@ -266,7 +272,7 @@ async fn create_draft(graph: &GraphClient, kind: Outgoing, body: &str) -> Result
                     "me/messages",
                     &json!({
                         "subject": subject,
-                        "body": { "contentType": "Text", "content": body },
+                        "body": html_body(body),
                         "toRecipients": recipients,
                     }),
                 )
@@ -391,4 +397,16 @@ async fn upload_large_attachment(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn html_body_turns_newlines_into_breaks() {
+        let body = html_body("line1\nline2");
+        assert_eq!(body["contentType"], "HTML");
+        assert_eq!(body["content"], "line1<br>line2");
+    }
 }
