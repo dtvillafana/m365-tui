@@ -182,6 +182,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Presence => "1-6 set · c clear · Esc close",
             Overlay::Search { .. } => "Enter search · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
+            Overlay::MoveMail { .. } => "j/k choose · Enter move · Esc cancel",
             Overlay::Calendar | Overlay::Help => "Esc close",
         };
     }
@@ -189,10 +190,10 @@ fn context_hints(app: &App) -> &'static str {
         Screen::Outlook => match app.outlook_focus {
             OutlookFocus::Folders => "j/k move · l open · H/L resize",
             OutlookFocus::Messages => {
-                "j/k move · l read · h back · c compose · r reply · u read/unread · / search"
+                "j/k move · l read · h back · c compose · r reply · u read · m move · d trash · / search"
             }
             OutlookFocus::Reading => {
-                "j/k scroll · h back · u read/unread · o links · A attach · y copy"
+                "j/k scroll · h back · u read · m move · d trash · o links · A attach · y copy"
             }
         },
         Screen::Teams => match app.teams.focus {
@@ -956,7 +957,8 @@ fn render_overlay(f: &mut Frame, app: &App) {
           Outlook: Shift+H/L resize the Folders panel\n\
  \n\
  Outlook: Enter open · c compose · r reply · a reply-all · f forward\n\
-          u read/unread · / search · g calendar · in the reading pane j/k scroll\n\
+          u read/unread · m move folder · d trash · / search · g calendar\n\
+          in the reading pane j/k scroll\n\
  \n\
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
           i type · r reply · Enter send · Ctrl+V paste image\n\
@@ -1137,6 +1139,30 @@ fn render_overlay(f: &mut Frame, app: &App) {
                 })
                 .collect();
             f.render_widget(List::new(items), inner);
+        }
+        Overlay::MoveMail { sel } => {
+            let area = centered(50, 70, f.area());
+            f.render_widget(Clear, area);
+            let items: Vec<ListItem> = app
+                .outlook
+                .folders
+                .iter()
+                .map(|folder| ListItem::new(mail_folder_label(folder)))
+                .collect();
+            let mut st = ListState::default();
+            st.select(Some(*sel));
+            f.render_stateful_widget(
+                List::new(items)
+                    .block(popup_block("Move to folder — Enter to move · Esc cancel"))
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                area,
+                &mut st,
+            );
         }
         Overlay::Presence => {
             let area = centered(46, 55, f.area());

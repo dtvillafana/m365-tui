@@ -150,6 +150,10 @@ pub enum Overlay {
     Links,
     /// Attachments of the open mail message, to save to disk.
     Attachments,
+    /// Pick a folder to move the selected mail into.
+    MoveMail {
+        sel: usize,
+    },
 }
 
 /// Whether Graph push notifications are working.
@@ -484,6 +488,8 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("teams", "Switch to Teams"),
     ("compose", "Compose new mail"),
     ("mark-read", "Toggle the selected mail's read/unread state"),
+    ("move-mail", "Move the selected mail to another folder"),
+    ("trash", "Move the selected mail to Deleted Items"),
     ("layout", "Toggle horizontal/vertical pane layout"),
     ("calendar", "Open calendar (today)"),
     ("chat-sender", "Teams: chat with selected email's sender"),
@@ -1668,6 +1674,8 @@ impl App {
             KeyCode::Char('a') => self.open_reply(ReplyMode::ReplyAll),
             KeyCode::Char('f') => self.open_reply(ReplyMode::Forward),
             KeyCode::Char('u') => self.toggle_mail_read(),
+            KeyCode::Char('m') => self.open_move_mail(),
+            KeyCode::Char('d') | KeyCode::Delete => self.trash_current_mail(),
             KeyCode::Up | KeyCode::Char('k') => self.outlook_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.outlook_move(1),
             KeyCode::PageUp => self.outlook_move(-10),
@@ -1834,6 +1842,79 @@ impl App {
             } else {
                 "marked as unread".into()
             }))
+        });
+    }
+
+    fn open_move_mail(&mut self) {
+        if self.current_mail().is_none() {
+            self.status = "select a message first".into();
+            return;
+        }
+        if self.outlook.folders.is_empty() {
+            self.status = "folders still loading".into();
+            return;
+        }
+        self.overlay = Some(Overlay::MoveMail {
+            sel: self.outlook.folder_sel,
+        });
+    }
+
+    fn trash_current_mail(&mut self) {
+        let (id, label) = self
+            .outlook
+            .folders
+            .iter()
+            .find(|f| {
+                matches!(
+                    f.display_name.as_deref(),
+                    Some("Deleted Items") | Some("Trash")
+                )
+            })
+            .map(|f| {
+                (
+                    f.id.clone(),
+                    f.display_name
+                        .clone()
+                        .unwrap_or_else(|| "Deleted Items".into()),
+                )
+            })
+            .unwrap_or_else(|| ("deleteditems".into(), "Deleted Items".into()));
+        self.move_current_mail(id, label);
+    }
+
+    fn move_current_mail(&mut self, destination_id: String, dest_label: String) {
+        let Some(m) = self.current_mail() else {
+            self.status = "select a message first".into();
+            return;
+        };
+        if self
+            .outlook
+            .folders
+            .get(self.outlook.folder_sel)
+            .is_some_and(|f| f.id == destination_id)
+        {
+            self.status = format!("already in {dest_label}");
+            return;
+        }
+        let id = m.id.clone();
+        let sel = self.outlook.msg_sel;
+        self.outlook.messages.remove(sel);
+        self.outlook.msg_sel = sel.min(self.outlook.messages.len().saturating_sub(1));
+        if self.outlook.reading.as_ref().is_some_and(|r| r.id == id) {
+            self.outlook.reading = None;
+            self.outlook.reading_body = None;
+            self.outlook.reading_links.clear();
+            self.outlook.reading_attachments.clear();
+            self.outlook.reading_scroll = 0;
+            if self.outlook_focus == OutlookFocus::Reading {
+                self.outlook_focus = OutlookFocus::Messages;
+            }
+        }
+        self.status = format!("moving to {dest_label}…");
+        let s = self.session.clone();
+        self.spawn(async move {
+            mail::move_message(&s.graph, &id, &destination_id).await?;
+            Ok(AppMessage::Done(format!("moved to {dest_label}")))
         });
     }
 
@@ -2421,6 +2502,29 @@ impl App {
                 }
             }
             Some(Overlay::Compose(mut c)) => self.on_key_compose(key, &mut c),
+            Some(Overlay::MoveMail { mut sel }) => match key.code {
+                KeyCode::Enter => {
+                    if let Some(folder) = self.outlook.folders.get(sel) {
+                        let dest_id = folder.id.clone();
+                        let dest_label = folder
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| dest_id.clone());
+                        self.move_current_mail(dest_id, dest_label);
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    sel = sel.saturating_sub(1);
+                    self.overlay = Some(Overlay::MoveMail { sel });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if sel + 1 < self.outlook.folders.len() {
+                        sel += 1;
+                    }
+                    self.overlay = Some(Overlay::MoveMail { sel });
+                }
+                _ => self.overlay = Some(Overlay::MoveMail { sel }),
+            },
             None => {}
         }
     }
@@ -2627,6 +2731,8 @@ impl App {
                 self.overlay = Some(Overlay::Compose(empty_compose()));
             }
             "mark-read" => self.toggle_mail_read(),
+            "move-mail" => self.open_move_mail(),
+            "trash" => self.trash_current_mail(),
             "layout" => self.toggle_pane_layout(),
             "calendar" => self.load_calendar_and_show(),
             "chat-sender" => {

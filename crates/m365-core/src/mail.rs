@@ -125,6 +125,17 @@ pub async fn mark_read(graph: &GraphClient, id: &str, read: bool) -> Result<()> 
         .await
 }
 
+/// Move a message into another folder. `destination_id` is a folder id or a
+/// well-known name such as `deleteditems`.
+pub async fn move_message(graph: &GraphClient, id: &str, destination_id: &str) -> Result<()> {
+    graph
+        .post_action(
+            &format!("me/messages/{id}/move"),
+            &json!({ "destinationId": destination_id }),
+        )
+        .await
+}
+
 /// Send a new message.
 pub async fn send_mail(
     graph: &GraphClient,
