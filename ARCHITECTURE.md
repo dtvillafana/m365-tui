@@ -349,8 +349,9 @@ filesystem I/O, which it otherwise avoids.
 
 ## Navigation
 
-Panes are laid out left to right — folders, messages, reading; chat list,
-conversation — so movement follows that geometry, the way a file manager does:
+Panes are laid out left to right by default — folders, messages, reading; chat
+list, conversation — so movement follows that geometry, the way a file manager
+does. `|` (or `\`) stacks the same panes top to bottom instead:
 
 | Key | Effect |
 |---|---|

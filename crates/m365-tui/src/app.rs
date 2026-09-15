@@ -467,6 +467,9 @@ pub struct App {
     /// Borderless full-width view for clean terminal text selection.
     pub copy_mode: bool,
     pub copy_scroll: u16,
+    /// When true, Outlook and Teams panes stack top-to-bottom instead of
+    /// left-to-right.
+    pub panes_vertical: bool,
     pub should_quit: bool,
     /// Terminal graphics protocol, if the terminal can draw pixels.
     pub graphics: Option<crate::termimg::Graphics>,
@@ -481,6 +484,7 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("teams", "Switch to Teams"),
     ("compose", "Compose new mail"),
     ("mark-read", "Toggle the selected mail's read/unread state"),
+    ("layout", "Toggle horizontal/vertical pane layout"),
     ("calendar", "Open calendar (today)"),
     ("chat-sender", "Teams: chat with selected email's sender"),
     ("refresh", "Refresh current view"),
@@ -515,6 +519,7 @@ impl App {
             reading_max_scroll: std::cell::Cell::new(0),
             copy_mode: false,
             copy_scroll: 0,
+            panes_vertical: false,
             should_quit: false,
             graphics: None,
             image_cache: std::collections::HashMap::new(),
@@ -1587,6 +1592,10 @@ impl App {
                 };
                 return;
             }
+            (KeyCode::Char('|') | KeyCode::Char('\\'), _) if !typing => {
+                self.toggle_pane_layout();
+                return;
+            }
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 self.overlay = Some(Overlay::Palette {
                     query: String::new(),
@@ -1676,6 +1685,15 @@ impl App {
             KeyCode::Enter => self.outlook_enter(),
             _ => {}
         }
+    }
+
+    fn toggle_pane_layout(&mut self) {
+        self.panes_vertical = !self.panes_vertical;
+        self.status = if self.panes_vertical {
+            "panes stacked vertically".into()
+        } else {
+            "panes stacked horizontally".into()
+        };
     }
 
     fn resize_folder_panel(&mut self, delta: i16) {
@@ -2609,6 +2627,7 @@ impl App {
                 self.overlay = Some(Overlay::Compose(empty_compose()));
             }
             "mark-read" => self.toggle_mail_read(),
+            "layout" => self.toggle_pane_layout(),
             "calendar" => self.load_calendar_and_show(),
             "chat-sender" => {
                 if let Some(addr) = self.current_mail().and_then(|m| m.sender_address()) {

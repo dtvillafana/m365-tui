@@ -202,7 +202,7 @@ Press `?` in the app for this list at any time.
 
 | Scope | Keys |
 |---|---|
-| **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `?` help · `q` quit |
+| **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `|` or `\` toggle pane layout · `?` help · `q` quit |
 | **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · `Shift+H`/`Shift+L` resize Outlook folders · arrows work the same · `Tab` cycles |
 | **Outlook** | `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `u` read/unread · `/` search · `g` calendar |
 | **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `h` back to the list |

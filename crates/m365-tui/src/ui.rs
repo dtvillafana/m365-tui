@@ -203,14 +203,24 @@ fn context_hints(app: &App) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Outlook
-// ---------------------------------------------------------------------------
+fn pane_direction(app: &App) -> Direction {
+    if app.panes_vertical {
+        Direction::Vertical
+    } else {
+        Direction::Horizontal
+    }
+}
 
-fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
+fn outlook_constraints(app: &App) -> [Constraint; 3] {
+    if app.panes_vertical {
+        let folder_h = (app.outlook.folders.len().clamp(3, 12) as u16).saturating_add(2);
+        [
+            Constraint::Length(folder_h),
+            Constraint::Percentage(35),
+            Constraint::Min(8),
+        ]
+    } else {
+        [
             Constraint::Length(
                 app.outlook
                     .folder_width
@@ -218,7 +228,31 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
             ),
             Constraint::Percentage(40),
             Constraint::Min(20),
-        ])
+        ]
+    }
+}
+
+fn teams_list_constraint(app: &App) -> Constraint {
+    if app.panes_vertical {
+        let n = match app.teams.mode {
+            TeamsMode::Chats => app.teams.chats.len(),
+            TeamsMode::Channels if app.teams.channels.is_empty() => app.teams.teams.len(),
+            TeamsMode::Channels => app.teams.channels.len(),
+        };
+        Constraint::Length((n.clamp(4, 12) as u16).saturating_add(2))
+    } else {
+        Constraint::Length(32)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outlook
+// ---------------------------------------------------------------------------
+
+fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
+    let cols = Layout::default()
+        .direction(pane_direction(app))
+        .constraints(outlook_constraints(app))
         .split(area);
 
     // Folders
@@ -642,8 +676,8 @@ const RUN_GAP_MINUTES: i64 = 15;
 
 fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(32), Constraint::Min(20)])
+        .direction(pane_direction(app))
+        .constraints([teams_list_constraint(app), Constraint::Min(20)])
         .split(area);
 
     let me_id = app.me.as_ref().map(|m| m.id.as_str());
@@ -907,7 +941,7 @@ fn render_overlay(f: &mut Frame, app: &App) {
             let text = "\
  M365 TUI — keys\n\
  \n\
- Global:  F2 switch app · Ctrl+P palette · p set presence · ? help · q quit\n\
+ Global:  F2 switch app · Ctrl+P palette · p set presence · | panes · ? help · q quit\n\
  \n\
  Links:   o list links in the message · 1-9 open in browser\n\
  Attach:  A list attachments · 1-9 save to your Downloads folder\n\
@@ -918,6 +952,7 @@ fn render_overlay(f: &mut Frame, app: &App) {
  \n\
  Moving:  h/← out a pane · l/→ into it (opens what's selected)\n\
           j/k or ↑/↓ move · arrows work everywhere hjkl does\n\
+          | or \\ toggle horizontal/vertical panes\n\
           Outlook: Shift+H/L resize the Folders panel\n\
  \n\
  Outlook: Enter open · c compose · r reply · a reply-all · f forward\n\
