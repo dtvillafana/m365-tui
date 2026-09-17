@@ -4,6 +4,7 @@
 //!   m365            launch the TUI
 //!   m365 whoami     print the signed-in user and exit (auth smoke test)
 //!   m365 login      run device-code login and exit
+//!   m365 forward    forward a message and exit
 //!   m365 --help     usage; also --version
 //!
 //! Arguments are resolved before any configuration is read or sign-in is
@@ -55,6 +56,12 @@ enum Command {
     Tui,
     WhoAmI,
     Login,
+    Forward {
+        id: Option<String>,
+        query: Option<String>,
+        to: Vec<String>,
+        comment: String,
+    },
 }
 
 const USAGE: &str = "\
@@ -67,6 +74,7 @@ COMMANDS:
     (none)      launch the TUI
     login       sign in and cache the token, then exit
     whoami      print the signed-in account, then exit
+    forward     forward a message: m365 forward --to ADDR[,ADDR...] [--comment TEXT] (--id ID | --query TEXT | ID)
 
 OPTIONS:
     -h, --help     print this help
@@ -75,11 +83,39 @@ OPTIONS:
 Configuration is read from the environment or a .env file; M365_CLIENT_ID is
 the only required value. See https://github.com/rootHytx/m365-tui for setup.";
 
+const FORWARD_USAGE: &str = "\
+m365 forward — send an existing Outlook message to new recipients
+
+USAGE:
+    m365 forward --to ADDR[,ADDR...] [--comment TEXT] --id ID
+    m365 forward --to ADDR[,ADDR...] [--comment TEXT] --query TEXT
+    m365 forward --to ADDR[,ADDR...] [--comment TEXT] ID
+
+--query uses Graph mailbox search. A single match is forwarded; several
+matches are listed so you can pass --id.";
+
 fn parse_args() -> Command {
-    match std::env::args().nth(1).as_deref() {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I, S>(args: I) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
+    match args.next().as_ref().map(|s| s.as_ref()) {
         None => Command::Tui,
         Some("whoami") => Command::WhoAmI,
         Some("login") => Command::Login,
+        Some("forward") => match parse_forward_args(args) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                eprintln!("m365 forward: {e}\n");
+                eprintln!("{FORWARD_USAGE}");
+                std::process::exit(2);
+            }
+        },
         Some("-h") | Some("--help") | Some("help") => {
             println!("{USAGE}");
             std::process::exit(0);
@@ -94,6 +130,89 @@ fn parse_args() -> Command {
             std::process::exit(2);
         }
     }
+}
+
+fn parse_forward_args<I, S>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+    let mut to = None;
+    let mut comment = String::new();
+    let mut id = None;
+    let mut query = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!("{FORWARD_USAGE}");
+                std::process::exit(0);
+            }
+            "--to" | "-t" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "missing value for --to".to_string())?;
+                to = Some(split_addrs(value));
+            }
+            "--comment" | "-c" => {
+                i += 1;
+                comment = args
+                    .get(i)
+                    .ok_or_else(|| "missing value for --comment".to_string())?
+                    .clone();
+            }
+            "--id" => {
+                i += 1;
+                id = Some(
+                    args.get(i)
+                        .ok_or_else(|| "missing value for --id".to_string())?
+                        .clone(),
+                );
+            }
+            "--query" | "-q" => {
+                i += 1;
+                query = Some(
+                    args.get(i)
+                        .ok_or_else(|| "missing value for --query".to_string())?
+                        .clone(),
+                );
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unrecognised flag '{flag}'"));
+            }
+            positional => {
+                if id.is_some() {
+                    return Err("only one message id is allowed".into());
+                }
+                id = Some(positional.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    let to = to.ok_or_else(|| "missing --to".to_string())?;
+    if to.is_empty() {
+        return Err("add at least one recipient with --to".into());
+    }
+    if id.is_none() && query.as_ref().is_none_or(|q| q.trim().is_empty()) {
+        return Err("pass --id ID or --query TEXT".into());
+    }
+    Ok(Command::Forward {
+        id,
+        query,
+        to,
+        comment,
+    })
+}
+
+fn split_addrs(s: &str) -> Vec<String> {
+    s.split([',', ';'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[tokio::main]
@@ -133,7 +252,52 @@ async fn main() -> Result<()> {
             println!("signed in — token cached.");
             Ok(())
         }
+        Command::Forward {
+            id,
+            query,
+            to,
+            comment,
+        } => run_forward(&session, id, query, to, comment).await,
         Command::Tui => run_tui(session).await,
+    }
+}
+
+async fn run_forward(
+    session: &Session,
+    id: Option<String>,
+    query: Option<String>,
+    to: Vec<String>,
+    comment: String,
+) -> Result<()> {
+    let id = match id {
+        Some(id) => id,
+        None => {
+            let query = query.expect("parse_forward_args requires --query when --id is absent");
+            resolve_forward_id(&session.graph, &query).await?
+        }
+    };
+    m365_core::mail::forward(&session.graph, &id, &to, &comment).await?;
+    println!("forwarded to {}", to.join(", "));
+    Ok(())
+}
+
+async fn resolve_forward_id(graph: &m365_core::GraphClient, query: &str) -> Result<String> {
+    let matches = m365_core::mail::search(graph, query, 10).await?;
+    match matches.len() {
+        0 => anyhow::bail!("no messages matched {query:?}"),
+        1 => Ok(matches[0].id.clone()),
+        _ => {
+            eprintln!("multiple matches; pass --id to choose:");
+            for m in &matches {
+                eprintln!(
+                    "  {}  {}  {}",
+                    m.id,
+                    m.received_date_time.as_deref().unwrap_or("-"),
+                    m.subject.as_deref().unwrap_or("(no subject)")
+                );
+            }
+            anyhow::bail!("{} messages matched {query:?}", matches.len());
+        }
     }
 }
 
@@ -445,4 +609,60 @@ fn init_tracing() {
                 .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap())
         })
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_accepts_comma_separated_recipients_and_a_positional_id() {
+        let cmd = parse_forward_args(["--to", "a@x.pt, b@x.pt", "AAMk123"]).unwrap();
+        let Command::Forward {
+            id,
+            query,
+            comment,
+            to,
+        } = cmd
+        else {
+            panic!("expected Forward");
+        };
+        assert_eq!(id.as_deref(), Some("AAMk123"));
+        assert!(query.is_none());
+        assert!(comment.is_empty());
+        assert_eq!(to, ["a@x.pt", "b@x.pt"]);
+    }
+
+    #[test]
+    fn forward_accepts_query_and_comment() {
+        let cmd = parse_forward_args([
+            "--to",
+            "a@x.pt",
+            "--query",
+            "loan survey",
+            "--comment",
+            "FYI",
+        ])
+        .unwrap();
+        let Command::Forward {
+            id,
+            query,
+            comment,
+            to,
+        } = cmd
+        else {
+            panic!("expected Forward");
+        };
+        assert!(id.is_none());
+        assert_eq!(query.as_deref(), Some("loan survey"));
+        assert_eq!(comment, "FYI");
+        assert_eq!(to, ["a@x.pt"]);
+    }
+
+    #[test]
+    fn forward_requires_recipients_and_a_message() {
+        assert!(parse_forward_args(["--to", "a@x.pt"]).is_err());
+        assert!(parse_forward_args(["AAMk123"]).is_err());
+        assert!(parse_forward_args(["--to", "a@x.pt", "--query", "  "]).is_err());
+    }
 }

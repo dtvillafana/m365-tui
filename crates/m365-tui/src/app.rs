@@ -492,6 +492,9 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("outlook", "Switch to Outlook"),
     ("teams", "Switch to Teams"),
     ("compose", "Compose new mail"),
+    ("reply", "Reply to the selected mail"),
+    ("reply-all", "Reply-all to the selected mail"),
+    ("forward", "Forward the selected mail"),
     ("mark-read", "Toggle the selected mail's read/unread state"),
     ("move-mail", "Move the selected mail to another folder"),
     ("trash", "Move the selected mail to Deleted Items"),
@@ -2761,6 +2764,9 @@ impl App {
             "compose" => {
                 self.overlay = Some(Overlay::Compose(empty_compose()));
             }
+            "reply" => self.open_reply(ReplyMode::Reply),
+            "reply-all" => self.open_reply(ReplyMode::ReplyAll),
+            "forward" => self.open_reply(ReplyMode::Forward),
             "mark-read" => self.toggle_mail_read(),
             "move-mail" => self.open_move_mail(),
             "trash" => self.trash_current_mail(),

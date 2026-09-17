@@ -188,6 +188,7 @@ nix develop -c cargo build --release    # or via the bundled dev shell
 m365 --help     # usage; needs no configuration
 m365 whoami     # sign in and print your identity — a good first check
 m365            # launch
+m365 forward --to someone@example.com --query "subject words"
 ```
 
 The first run prints a URL and a code: open the URL, enter the code, sign in.
