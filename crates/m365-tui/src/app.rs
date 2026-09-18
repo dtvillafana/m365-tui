@@ -34,6 +34,10 @@ pub enum AppMessage {
         mode: ListUpdate,
     },
     MessageBody(MailMessage),
+    MailThread {
+        items: Vec<MailMessage>,
+        truncated: bool,
+    },
     Calendar(Vec<CalEvent>),
     Chats(Vec<Chat>),
     ChatMessages {
@@ -139,6 +143,11 @@ pub enum Overlay {
     },
     Search {
         query: String,
+    },
+    /// Filter the folder list and jump to a match.
+    FolderSearch {
+        query: String,
+        sel: usize,
     },
     Compose(Compose),
     Calendar,
@@ -344,6 +353,10 @@ pub struct OutlookState {
     /// at which point it is fitted to the rendered folder labels.
     pub folder_width: Option<u16>,
     pub messages: Vec<MailMessage>,
+    /// Indices into `messages` for the rows currently visible in the list.
+    /// Thread mode contains only the newest loaded message per conversation.
+    pub message_rows: Vec<usize>,
+    pub threaded: bool,
     pub msg_sel: usize,
     /// `@odata.nextLink` for the current folder listing (Some = more to load).
     pub messages_next: Option<String>,
@@ -352,6 +365,10 @@ pub struct OutlookState {
     pub reading: Option<MailMessage>,
     /// Cached styled body of the open message (HTML parsed once, not per frame).
     pub reading_body: Option<Text<'static>>,
+    /// Full mailbox-wide thread and its cached rendered bodies when thread mode
+    /// is active. Empty for an individually-opened message.
+    pub reading_thread: Vec<MailMessage>,
+    pub reading_thread_bodies: Vec<Text<'static>>,
     /// Links referenced by the open message, numbered `[1]`, `[2]`, ...
     pub reading_links: Vec<String>,
     /// Attachments of the open message (fetched when it has any).
@@ -471,6 +488,8 @@ pub struct App {
     /// Largest useful reading-pane scroll offset, set by the renderer once it
     /// knows the wrapped height of the open message.
     pub reading_max_scroll: std::cell::Cell<u16>,
+    /// Largest useful copy-mode scroll offset, set by the renderer.
+    pub copy_max_scroll: std::cell::Cell<u16>,
     /// Borderless full-width view for clean terminal text selection.
     pub copy_mode: bool,
     pub copy_scroll: u16,
@@ -499,6 +518,7 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("move-mail", "Move the selected mail to another folder"),
     ("trash", "Move the selected mail to Deleted Items"),
     ("layout", "Toggle horizontal/vertical pane layout"),
+    ("threads", "Toggle mail threads/individual messages"),
     ("calendar", "Open calendar (today)"),
     ("chat-sender", "Teams: chat with selected email's sender"),
     ("refresh", "Refresh current view"),
@@ -531,6 +551,7 @@ impl App {
             status_ticks: 0,
             text_width_hint: std::cell::Cell::new(60),
             reading_max_scroll: std::cell::Cell::new(0),
+            copy_max_scroll: std::cell::Cell::new(0),
             copy_mode: false,
             copy_scroll: 0,
             panes_vertical: false,
@@ -751,6 +772,16 @@ impl App {
         });
     }
 
+    fn load_mail_thread(&mut self, conversation_id: String) {
+        self.status = "loading thread…".into();
+        let s = self.session.clone();
+        self.spawn(async move {
+            let (items, truncated) =
+                mail::list_conversation(&s.graph, &conversation_id, PAGE_SIZE).await?;
+            Ok(AppMessage::MailThread { items, truncated })
+        });
+    }
+
     fn load_calendar(&self) {
         let s = self.session.clone();
         // Today .. +7 days in UTC.
@@ -933,11 +964,7 @@ impl App {
             }
             AppMessage::Messages { items, next, mode } => {
                 self.outlook.loading_more = false;
-                let selected_id = self
-                    .outlook
-                    .messages
-                    .get(self.outlook.msg_sel)
-                    .map(|m| m.id.clone());
+                let selected_key = self.current_mail().map(|m| self.mail_selection_key(m));
 
                 match mode {
                     ListUpdate::Replace => {
@@ -963,10 +990,18 @@ impl App {
                     }
                 }
 
-                self.outlook.msg_sel = selected_id
-                    .and_then(|id| self.outlook.messages.iter().position(|m| m.id == id))
+                self.rebuild_mail_rows();
+                self.outlook.msg_sel = selected_key
+                    .and_then(|key| {
+                        self.outlook.message_rows.iter().position(|&i| {
+                            self.outlook
+                                .messages
+                                .get(i)
+                                .is_some_and(|m| self.mail_selection_key(m) == key)
+                        })
+                    })
                     .unwrap_or(self.outlook.msg_sel)
-                    .min(self.outlook.messages.len().saturating_sub(1));
+                    .min(self.outlook.message_rows.len().saturating_sub(1));
             }
             AppMessage::MessageBody(m) => {
                 let (ct, raw) = match &m.body {
@@ -979,12 +1014,48 @@ impl App {
                 let rendered = content::render_body(ct, &raw);
                 self.outlook.reading_links = rendered.links;
                 self.outlook.reading_body = Some(rendered.text);
+                self.outlook.reading_thread.clear();
+                self.outlook.reading_thread_bodies.clear();
                 self.outlook.reading_attachments.clear();
                 self.outlook.reading_scroll = 0;
                 if m.has_attachments.unwrap_or(false) {
                     self.load_attachments(m.id.clone());
                 }
                 self.outlook.reading = Some(m);
+            }
+            AppMessage::MailThread { items, truncated } => {
+                let Some(latest) = items.last().cloned() else {
+                    self.status = "thread has no messages".into();
+                    return;
+                };
+                let mut bodies = Vec::with_capacity(items.len());
+                let mut latest_links = Vec::new();
+                for message in &items {
+                    let rendered = render_mail_body(message);
+                    latest_links = rendered.links;
+                    bodies.push(rendered.text);
+                }
+                self.outlook.reading = Some(latest.clone());
+                self.outlook.reading_body = None;
+                self.outlook.reading_thread = items;
+                self.outlook.reading_thread_bodies = bodies;
+                self.outlook.reading_links = latest_links;
+                self.outlook.reading_attachments.clear();
+                self.outlook.reading_scroll = 0;
+                if latest.has_attachments.unwrap_or(false) {
+                    self.load_attachments(latest.id.clone());
+                }
+                self.status = if truncated {
+                    format!(
+                        "{} thread messages loaded (more not shown)",
+                        self.outlook.reading_thread.len()
+                    )
+                } else {
+                    format!(
+                        "{} thread messages loaded",
+                        self.outlook.reading_thread.len()
+                    )
+                };
             }
             AppMessage::Calendar(e) => self.outlook.calendar = e,
             AppMessage::Chats(c) => {
@@ -1564,7 +1635,15 @@ impl App {
                 }
                 KeyCode::PageDown => self.copy_scroll = self.copy_scroll.saturating_add(20),
                 KeyCode::PageUp => self.copy_scroll = self.copy_scroll.saturating_sub(20),
-                KeyCode::Char('g') => self.copy_scroll = 0,
+                KeyCode::Home | KeyCode::Char('g')
+                    if !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    self.copy_scroll = 0
+                }
+                KeyCode::End | KeyCode::Char('G') => self.copy_scroll = self.copy_max_scroll.get(),
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.copy_scroll = self.copy_max_scroll.get()
+                }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.should_quit = true;
                 }
@@ -1670,14 +1749,22 @@ impl App {
                     OutlookFocus::Reading => OutlookFocus::Folders,
                 };
             }
-            KeyCode::Char('g') => self.load_calendar_and_show(),
+            KeyCode::Char('e') => self.load_calendar_and_show(),
+            KeyCode::Char('t') => self.toggle_mail_threads(),
             KeyCode::Char('c') => {
                 self.overlay = Some(Overlay::Compose(empty_compose()));
             }
             KeyCode::Char('/') => {
-                self.overlay = Some(Overlay::Search {
-                    query: String::new(),
-                });
+                self.overlay = if self.outlook_focus == OutlookFocus::Folders {
+                    Some(Overlay::FolderSearch {
+                        query: String::new(),
+                        sel: 0,
+                    })
+                } else {
+                    Some(Overlay::Search {
+                        query: String::new(),
+                    })
+                };
             }
             KeyCode::Char('r') => self.open_reply(ReplyMode::Reply),
             KeyCode::Char('a') => self.open_reply(ReplyMode::ReplyAll),
@@ -1691,14 +1778,15 @@ impl App {
             KeyCode::PageDown => self.outlook_move(10),
             // h/l move between panes: out to the left, into the thing on the
             // right. Esc is a synonym for backing out.
+            KeyCode::Home | KeyCode::Char('g') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.outlook_jump(false);
+            }
+            KeyCode::End | KeyCode::Char('G') => self.outlook_jump(true),
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.outlook_jump(true);
+            }
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.outlook_out(),
             KeyCode::Right | KeyCode::Char('l') => self.outlook_into(),
-            KeyCode::Home if self.outlook_focus == OutlookFocus::Reading => {
-                self.outlook.reading_scroll = 0;
-            }
-            KeyCode::End if self.outlook_focus == OutlookFocus::Reading => {
-                self.outlook.reading_scroll = self.reading_max_scroll.get();
-            }
             KeyCode::Enter => self.outlook_enter(),
             _ => {}
         }
@@ -1753,12 +1841,38 @@ impl App {
                 };
             }
             OutlookFocus::Messages => {
-                let len = self.outlook.messages.len();
+                let len = self.outlook.message_rows.len();
                 self.outlook.msg_sel = step(self.outlook.msg_sel, delta, len);
                 // Scrolling down onto the last row pulls the next page.
                 if delta > 0 && len > 0 && self.outlook.msg_sel == len - 1 {
                     self.load_more_messages();
                 }
+            }
+        }
+    }
+
+    fn outlook_jump(&mut self, to_end: bool) {
+        match self.outlook_focus {
+            OutlookFocus::Folders => {
+                self.outlook.folder_sel = if to_end {
+                    self.outlook.folders.len().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+            OutlookFocus::Messages => {
+                self.outlook.msg_sel = if to_end {
+                    self.outlook.message_rows.len().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+            OutlookFocus::Reading => {
+                self.outlook.reading_scroll = if to_end {
+                    self.reading_max_scroll.get()
+                } else {
+                    0
+                };
             }
         }
     }
@@ -1790,8 +1904,13 @@ impl App {
             }
             OutlookFocus::Messages | OutlookFocus::Reading => {
                 if let Some(m) = self.current_mail() {
-                    let id = m.id.clone();
-                    self.load_body(id);
+                    if self.outlook.threaded {
+                        let conversation_id =
+                            m.conversation_id.clone().unwrap_or_else(|| m.id.clone());
+                        self.load_mail_thread(conversation_id);
+                    } else {
+                        self.load_body(m.id.clone());
+                    }
                     self.outlook_focus = OutlookFocus::Reading;
                 }
             }
@@ -1799,7 +1918,51 @@ impl App {
     }
 
     fn current_mail(&self) -> Option<&MailMessage> {
-        self.outlook.messages.get(self.outlook.msg_sel)
+        self.outlook
+            .message_rows
+            .get(self.outlook.msg_sel)
+            .and_then(|&i| self.outlook.messages.get(i))
+    }
+
+    fn mail_selection_key(&self, message: &MailMessage) -> String {
+        if self.outlook.threaded {
+            message
+                .conversation_id
+                .clone()
+                .unwrap_or_else(|| message.id.clone())
+        } else {
+            message.id.clone()
+        }
+    }
+
+    fn rebuild_mail_rows(&mut self) {
+        self.outlook.message_rows = mail_row_indices(&self.outlook.messages, self.outlook.threaded);
+    }
+
+    fn toggle_mail_threads(&mut self) {
+        let selected = self.current_mail().cloned();
+        self.outlook.threaded = !self.outlook.threaded;
+        self.rebuild_mail_rows();
+        self.outlook.msg_sel = selected
+            .as_ref()
+            .and_then(|selected| {
+                self.outlook.message_rows.iter().position(|&i| {
+                    self.outlook.messages.get(i).is_some_and(|message| {
+                        if self.outlook.threaded {
+                            mail_conversation_key(message) == mail_conversation_key(selected)
+                        } else {
+                            message.id == selected.id
+                        }
+                    })
+                })
+            })
+            .unwrap_or(0)
+            .min(self.outlook.message_rows.len().saturating_sub(1));
+        self.status = if self.outlook.threaded {
+            "mail: threads".into()
+        } else {
+            "mail: individual messages".into()
+        };
     }
 
     /// Toggle the selected message between read and unread.
@@ -1907,11 +2070,16 @@ impl App {
         }
         let id = m.id.clone();
         let sel = self.outlook.msg_sel;
-        self.outlook.messages.remove(sel);
-        self.outlook.msg_sel = sel.min(self.outlook.messages.len().saturating_sub(1));
+        if let Some(raw) = self.outlook.message_rows.get(sel).copied() {
+            self.outlook.messages.remove(raw);
+        }
+        self.rebuild_mail_rows();
+        self.outlook.msg_sel = sel.min(self.outlook.message_rows.len().saturating_sub(1));
         if self.outlook.reading.as_ref().is_some_and(|r| r.id == id) {
             self.outlook.reading = None;
             self.outlook.reading_body = None;
+            self.outlook.reading_thread.clear();
+            self.outlook.reading_thread_bodies.clear();
             self.outlook.reading_links.clear();
             self.outlook.reading_attachments.clear();
             self.outlook.reading_scroll = 0;
@@ -2035,13 +2203,38 @@ impl App {
             {
                 self.overlay = Some(Overlay::React);
             }
-            // Jump back to the newest message and resume following it.
-            KeyCode::End | KeyCode::Char('g') if self.teams.focus == TeamsFocus::Messages => {
+            // g/Home oldest (top), G/End newest (bottom) — vim-style.
+            KeyCode::Home | KeyCode::Char('g')
+                if self.teams.focus == TeamsFocus::Messages
+                    && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.teams.msg_sel = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') if self.teams.focus == TeamsFocus::Messages => {
                 self.teams.msg_sel = self.teams.messages.len().saturating_sub(1);
                 self.teams.unseen = 0;
             }
-            KeyCode::Home if self.teams.focus == TeamsFocus::Messages => {
-                self.teams.msg_sel = 0;
+            KeyCode::Char('g')
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.teams.focus == TeamsFocus::Messages =>
+            {
+                self.teams.msg_sel = self.teams.messages.len().saturating_sub(1);
+                self.teams.unseen = 0;
+            }
+            KeyCode::Home | KeyCode::Char('g')
+                if self.teams.focus == TeamsFocus::List
+                    && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.teams_jump_list(false);
+            }
+            KeyCode::End | KeyCode::Char('G') if self.teams.focus == TeamsFocus::List => {
+                self.teams_jump_list(true);
+            }
+            KeyCode::Char('g')
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.teams.focus == TeamsFocus::List =>
+            {
+                self.teams_jump_list(true);
             }
             KeyCode::Up | KeyCode::Char('k') => self.teams_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.teams_move(1),
@@ -2098,6 +2291,33 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn teams_jump_list(&mut self, to_end: bool) {
+        match self.teams.mode {
+            TeamsMode::Chats => {
+                self.teams.chat_sel = if to_end {
+                    self.teams.chats.len().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+            TeamsMode::Channels => {
+                if self.teams.channels.is_empty() {
+                    self.teams.team_sel = if to_end {
+                        self.teams.teams.len().saturating_sub(1)
+                    } else {
+                        0
+                    };
+                } else {
+                    self.teams.channel_sel = if to_end {
+                        self.teams.channels.len().saturating_sub(1)
+                    } else {
+                        0
+                    };
+                }
+            }
         }
     }
 
@@ -2488,6 +2708,36 @@ impl App {
                 }
                 _ => self.overlay = Some(Overlay::Search { query }),
             },
+            Some(Overlay::FolderSearch { mut query, mut sel }) => {
+                let matches = filter_folders(&self.outlook.folders, &query);
+                match key.code {
+                    KeyCode::Enter => {
+                        if let Some(&idx) = matches.get(sel) {
+                            self.outlook.folder_sel = idx;
+                            self.outlook_enter();
+                        }
+                    }
+                    KeyCode::Up => {
+                        sel = sel.saturating_sub(1);
+                        self.overlay = Some(Overlay::FolderSearch { query, sel });
+                    }
+                    KeyCode::Down => {
+                        if sel + 1 < matches.len() {
+                            sel += 1;
+                        }
+                        self.overlay = Some(Overlay::FolderSearch { query, sel });
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        self.overlay = Some(Overlay::FolderSearch { query, sel: 0 });
+                    }
+                    KeyCode::Char(c) => {
+                        query.push(c);
+                        self.overlay = Some(Overlay::FolderSearch { query, sel: 0 });
+                    }
+                    _ => self.overlay = Some(Overlay::FolderSearch { query, sel }),
+                }
+            }
             Some(Overlay::Palette { mut query, mut sel }) => {
                 let matches = filter_commands(&query);
                 match key.code {
@@ -2537,6 +2787,19 @@ impl App {
                     if sel + 1 < self.outlook.folders.len() {
                         sel += 1;
                     }
+                    self.overlay = Some(Overlay::MoveMail { sel });
+                }
+                KeyCode::Home | KeyCode::Char('g')
+                    if !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    self.overlay = Some(Overlay::MoveMail { sel: 0 });
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    let sel = self.outlook.folders.len().saturating_sub(1);
+                    self.overlay = Some(Overlay::MoveMail { sel });
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    let sel = self.outlook.folders.len().saturating_sub(1);
                     self.overlay = Some(Overlay::MoveMail { sel });
                 }
                 _ => self.overlay = Some(Overlay::MoveMail { sel }),
@@ -2658,6 +2921,10 @@ impl App {
                 query.push_str(text.trim());
                 self.overlay = Some(Overlay::Search { query });
             }
+            Some(Overlay::FolderSearch { mut query, .. }) => {
+                query.push_str(text.trim());
+                self.overlay = Some(Overlay::FolderSearch { query, sel: 0 });
+            }
             other => {
                 self.overlay = other;
                 if self.overlay.is_none()
@@ -2771,6 +3038,7 @@ impl App {
             "move-mail" => self.open_move_mail(),
             "trash" => self.trash_current_mail(),
             "layout" => self.toggle_pane_layout(),
+            "threads" => self.toggle_mail_threads(),
             "calendar" => self.load_calendar_and_show(),
             "chat-sender" => {
                 if let Some(addr) = self.current_mail().and_then(|m| m.sender_address()) {
@@ -2953,6 +3221,49 @@ fn prepared_body(prepared: &crate::images::Prepared) -> OutgoingBody<'_> {
     }
 }
 
+fn render_mail_body(message: &MailMessage) -> content::RenderedBody {
+    let (content_type, raw) = match &message.body {
+        Some(body) => (
+            body.content_type.as_deref(),
+            body.content.clone().unwrap_or_default(),
+        ),
+        None => (
+            Some("text"),
+            message.body_preview.clone().unwrap_or_default(),
+        ),
+    };
+    content::render_body(content_type, &raw)
+}
+
+fn mail_conversation_key(message: &MailMessage) -> &str {
+    message.conversation_id.as_deref().unwrap_or(&message.id)
+}
+
+/// Build the visible mail rows from a newest-first folder page.
+fn mail_row_indices(messages: &[MailMessage], threaded: bool) -> Vec<usize> {
+    if !threaded {
+        return (0..messages.len()).collect();
+    }
+    let mut seen = std::collections::HashSet::new();
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, message)| seen.insert(mail_conversation_key(message)).then_some(i))
+        .collect()
+}
+
+pub(crate) fn mail_same_thread(a: &MailMessage, b: &MailMessage) -> bool {
+    mail_conversation_key(a) == mail_conversation_key(b)
+}
+
+pub(crate) fn mail_thread_size(messages: &[MailMessage], message: &MailMessage) -> usize {
+    let key = mail_conversation_key(message);
+    messages
+        .iter()
+        .filter(|candidate| mail_conversation_key(candidate) == key)
+        .count()
+}
+
 /// Move a selection index by `delta`, clamped to `[0, len)`.
 fn step(idx: usize, delta: i32, len: usize) -> usize {
     if len == 0 {
@@ -2989,6 +3300,19 @@ fn folder_panel_width(folders: &[MailFolder]) -> u16 {
         .max(MIN_FOLDER_PANEL_WIDTH)
 }
 
+/// Folder-list filter (case-insensitive substring on the rendered label).
+pub fn filter_folders(folders: &[MailFolder], query: &str) -> Vec<usize> {
+    let q = query.to_ascii_lowercase();
+    folders
+        .iter()
+        .enumerate()
+        .filter(|(_, folder)| {
+            q.is_empty() || mail_folder_label(folder).to_ascii_lowercase().contains(&q)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Palette fuzzy-ish filter (case-insensitive substring on label or id).
 pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
     let q = query.to_ascii_lowercase();
@@ -3004,8 +3328,9 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        folder_panel_width, format_compose_file, merge_newest_first, next_field,
-        parse_compose_file, parse_recipients, step,
+        filter_folders, folder_panel_width, format_compose_file, mail_row_indices,
+        mail_thread_size, merge_newest_first, next_field, parse_compose_file, parse_recipients,
+        step,
     };
 
     #[test]
@@ -3136,5 +3461,47 @@ mod tests {
             parse_compose_file("just the body\n"),
             (None, "just the body\n".into())
         );
+    }
+
+    #[test]
+    fn folder_search_matches_labels_case_insensitively() {
+        let folder = |name: &str| {
+            serde_json::from_value(serde_json::json!({
+                "id": name,
+                "displayName": name
+            }))
+            .unwrap()
+        };
+        let folders = [folder("Inbox"), folder("Sent Items"), folder("Archive")];
+        assert_eq!(filter_folders(&folders, ""), vec![0, 1, 2]);
+        assert_eq!(filter_folders(&folders, "in"), vec![0]);
+        assert_eq!(filter_folders(&folders, "item"), vec![1]);
+        assert_eq!(filter_folders(&folders, "ARCHIVE"), vec![2]);
+        assert!(filter_folders(&folders, "zzz").is_empty());
+    }
+
+    #[test]
+    fn mail_threads_collapse_to_the_newest_loaded_message() {
+        let message = |id: &str, conversation: Option<&str>| {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "conversationId": conversation,
+                "subject": id
+            }))
+            .unwrap()
+        };
+        // Folder pages are newest-first. Missing conversation ids deliberately
+        // remain distinct instead of collapsing into one synthetic thread.
+        let messages = [
+            message("new-a", Some("a")),
+            message("only-b", Some("b")),
+            message("old-a", Some("a")),
+            message("standalone-1", None),
+            message("standalone-2", None),
+        ];
+        assert_eq!(mail_row_indices(&messages, false), vec![0, 1, 2, 3, 4]);
+        assert_eq!(mail_row_indices(&messages, true), vec![0, 1, 3, 4]);
+        assert_eq!(mail_thread_size(&messages, &messages[0]), 2);
+        assert_eq!(mail_thread_size(&messages, &messages[3]), 1);
     }
 }

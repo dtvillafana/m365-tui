@@ -49,7 +49,7 @@ pub async fn list_messages(
 ) -> Result<(Vec<MailMessage>, Option<String>)> {
     let path = format!(
         "me/mailFolders/{folder_id}/messages?$top={top}&$orderby=receivedDateTime desc\
-         &$select=id,subject,bodyPreview,from,toRecipients,receivedDateTime,isRead,hasAttachments,webLink"
+         &$select=id,conversationId,subject,bodyPreview,from,toRecipients,receivedDateTime,isRead,hasAttachments,webLink"
     );
     // Single page only — `$top` bounds it; we don't want to walk the whole folder.
     graph.get_page_with_next(&path).await
@@ -67,7 +67,7 @@ pub async fn list_messages_more(
 /// Fetch a single message including its full body.
 pub async fn get_message(graph: &GraphClient, id: &str) -> Result<MailMessage> {
     let path = format!(
-        "me/messages/{id}?$select=id,subject,body,bodyPreview,from,toRecipients,receivedDateTime,isRead,hasAttachments,webLink"
+        "me/messages/{id}?$select=id,conversationId,subject,body,bodyPreview,from,toRecipients,receivedDateTime,isRead,hasAttachments,webLink"
     );
     graph.get_json(&path).await
 }
@@ -81,7 +81,7 @@ pub async fn delta_messages(
 ) -> Result<DeltaPage<MailMessage>> {
     let path = match delta_link {
         Some(link) => link.to_string(),
-        None => format!("me/mailFolders/{folder_id}/messages/delta?$select=id,subject,bodyPreview,from,receivedDateTime,isRead"),
+        None => format!("me/mailFolders/{folder_id}/messages/delta?$select=id,conversationId,subject,bodyPreview,from,receivedDateTime,isRead"),
     };
     graph.delta(&path).await
 }
@@ -113,9 +113,40 @@ pub async fn search(graph: &GraphClient, query: &str, top: u32) -> Result<Vec<Ma
     let escaped = query.replace('"', "");
     let path = format!(
         "me/messages?$search=\"{escaped}\"&$top={top}\
-         &$select=id,subject,bodyPreview,from,receivedDateTime,isRead"
+         &$select=id,conversationId,subject,bodyPreview,from,receivedDateTime,isRead"
     );
     graph.get_page(&path).await
+}
+
+/// Fetch one mailbox-wide reply thread. Graph cannot aggregate folder messages
+/// into conversations, so callers collapse folder pages by `conversationId`
+/// and use this filtered query only when a thread is opened.
+pub async fn list_conversation(
+    graph: &GraphClient,
+    conversation_id: &str,
+    top: u32,
+) -> Result<(Vec<MailMessage>, bool)> {
+    let escaped = escape_odata_string(conversation_id);
+    let path = format!(
+        "me/messages?$filter=conversationId eq '{escaped}'&$top={top}\
+         &$select=id,conversationId,subject,body,bodyPreview,from,toRecipients,receivedDateTime,isRead,hasAttachments,webLink"
+    );
+    let (mut messages, next): (Vec<MailMessage>, Option<String>) =
+        graph.get_page_with_next(&path).await?;
+    sort_conversation_messages(&mut messages);
+    Ok((messages, next.is_some()))
+}
+
+fn escape_odata_string(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn sort_conversation_messages(messages: &mut [MailMessage]) {
+    messages.sort_by(|a, b| {
+        a.received_date_time
+            .cmp(&b.received_date_time)
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 /// Mark a message as read or unread.
@@ -408,5 +439,34 @@ mod tests {
         let body = html_body("line1\nline2");
         assert_eq!(body["contentType"], "HTML");
         assert_eq!(body["content"], "line1<br>line2");
+    }
+
+    #[test]
+    fn conversation_filter_escapes_odata_quotes() {
+        assert_eq!(escape_odata_string("a'b"), "a''b");
+    }
+
+    #[test]
+    fn conversation_messages_sort_oldest_first() {
+        let message = |id: &str, received: &str| {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "receivedDateTime": received
+            }))
+            .unwrap()
+        };
+        let mut messages = [
+            message("new", "2026-09-17T15:00:00Z"),
+            message("old", "2026-09-17T13:00:00Z"),
+            message("middle", "2026-09-17T14:00:00Z"),
+        ];
+        sort_conversation_messages(&mut messages);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old", "middle", "new"]
+        );
     }
 }

@@ -204,10 +204,10 @@ Press `?` in the app for this list at any time.
 | Scope | Keys |
 |---|---|
 | **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `|` or `\` toggle pane layout · `?` help · `q` quit |
-| **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · `Shift+H`/`Shift+L` resize Outlook folders · arrows work the same · `Tab` cycles |
-| **Outlook** | `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `u` read/unread · `m` move folder · `d` trash · `/` search · `g` calendar |
-| **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `h` back to the list |
-| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `r` reply · `i` write · `Enter` send · `Ctrl+V` paste image · `@path` `Tab` complete |
+| **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · `g`/`G` top/bottom · `Shift+H`/`Shift+L` resize Outlook folders · arrows work the same · `Tab` cycles |
+| **Outlook** | `Enter` open · `t` threads/individual messages · `c` compose · `r` reply · `a` reply-all · `f` forward · `u` read/unread · `m` move folder · `d` trash · `/` search mail · folders pane `/` find folder · `e` calendar |
+| **Reading a mail** | `j`/`k` scroll · `g`/`G` or `Home`/`End` · `h` back to the list |
+| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` oldest · `G` newest · `e` react · `r` reply · `i` write · `Enter` send · `Ctrl+V` paste image · `@path` `Tab` complete |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
@@ -216,7 +216,14 @@ Press `?` in the app for this list at any time.
 `h` and `l` work like a file manager: `l` moves right into the pane beside you,
 opening whatever is selected, and `h` moves back out. `j`/`k` stay inside the
 focused pane — in a reading pane or conversation they scroll the text, since
-there's nothing below to move to.
+there's nothing below to move to. `g`/`G` jump to the top and bottom, like vim.
+In the folders pane, `/` filters the list so you can jump to an inbox by name.
+
+Press `t` in Outlook to collapse the loaded message list into reply threads.
+Thread rows show the number of loaded messages in brackets; opening one fetches
+up to 50 messages from that conversation across the mailbox and displays them
+oldest first. Mail actions still apply to the newest message represented by the
+selected row. Press `t` again to return to individual messages.
 
 Scrolling to the end of a message list or conversation loads the next 50 items.
 

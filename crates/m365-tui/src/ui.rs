@@ -7,8 +7,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    filter_commands, mail_folder_label, App, Compose, OutlookFocus, Overlay, PushState, Screen,
-    TeamsFocus, TeamsMode, DEFAULT_FOLDER_PANEL_WIDTH,
+    filter_commands, filter_folders, mail_folder_label, mail_same_thread, mail_thread_size, App,
+    Compose, OutlookFocus, Overlay, PushState, Screen, TeamsFocus, TeamsMode,
+    DEFAULT_FOLDER_PANEL_WIDTH,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -53,7 +54,7 @@ fn render_copy_mode(f: &mut Frame, app: &App) {
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " COPY MODE — drag to select · y yank all · j/k scroll · z/Esc exit ",
+            " COPY MODE — drag to select · y yank all · j/k scroll · g/G top/bottom · z/Esc exit ",
             Style::default()
                 .fg(Color::Black)
                 .bg(ACCENT)
@@ -68,6 +69,7 @@ fn render_copy_mode(f: &mut Frame, app: &App) {
     };
     let (wrapped, _) = crate::wrap::wrap_all(&lines, rows[1].width as usize);
     let max = (wrapped.len() as u16).saturating_sub(rows[1].height);
+    app.copy_max_scroll.set(max);
     f.render_widget(
         Paragraph::new(wrapped).scroll((app.copy_scroll.min(max), 0)),
         rows[1],
@@ -181,24 +183,25 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::React => "1-7 react · Esc close",
             Overlay::Presence => "1-6 set · c clear · Esc close",
             Overlay::Search { .. } => "Enter search · Esc cancel",
+            Overlay::FolderSearch { .. } => "↑↓ choose · Enter open · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
-            Overlay::MoveMail { .. } => "j/k choose · Enter move · Esc cancel",
+            Overlay::MoveMail { .. } => "j/k/g/G choose · Enter move · Esc cancel",
             Overlay::Calendar | Overlay::Help => "Esc close",
         };
     }
     match app.screen {
         Screen::Outlook => match app.outlook_focus {
-            OutlookFocus::Folders => "j/k move · l open · H/L resize",
+            OutlookFocus::Folders => "j/k move · g/G · l open · / find · e calendar · H/L resize",
             OutlookFocus::Messages => {
-                "j/k move · l read · h back · c compose · r reply · u read · m move · d trash · / search"
+                "j/k move · g/G · l read · t threads · h back · c compose · r reply · u read · m move · d trash · / search"
             }
             OutlookFocus::Reading => {
-                "j/k scroll · h back · u read · m move · d trash · o links · A attach · y copy"
+                "j/k scroll · g/G · h back · u read · m move · d trash · o links · A attach · y copy"
             }
         },
         Screen::Teams => match app.teams.focus {
-            TeamsFocus::List => "j/k move · l open · t chats/channels",
-            TeamsFocus::Messages => "j/k select · h back · r reply · e react",
+            TeamsFocus::List => "j/k move · g/G · l open · t chats/channels",
+            TeamsFocus::Messages => "j/k select · g/G · h back · r reply · e react",
             TeamsFocus::Composer => "Enter send · Ctrl+V image · @path Tab · Esc leave",
         },
     }
@@ -272,45 +275,67 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
     );
 
     // Messages
-    let msgs: Vec<ListItem> = app
-        .outlook
-        .messages
-        .iter()
-        .map(|m| {
-            let unread = !m.is_read.unwrap_or(true);
-            let marker = if unread { "●" } else { " " };
-            let clip = if m.has_attachments.unwrap_or(false) {
-                "📎"
-            } else {
-                ""
-            };
-            let subject = m.subject.clone().unwrap_or_else(|| "(no subject)".into());
-            let line = Line::from(vec![
-                Span::styled(format!("{marker} "), Style::default().fg(ACCENT)),
-                Span::styled(
-                    truncate(&m.sender_name(), 18),
-                    Style::default().fg(Color::LightGreen),
-                ),
-                Span::raw("  "),
-                Span::styled(clip.to_string(), Style::default().fg(DIM)),
-                Span::styled(
-                    subject,
-                    if unread {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    },
-                ),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
+    let msgs: Vec<ListItem> =
+        app.outlook
+            .message_rows
+            .iter()
+            .filter_map(|&i| app.outlook.messages.get(i))
+            .map(|m| {
+                let members =
+                    app.outlook.messages.iter().filter(|candidate| {
+                        !app.outlook.threaded || mail_same_thread(candidate, m)
+                    });
+                let unread = members
+                    .clone()
+                    .any(|message| !message.is_read.unwrap_or(true));
+                let marker = if unread { "●" } else { " " };
+                let clip = if members
+                    .clone()
+                    .any(|message| message.has_attachments.unwrap_or(false))
+                {
+                    "📎"
+                } else {
+                    ""
+                };
+                let mut subject = m.subject.clone().unwrap_or_else(|| "(no subject)".into());
+                if app.outlook.threaded {
+                    let count = mail_thread_size(&app.outlook.messages, m);
+                    if count > 1 {
+                        subject.push_str(&format!(" [{count}]"));
+                    }
+                }
+                let line = Line::from(vec![
+                    Span::styled(format!("{marker} "), Style::default().fg(ACCENT)),
+                    Span::styled(
+                        truncate(&m.sender_name(), 18),
+                        Style::default().fg(Color::LightGreen),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(clip.to_string(), Style::default().fg(DIM)),
+                    Span::styled(
+                        subject,
+                        if unread {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
     let mut mstate = ListState::default();
     mstate.select(Some(app.outlook.msg_sel));
-    let msg_title = if app.outlook.messages_next.is_some() {
-        format!("Messages ({} · ↓ for more)", app.outlook.messages.len())
+    let kind = if app.outlook.threaded {
+        "Threads"
     } else {
-        format!("Messages ({})", app.outlook.messages.len())
+        "Messages"
+    };
+    let count = app.outlook.message_rows.len();
+    let msg_title = if app.outlook.messages_next.is_some() {
+        format!("{kind} ({count} · ↓ for more)")
+    } else {
+        format!("{kind} ({count})")
     };
     f.render_stateful_widget(
         selectable_list(
@@ -325,7 +350,7 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
     // Reading pane — scrollable when focused, like the Teams conversation.
     let focused = app.outlook_focus == OutlookFocus::Reading;
     let title = if focused {
-        "Reading (j/k scroll · Esc back)"
+        "Reading (j/k scroll · g/G · Esc back)"
     } else {
         "Reading"
     };
@@ -359,6 +384,37 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
 /// Shared by the reading pane and copy mode.
 pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
     let m = app.outlook.reading.as_ref()?;
+    if !app.outlook.reading_thread.is_empty() {
+        let total = app.outlook.reading_thread.len();
+        let mut lines = Vec::new();
+        for (i, (message, body)) in app
+            .outlook
+            .reading_thread
+            .iter()
+            .zip(&app.outlook.reading_thread_bodies)
+            .enumerate()
+        {
+            if i > 0 {
+                lines.push(Line::raw(""));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("── Message {} of {total} ──", i + 1),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(kv("Subject", &message.subject.clone().unwrap_or_default()));
+            lines.push(kv("From", &message.sender_name()));
+            lines.push(kv(
+                "Date",
+                &message.received_date_time.clone().unwrap_or_default(),
+            ));
+            if i + 1 == total && !app.outlook.reading_attachments.is_empty() {
+                lines.push(attachment_line(app));
+            }
+            lines.push(Line::raw(""));
+            lines.extend(body.lines.iter().cloned());
+        }
+        return Some(lines);
+    }
     let mut lines = vec![
         kv("Subject", &m.subject.clone().unwrap_or_default()),
         kv("From", &m.sender_name()),
@@ -366,24 +422,25 @@ pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
         Line::raw(""),
     ];
     if !app.outlook.reading_attachments.is_empty() {
-        let names: Vec<String> = app
-            .outlook
-            .reading_attachments
-            .iter()
-            .map(|a| format!("{} ({})", a.display_name(), a.human_size()))
-            .collect();
-        lines.insert(
-            3,
-            kv(
-                "Attach",
-                &format!("📎 {}  — press A to save", names.join(", ")),
-            ),
-        );
+        lines.insert(3, attachment_line(app));
     }
     if let Some(body) = &app.outlook.reading_body {
         lines.extend(body.lines.iter().cloned());
     }
     Some(lines)
+}
+
+fn attachment_line(app: &App) -> Line<'static> {
+    let names: Vec<String> = app
+        .outlook
+        .reading_attachments
+        .iter()
+        .map(|a| format!("{} ({})", a.display_name(), a.human_size()))
+        .collect();
+    kv(
+        "Attach",
+        &format!("📎 {}  — press A to save", names.join(", ")),
+    )
 }
 
 enum FlowItem {
@@ -767,9 +824,9 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
         .min(total_h.saturating_sub(pane_h)) as u16;
     // Flag messages that arrived while the user was reading further back.
     let title = if app.teams.unseen > 0 {
-        format!("Conversation — ▼ {} new (g to jump)", app.teams.unseen)
+        format!("Conversation — ▼ {} new (G to jump)", app.teams.unseen)
     } else if focused {
-        "Conversation (j/k select · e react · z copy-mode)".to_string()
+        "Conversation (j/k select · g/G · e react · z copy-mode)".to_string()
     } else {
         "Conversation".to_string()
     };
@@ -952,15 +1009,16 @@ fn render_overlay(f: &mut Frame, app: &App) {
           z copy mode (full-width, borderless — drag-select cleanly)\n\
  \n\
  Moving:  h/← out a pane · l/→ into it (opens what's selected)\n\
-          j/k or ↑/↓ move · arrows work everywhere hjkl does\n\
+          j/k or ↑/↓ move · g/G top/bottom · arrows work everywhere hjkl does\n\
           | or \\ toggle horizontal/vertical panes\n\
           Outlook: Shift+H/L resize the Folders panel\n\
  \n\
  Outlook: Enter open · c compose · r reply · a reply-all · f forward\n\
-          u read/unread · m move folder · d trash · / search · g calendar\n\
-          in the reading pane j/k scroll\n\
+           u read/unread · m move folder · d trash · / search · e calendar\n\
+           t toggles threads/individual messages\n\
+          folders pane / finds a folder · reading pane j/k scroll · g/G\n\
  \n\
- Teams:   t chats/channels · j/k select message · g newest · e react\n\
+ Teams:   t chats/channels · j/k select message · g oldest · G newest · e react\n\
           i type · r reply · Enter send · Ctrl+V paste image\n\
           @path Tab complete image · Ctrl+X remove last image\n\
  \n\
@@ -1021,6 +1079,36 @@ fn render_overlay(f: &mut Frame, app: &App) {
                 ))
                 .block(popup_block("Search")),
                 area,
+            );
+        }
+        Overlay::FolderSearch { query, sel } => {
+            let area = centered(50, 60, f.area());
+            f.render_widget(Clear, area);
+            let matches = filter_folders(&app.outlook.folders, query);
+            let block = popup_block("Find folder");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(0)])
+                .split(inner);
+            f.render_widget(Paragraph::new(format!("> {query}▏")), rows[0]);
+            let items: Vec<ListItem> = matches
+                .iter()
+                .filter_map(|&i| app.outlook.folders.get(i))
+                .map(|folder| ListItem::new(mail_folder_label(folder)))
+                .collect();
+            let mut st = ListState::default();
+            st.select(Some(*sel));
+            f.render_stateful_widget(
+                List::new(items).highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                rows[1],
+                &mut st,
             );
         }
         Overlay::Palette { query, sel } => {

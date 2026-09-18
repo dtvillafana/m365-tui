@@ -72,6 +72,8 @@ pub struct MailFolder {
 pub struct MailMessage {
     pub id: String,
     #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
     pub subject: Option<String>,
     #[serde(default)]
     pub body_preview: Option<String>,
