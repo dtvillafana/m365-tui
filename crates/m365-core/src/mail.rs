@@ -89,23 +89,23 @@ pub async fn delta_messages(
 /// List a message's attachments. `$select` keeps `contentBytes` out of the
 /// response so listing stays cheap regardless of attachment size.
 ///
-/// `contentId` is a `fileAttachment` property, not on the base `attachment`
-/// type, so `$select=contentId` on `/attachments` is rejected by Graph.
-/// Inline CID images still need those values; they are filled from an OData
-/// type-cast query that also omits `contentBytes`.
+/// `contentId` is not on the base `attachment` type. Graph rejects it in
+/// `$select` even after an OData `fileAttachment` cast, so CID values are
+/// read from unselected inline attachments instead — those payloads are
+/// small, and extra fields such as `contentBytes` are ignored here.
 pub async fn list_attachments(graph: &GraphClient, message_id: &str) -> Result<Vec<Attachment>> {
     let path =
         format!("me/messages/{message_id}/attachments?$select=id,name,contentType,size,isInline");
     let mut attachments: Vec<Attachment> = graph.get_collection(&path).await?;
-    if attachments.is_empty() {
+    if !attachments.iter().any(|a| a.is_inline.unwrap_or(false)) {
         return Ok(attachments);
     }
-    let files: Vec<Attachment> = graph
+    let inline: Vec<Attachment> = graph
         .get_collection(&format!(
-            "me/messages/{message_id}/attachments/microsoft.graph.fileAttachment?$select=id,contentId"
+            "me/messages/{message_id}/attachments?$filter=isInline eq true"
         ))
         .await?;
-    for file in files {
+    for file in inline {
         if let Some(attachment) = attachments.iter_mut().find(|a| a.id == file.id) {
             attachment.content_id = file.content_id;
         }
