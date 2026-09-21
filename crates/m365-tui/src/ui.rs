@@ -407,7 +407,7 @@ pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
                 "Date",
                 &message.received_date_time.clone().unwrap_or_default(),
             ));
-            if i + 1 == total && !app.outlook.reading_attachments.is_empty() {
+            if i == 0 && !app.outlook.reading_attachments.is_empty() {
                 lines.push(attachment_line(app));
             }
             lines.push(Line::raw(""));

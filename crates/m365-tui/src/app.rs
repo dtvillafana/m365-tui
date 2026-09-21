@@ -1024,15 +1024,17 @@ impl App {
                 self.outlook.reading = Some(m);
             }
             AppMessage::MailThread { items, truncated } => {
-                let Some(latest) = items.last().cloned() else {
+                let Some(latest) = items.first().cloned() else {
                     self.status = "thread has no messages".into();
                     return;
                 };
                 let mut bodies = Vec::with_capacity(items.len());
                 let mut latest_links = Vec::new();
-                for message in &items {
+                for (index, message) in items.iter().enumerate() {
                     let rendered = render_mail_body(message);
-                    latest_links = rendered.links;
+                    if index == 0 {
+                        latest_links = rendered.links;
+                    }
                     bodies.push(rendered.text);
                 }
                 self.outlook.reading = Some(latest.clone());
@@ -1967,7 +1969,15 @@ impl App {
 
     /// Toggle the selected message between read and unread.
     fn toggle_mail_read(&mut self) {
-        let Some(m) = self.current_mail() else {
+        let message = if self.outlook_focus == OutlookFocus::Reading {
+            self.outlook
+                .reading
+                .as_ref()
+                .or_else(|| self.current_mail())
+        } else {
+            self.current_mail()
+        };
+        let Some(m) = message else {
             self.status = "select a message first".into();
             return;
         };
@@ -1977,26 +1987,41 @@ impl App {
     }
 
     fn set_mail_read(&mut self, id: &str, read: bool) {
-        let mut found = false;
-        let mut was_unread = false;
-        if let Some(m) = self.outlook.messages.iter_mut().find(|m| m.id == id) {
-            was_unread = !m.is_read.unwrap_or(false);
-            m.is_read = Some(read);
-            found = true;
-        }
-        if let Some(m) = self.outlook.reading.as_mut().filter(|m| m.id == id) {
-            m.is_read = Some(read);
-            found = true;
-        }
-        if !found {
+        let in_current_folder = self.outlook.messages.iter().any(|m| m.id == id);
+        let previous = self
+            .outlook
+            .messages
+            .iter()
+            .chain(self.outlook.reading_thread.iter())
+            .find(|m| m.id == id)
+            .or_else(|| self.outlook.reading.as_ref().filter(|m| m.id == id))
+            .map(|m| m.is_read.unwrap_or(false));
+        let Some(was_read) = previous else {
             return;
+        };
+
+        for message in self
+            .outlook
+            .messages
+            .iter_mut()
+            .chain(self.outlook.reading_thread.iter_mut())
+        {
+            if message.id == id {
+                message.is_read = Some(read);
+            }
         }
-        if let Some(folder) = self.outlook.folders.get_mut(self.outlook.folder_sel) {
-            if let Some(count) = folder.unread_item_count.as_mut() {
-                if read && was_unread {
-                    *count = count.saturating_sub(1);
-                } else if !read && !was_unread {
-                    *count += 1;
+        if let Some(message) = self.outlook.reading.as_mut().filter(|m| m.id == id) {
+            message.is_read = Some(read);
+        }
+
+        if in_current_folder {
+            if let Some(folder) = self.outlook.folders.get_mut(self.outlook.folder_sel) {
+                if let Some(count) = folder.unread_item_count.as_mut() {
+                    if read && !was_read {
+                        *count = count.saturating_sub(1);
+                    } else if !read && was_read {
+                        *count += 1;
+                    }
                 }
             }
         }

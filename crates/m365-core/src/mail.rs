@@ -143,9 +143,9 @@ fn escape_odata_string(value: &str) -> String {
 
 fn sort_conversation_messages(messages: &mut [MailMessage]) {
     messages.sort_by(|a, b| {
-        a.received_date_time
-            .cmp(&b.received_date_time)
-            .then_with(|| a.id.cmp(&b.id))
+        b.received_date_time
+            .cmp(&a.received_date_time)
+            .then_with(|| b.id.cmp(&a.id))
     });
 }
 
@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_messages_sort_oldest_first() {
+    fn conversation_messages_sort_newest_first() {
         let message = |id: &str, received: &str| {
             serde_json::from_value(serde_json::json!({
                 "id": id,
@@ -466,7 +466,7 @@ mod tests {
                 .iter()
                 .map(|message| message.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["old", "middle", "new"]
+            vec!["new", "middle", "old"]
         );
     }
 }
