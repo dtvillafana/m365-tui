@@ -5,6 +5,7 @@
 //! which the main loop applies to the state before the next redraw.
 
 use std::future::Future;
+use std::time::Duration;
 
 use anyhow::Context;
 
@@ -103,6 +104,10 @@ pub enum AppMessage {
     Tick,
     /// Periodic tick: refresh the current view from the server.
     Poll,
+    /// Debounced mail body/thread fetch: only run if this generation is still current.
+    OpenMailDue {
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -193,6 +198,10 @@ const STATUS_TICKS_TO_LIVE: u32 = 5;
 /// How many items to fetch per page — mail messages and Teams messages alike.
 /// Scrolling to the end of a list pulls the next page of this size.
 pub const PAGE_SIZE: u32 = 50;
+
+/// Wait this long after the selection settles before fetching a mail body or
+/// thread, so moving through the list does not fire a Graph call per row.
+const MAIL_FETCH_DELAY: Duration = Duration::from_secs(2);
 
 /// How an incoming page of items updates the list already on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,6 +461,8 @@ pub struct OutlookState {
     attachment_cache: std::collections::HashMap<String, Vec<Attachment>>,
     attachment_loading: std::collections::HashSet<String>,
     pending_reading: Option<ReadingKey>,
+    /// Incremented to cancel an in-flight mail-fetch debounce timer.
+    mail_fetch_generation: u64,
     /// Line scroll offset of the reading pane.
     pub reading_scroll: u16,
     pub calendar: Vec<CalEvent>,
@@ -1127,8 +1138,11 @@ impl App {
                 self.cache_mail_contacts(std::slice::from_ref(&m));
                 let id = m.id.clone();
                 self.outlook.message_cache.insert(id.clone(), m.clone());
-                if self.outlook.pending_reading.as_ref() == Some(&ReadingKey::Message(id)) {
+                let key = ReadingKey::Message(id);
+                if self.outlook.pending_reading.as_ref() == Some(&key) {
                     self.outlook.pending_reading = None;
+                }
+                if self.selection_reading_key().as_ref() == Some(&key) {
                     self.show_message(m);
                 }
             }
@@ -1147,10 +1161,11 @@ impl App {
                 self.outlook
                     .thread_cache
                     .insert(conversation_id.clone(), (items.clone(), truncated));
-                if self.outlook.pending_reading.as_ref()
-                    == Some(&ReadingKey::Thread(conversation_id))
-                {
+                let key = ReadingKey::Thread(conversation_id);
+                if self.outlook.pending_reading.as_ref() == Some(&key) {
                     self.outlook.pending_reading = None;
+                }
+                if self.selection_reading_key().as_ref() == Some(&key) {
                     self.show_thread(items, truncated);
                 }
             }
@@ -1323,6 +1338,11 @@ impl App {
                 }
             }
             AppMessage::Poll => self.poll(),
+            AppMessage::OpenMailDue { generation } => {
+                if generation == self.outlook.mail_fetch_generation {
+                    self.open_current_mail_now();
+                }
+            }
         }
     }
 
@@ -2028,7 +2048,7 @@ impl App {
             }
             OutlookFocus::Messages | OutlookFocus::Reading => {
                 if self.current_mail().is_some() {
-                    self.open_current_mail();
+                    self.open_current_mail_now();
                     self.outlook_focus = OutlookFocus::Reading;
                 }
             }
@@ -2042,34 +2062,77 @@ impl App {
             .and_then(|&i| self.outlook.messages.get(i))
     }
 
+    fn selection_reading_key(&self) -> Option<ReadingKey> {
+        self.current_mail()
+            .map(|message| reading_key(message, self.outlook.threaded))
+    }
+
     fn open_current_mail(&mut self) {
-        let Some(message) = self.current_mail().cloned() else {
+        self.open_selected_mail(false);
+    }
+
+    fn open_current_mail_now(&mut self) {
+        self.open_selected_mail(true);
+    }
+
+    fn open_selected_mail(&mut self, immediate: bool) {
+        let Some(key) = self.selection_reading_key() else {
             return;
         };
-        if self.outlook.threaded {
-            let conversation_id = message
-                .conversation_id
-                .clone()
-                .unwrap_or_else(|| message.id.clone());
-            let key = ReadingKey::Thread(conversation_id.clone());
-            if let Some((items, truncated)) =
-                self.outlook.thread_cache.get(&conversation_id).cloned()
-            {
-                self.outlook.pending_reading = None;
+        if self.show_cached_mail(&key) {
+            self.outlook.mail_fetch_generation = self.outlook.mail_fetch_generation.wrapping_add(1);
+            self.outlook.pending_reading = None;
+            return;
+        }
+        if immediate {
+            self.fetch_selected_mail(key);
+        } else if self.outlook.pending_reading.as_ref() != Some(&key) {
+            self.schedule_mail_fetch();
+        }
+    }
+
+    fn show_cached_mail(&mut self, key: &ReadingKey) -> bool {
+        match key {
+            ReadingKey::Thread(conversation_id) => {
+                let Some((items, truncated)) =
+                    self.outlook.thread_cache.get(conversation_id).cloned()
+                else {
+                    return false;
+                };
                 self.show_thread(items, truncated);
-            } else if self.outlook.pending_reading.as_ref() != Some(&key) {
-                self.outlook.pending_reading = Some(key);
-                self.load_mail_thread(conversation_id);
+                true
             }
-        } else {
-            let key = ReadingKey::Message(message.id.clone());
-            if let Some(cached) = self.outlook.message_cache.get(&message.id).cloned() {
-                self.outlook.pending_reading = None;
+            ReadingKey::Message(id) => {
+                let Some(cached) = self.outlook.message_cache.get(id).cloned() else {
+                    return false;
+                };
                 self.show_message(cached);
-            } else if self.outlook.pending_reading.as_ref() != Some(&key) {
-                self.outlook.pending_reading = Some(key);
+                true
+            }
+        }
+    }
+
+    fn schedule_mail_fetch(&mut self) {
+        self.outlook.mail_fetch_generation = self.outlook.mail_fetch_generation.wrapping_add(1);
+        let generation = self.outlook.mail_fetch_generation;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(MAIL_FETCH_DELAY).await;
+            let _ = tx.send(AppMessage::OpenMailDue { generation }).await;
+        });
+    }
+
+    fn fetch_selected_mail(&mut self, key: ReadingKey) {
+        self.outlook.mail_fetch_generation = self.outlook.mail_fetch_generation.wrapping_add(1);
+        if self.outlook.pending_reading.as_ref() == Some(&key) {
+            return;
+        }
+        self.outlook.pending_reading = Some(key.clone());
+        match key {
+            ReadingKey::Thread(conversation_id) => self.load_mail_thread(conversation_id),
+            ReadingKey::Message(id) => {
                 self.status = "loading message…".into();
-                self.load_body(message.id);
+                self.load_body(id);
             }
         }
     }
@@ -3940,6 +4003,14 @@ fn render_mail_body(message: &MailMessage) -> content::RenderedBody {
 
 fn mail_conversation_key(message: &MailMessage) -> &str {
     message.conversation_id.as_deref().unwrap_or(&message.id)
+}
+
+fn reading_key(message: &MailMessage, threaded: bool) -> ReadingKey {
+    if threaded {
+        ReadingKey::Thread(mail_conversation_key(message).to_string())
+    } else {
+        ReadingKey::Message(message.id.clone())
+    }
 }
 
 /// Build the visible mail rows from a newest-first folder page.
