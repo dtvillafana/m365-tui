@@ -21,7 +21,46 @@ pub struct Graphics {
 
 pub struct ReadyImage {
     pub protocol: StatefulProtocol,
-    pub rows: u16,
+    pixel_width: u32,
+    pixel_height: u32,
+    cell_width: u16,
+    cell_height: u16,
+    max_rows: u16,
+}
+
+impl ReadyImage {
+    /// Preserve aspect ratio as the pane changes width. The terminal protocol
+    /// then resizes the pixels to the matching render rectangle.
+    pub fn rows_for_width(&self, columns: u16) -> u16 {
+        scaled_rows(
+            self.pixel_width,
+            self.pixel_height,
+            self.cell_width,
+            self.cell_height,
+            columns,
+            self.max_rows,
+        )
+    }
+}
+
+fn scaled_rows(
+    pixel_width: u32,
+    pixel_height: u32,
+    cell_width: u16,
+    cell_height: u16,
+    columns: u16,
+    max_rows: u16,
+) -> u16 {
+    let available_width = u32::from(columns.max(1)) * u32::from(cell_width.max(1));
+    let scaled_height = if available_width < pixel_width {
+        pixel_height
+            .saturating_mul(available_width)
+            .div_ceil(pixel_width.max(1))
+    } else {
+        pixel_height
+    };
+    let rows = scaled_height.div_ceil(u32::from(cell_height.max(1))) as u16;
+    rows.clamp(1, max_rows.max(1))
 }
 
 impl Graphics {
@@ -40,11 +79,17 @@ impl Graphics {
             .map_err(|e| e.to_string())?;
         let dyn_img = reader.decode().map_err(|e| e.to_string())?;
         let font = self.picker.font_size();
-        let cell_h = u32::from(font.1.max(1));
-        let natural = dyn_img.height().div_ceil(cell_h) as u16;
-        let rows = natural.clamp(1, max_rows.max(1));
+        let pixel_width = dyn_img.width();
+        let pixel_height = dyn_img.height();
         let protocol = self.picker.new_resize_protocol(dyn_img);
-        Ok(ReadyImage { protocol, rows })
+        Ok(ReadyImage {
+            protocol,
+            pixel_width,
+            pixel_height,
+            cell_width: font.0,
+            cell_height: font.1,
+            max_rows,
+        })
     }
 }
 
@@ -61,6 +106,10 @@ pub fn cache_key(src: &str, hosted_id: Option<&str>) -> String {
     } else {
         src.to_string()
     }
+}
+
+pub fn mail_cache_key(message_id: &str, src: &str) -> String {
+    format!("mail:{message_id}:{src}")
 }
 
 /// Pull a Graph hosted-content id out of an `<img src>`.
@@ -156,5 +205,17 @@ mod tests {
             ),
             Some("teams/t/channels/ch/messages/mid/hostedContents/9/$value".into())
         );
+    }
+
+    #[test]
+    fn image_rows_shrink_with_the_available_width() {
+        assert_eq!(scaled_rows(800, 400, 10, 20, 80, 30), 20);
+        assert_eq!(scaled_rows(800, 400, 10, 20, 40, 30), 10);
+        assert_eq!(scaled_rows(800, 400, 10, 20, 20, 30), 5);
+    }
+
+    #[test]
+    fn image_rows_respect_the_height_cap() {
+        assert_eq!(scaled_rows(800, 1200, 10, 20, 80, 8), 8);
     }
 }

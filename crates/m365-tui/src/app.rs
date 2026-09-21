@@ -424,6 +424,7 @@ pub struct OutlookState {
     /// Width of the folders panel. `None` until the first folder list arrives,
     /// at which point it is fitted to the rendered folder labels.
     pub folder_width: Option<u16>,
+    pub folder_height: Option<u16>,
     pub messages: Vec<MailMessage>,
     /// Indices into `messages` for the rows currently visible in the list.
     /// Thread mode contains only the newest loaded message per conversation.
@@ -445,13 +446,21 @@ pub struct OutlookState {
     pub reading_links: Vec<String>,
     /// Attachments of the open message (fetched when it has any).
     pub reading_attachments: Vec<Attachment>,
+    pub reading_images: Vec<MailBodyImage>,
     message_cache: std::collections::HashMap<String, MailMessage>,
     thread_cache: std::collections::HashMap<String, (Vec<MailMessage>, bool)>,
     attachment_cache: std::collections::HashMap<String, Vec<Attachment>>,
+    attachment_loading: std::collections::HashSet<String>,
     pending_reading: Option<ReadingKey>,
     /// Line scroll offset of the reading pane.
     pub reading_scroll: u16,
     pub calendar: Vec<CalEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MailBodyImage {
+    pub message_id: String,
+    pub image: content::BodyImage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -656,8 +665,19 @@ impl App {
         self.graphics = graphics;
     }
 
-    pub fn image_display_rows(&self, key: &str) -> u16 {
-        self.image_cache.get(key).map(|img| img.rows).unwrap_or(1)
+    pub fn image_display_rows(&self, key: &str, width: u16) -> u16 {
+        self.image_cache
+            .get(key)
+            .map(|image| image.rows_for_width(width))
+            .unwrap_or(1)
+    }
+
+    pub fn image_is_pending(&self, key: &str) -> bool {
+        self.image_loading.contains(key)
+            || self.outlook.reading_images.iter().any(|image| {
+                self.outlook.attachment_loading.contains(&image.message_id)
+                    && crate::termimg::mail_cache_key(&image.message_id, &image.image.src) == key
+            })
     }
 
     /// Kick off the initial data loads.
@@ -1018,6 +1038,7 @@ impl App {
             AppMessage::Status(s) => self.status = s,
             AppMessage::Error(e) => {
                 self.outlook.pending_reading = None;
+                self.outlook.attachment_loading.clear();
                 self.status = format!("error: {}", m365_core::util::graph_error_summary(&e));
             }
             AppMessage::Whoami(u) => {
@@ -1235,6 +1256,7 @@ impl App {
             }
             AppMessage::InboxPeek(items) => self.notify_for_mail(&items),
             AppMessage::Attachments { message_id, items } => {
+                self.outlook.attachment_loading.remove(&message_id);
                 self.outlook
                     .attachment_cache
                     .insert(message_id.clone(), items.clone());
@@ -1246,6 +1268,7 @@ impl App {
                         .filter(|a| !a.is_inline.unwrap_or(false))
                         .collect();
                 }
+                self.fetch_mail_images();
             }
             AppMessage::HostedImage { key, bytes } => {
                 self.image_loading.remove(&key);
@@ -1890,15 +1913,21 @@ impl App {
     }
 
     fn resize_folder_panel(&mut self, delta: i16) {
-        let Some(width) = self.outlook.folder_width else {
+        if self.panes_vertical {
+            let height = self
+                .outlook
+                .folder_height
+                .unwrap_or_else(|| folder_panel_height(&self.outlook.folders));
+            let height = resize_panel_extent(height, delta, MIN_FOLDER_PANEL_HEIGHT);
+            self.outlook.folder_height = Some(height);
+            self.status = format!("Folders height: {height}");
             return;
-        };
-        let width = if delta < 0 {
-            width.saturating_sub(delta.unsigned_abs())
-        } else {
-            width.saturating_add(delta as u16)
         }
-        .max(MIN_FOLDER_PANEL_WIDTH);
+        let width = self
+            .outlook
+            .folder_width
+            .unwrap_or(DEFAULT_FOLDER_PANEL_WIDTH);
+        let width = resize_panel_extent(width, delta, MIN_FOLDER_PANEL_WIDTH);
         self.outlook.folder_width = Some(width);
         self.status = format!("Folders width: {width}");
     }
@@ -2048,12 +2077,30 @@ impl App {
     fn show_message(&mut self, message: MailMessage) {
         let rendered = render_mail_body(&message);
         self.outlook.reading_links = rendered.links;
+        self.outlook.reading_images = rendered
+            .images
+            .into_iter()
+            .map(|image| MailBodyImage {
+                message_id: message.id.clone(),
+                image,
+            })
+            .collect();
         self.outlook.reading_body = Some(rendered.text);
         self.outlook.reading_thread.clear();
         self.outlook.reading_thread_bodies.clear();
         self.show_cached_attachments(&message);
+        if self.graphics.is_some()
+            && self
+                .outlook
+                .reading_images
+                .iter()
+                .any(|image| mail_content_id(&image.image.src).is_some())
+        {
+            self.ensure_attachment_list(message.id.clone());
+        }
         self.outlook.reading_scroll = 0;
         self.outlook.reading = Some(message);
+        self.fetch_mail_images();
     }
 
     fn show_thread(&mut self, items: Vec<MailMessage>, truncated: bool) {
@@ -2067,11 +2114,34 @@ impl App {
             .map(|body| body.links.clone())
             .unwrap_or_default();
         self.outlook.reading_body = None;
+        self.outlook.reading_images = items
+            .iter()
+            .zip(&rendered)
+            .flat_map(|(message, body)| {
+                body.images.iter().cloned().map(|image| MailBodyImage {
+                    message_id: message.id.clone(),
+                    image,
+                })
+            })
+            .collect();
         self.outlook.reading_thread_bodies = rendered.into_iter().map(|body| body.text).collect();
         self.outlook.reading_thread = items;
         self.show_cached_attachments(&latest);
+        if self.graphics.is_some() {
+            let image_message_ids: std::collections::HashSet<String> = self
+                .outlook
+                .reading_images
+                .iter()
+                .filter(|image| mail_content_id(&image.image.src).is_some())
+                .map(|image| image.message_id.clone())
+                .collect();
+            for message_id in image_message_ids {
+                self.ensure_attachment_list(message_id);
+            }
+        }
         self.outlook.reading_scroll = 0;
         self.outlook.reading = Some(latest);
+        self.fetch_mail_images();
         self.status = if truncated {
             format!(
                 "{} thread messages loaded (more not shown)",
@@ -2092,10 +2162,16 @@ impl App {
             .get(&message.id)
             .cloned()
             .unwrap_or_default();
-        if message.has_attachments.unwrap_or(false)
-            && !self.outlook.attachment_cache.contains_key(&message.id)
+        if message.has_attachments.unwrap_or(false) {
+            self.ensure_attachment_list(message.id.clone());
+        }
+    }
+
+    fn ensure_attachment_list(&mut self, message_id: String) {
+        if !self.outlook.attachment_cache.contains_key(&message_id)
+            && self.outlook.attachment_loading.insert(message_id.clone())
         {
-            self.load_attachments(message.id.clone());
+            self.load_attachments(message_id);
         }
     }
 
@@ -2915,6 +2991,73 @@ impl App {
             let s = self.session.clone();
             self.spawn(async move {
                 match s.graph.get_bytes(&path).await {
+                    Ok(bytes) => Ok(AppMessage::HostedImage { key, bytes }),
+                    Err(_) => Ok(AppMessage::HostedImageFailed { key }),
+                }
+            });
+        }
+    }
+
+    fn fetch_mail_images(&mut self) {
+        if self.graphics.is_none() {
+            return;
+        }
+        let images = self.outlook.reading_images.clone();
+        for mail_image in images {
+            let key = crate::termimg::mail_cache_key(&mail_image.message_id, &mail_image.image.src);
+            if self.image_cache.contains_key(&key)
+                || self.image_failed.contains(&key)
+                || self.image_loading.contains(&key)
+            {
+                continue;
+            }
+
+            if let Some(decoded) = crate::images::from_data_uri(&mail_image.image.src) {
+                match decoded.ok().and_then(|image| {
+                    self.graphics.as_ref().and_then(|graphics| {
+                        graphics
+                            .decode(&image.bytes, crate::termimg::CONVO_IMAGE_ROWS)
+                            .ok()
+                    })
+                }) {
+                    Some(image) => {
+                        self.image_cache.insert(key, image);
+                    }
+                    None => {
+                        self.image_failed.insert(key);
+                    }
+                }
+                continue;
+            }
+
+            let Some(content_id) = mail_content_id(&mail_image.image.src) else {
+                // Deliberately do not load remote images: doing so leaks that the
+                // message was opened and may expose Graph credentials to a third party.
+                self.image_failed.insert(key);
+                continue;
+            };
+            let Some(attachments) = self.outlook.attachment_cache.get(&mail_image.message_id)
+            else {
+                continue;
+            };
+            let attachment = attachments.iter().find(|attachment| {
+                attachment.content_id.as_deref().is_some_and(|id| {
+                    normalize_content_id(id).eq_ignore_ascii_case(normalize_content_id(content_id))
+                }) || attachment
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(content_id))
+            });
+            let Some(attachment) = attachment else {
+                self.image_failed.insert(key);
+                continue;
+            };
+            let message_id = mail_image.message_id;
+            let attachment_id = attachment.id.clone();
+            self.image_loading.insert(key.clone());
+            let session = self.session.clone();
+            self.spawn(async move {
+                match mail::download_attachment(&session.graph, &message_id, &attachment_id).await {
                     Ok(bytes) => Ok(AppMessage::HostedImage { key, bytes }),
                     Err(_) => Ok(AppMessage::HostedImageFailed { key }),
                 }
@@ -3769,6 +3912,18 @@ fn prepared_body(prepared: &crate::images::Prepared) -> OutgoingBody<'_> {
     }
 }
 
+fn mail_content_id(src: &str) -> Option<&str> {
+    let src = src.trim();
+    src.get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cid:"))
+        .then(|| src[4..].trim())
+        .filter(|id| !id.is_empty())
+}
+
+fn normalize_content_id(id: &str) -> &str {
+    id.trim().trim_start_matches('<').trim_end_matches('>')
+}
+
 fn render_mail_body(message: &MailMessage) -> content::RenderedBody {
     let (content_type, raw) = match &message.body {
         Some(body) => (
@@ -3842,6 +3997,7 @@ fn step(idx: usize, delta: i32, len: usize) -> usize {
 
 pub const DEFAULT_FOLDER_PANEL_WIDTH: u16 = 26;
 const MIN_FOLDER_PANEL_WIDTH: u16 = 11;
+pub const MIN_FOLDER_PANEL_HEIGHT: u16 = 5;
 
 pub(crate) fn mail_folder_label(folder: &MailFolder) -> String {
     let name = folder.display_name.clone().unwrap_or_default();
@@ -3861,6 +4017,19 @@ fn folder_panel_width(folders: &[MailFolder]) -> u16 {
         .unwrap_or(0)
         .saturating_add(3)
         .max(MIN_FOLDER_PANEL_WIDTH)
+}
+
+pub fn folder_panel_height(folders: &[MailFolder]) -> u16 {
+    (folders.len().clamp(3, 12) as u16).saturating_add(2)
+}
+
+fn resize_panel_extent(current: u16, delta: i16, minimum: u16) -> u16 {
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as u16)
+    }
+    .max(minimum)
 }
 
 /// Folder-list filter (case-insensitive substring on the rendered label).
@@ -3891,11 +4060,12 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_recipient_suggestion, cache_mail_contact, filter_folders, folder_panel_width,
-        format_compose_file, mail_row_indices, mail_row_unread, mail_thread_size,
-        merge_newest_first, next_field, parse_compose_file, parse_recipients, recipient_token,
-        step, Compose, ComposeKind, MailContact, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY,
-        COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO,
+        accept_recipient_suggestion, cache_mail_contact, filter_folders, folder_panel_height,
+        folder_panel_width, format_compose_file, mail_content_id, mail_row_indices,
+        mail_row_unread, mail_thread_size, merge_newest_first, next_field, normalize_content_id,
+        parse_compose_file, parse_recipients, recipient_token, resize_panel_extent, step, Compose,
+        ComposeKind, MailContact, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY, COMPOSE_CC,
+        COMPOSE_SUBJECT, COMPOSE_TO,
     };
 
     #[test]
@@ -3998,6 +4168,23 @@ mod tests {
     }
 
     #[test]
+    fn folder_panel_height_tracks_items_with_bounds() {
+        let folder = |name: &str| -> m365_core::models::MailFolder {
+            serde_json::from_value(serde_json::json!({ "id": name, "displayName": name })).unwrap()
+        };
+        assert_eq!(folder_panel_height(&[]), 5);
+        assert_eq!(folder_panel_height(&[folder("Inbox")]), 5);
+        assert_eq!(folder_panel_height(&vec![folder("x"); 20]), 14);
+    }
+
+    #[test]
+    fn panel_resize_respects_minimum() {
+        assert_eq!(resize_panel_extent(8, -1, 5), 7);
+        assert_eq!(resize_panel_extent(5, -1, 5), 5);
+        assert_eq!(resize_panel_extent(8, 1, 5), 9);
+    }
+
+    #[test]
     fn compose_field_cycles_within_allowed_fields() {
         assert_eq!(next_field(&[0, 1, 2], 0), 1);
         assert_eq!(next_field(&[0, 1, 2], 2), 0);
@@ -4036,6 +4223,17 @@ mod tests {
             vec!["a@x.pt", "b@x.pt", "c@x.pt", "d@x.pt"]
         );
         assert!(parse_recipients("  ,; ").is_empty());
+    }
+
+    #[test]
+    fn mail_content_ids_are_parsed_and_normalized() {
+        assert_eq!(mail_content_id("cid:logo@example"), Some("logo@example"));
+        assert_eq!(
+            mail_content_id("CID:<logo@example>"),
+            Some("<logo@example>")
+        );
+        assert_eq!(normalize_content_id(" <logo@example> "), "logo@example");
+        assert_eq!(mail_content_id("https://example.com/logo.png"), None);
     }
 
     #[test]

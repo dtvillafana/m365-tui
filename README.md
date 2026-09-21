@@ -5,7 +5,7 @@ between the two with `F2`.
 
 ![Reading an HTML email in the terminal, then jumping from its sender straight into a Teams chat with them](demo.gif)
 
-- **Outlook** — read mail with proper HTML rendering, compose / reply /
+- **Outlook** — read mail with proper HTML and inline-image rendering, compose / reply /
   reply-all / forward, send and save attachments, search, and a 7-day calendar
   with RSVP.
 - **Teams** — chats and channels, emoji reactions, shared files, and your
@@ -246,6 +246,10 @@ it inline, using the same syntax as the Teams composer.
 **Reading previews.** By default, selecting a message populates the reading pane
 without requiring `Enter`. Press `s` to change this; the setting persists across
 restarts.
+
+Inline images attached to an email are shown in terminals that support Kitty,
+Sixel, or iTerm2 graphics. They preserve their aspect ratio and resize when the
+pane width changes. Remote tracking images are not downloaded automatically.
 
 **Editing in `$EDITOR`.** While composing mail, `Ctrl+X e` (the same chord as
 the shell) leaves the TUI and opens `$VISUAL` or `$EDITOR` on the subject and

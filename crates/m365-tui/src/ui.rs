@@ -7,10 +7,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    filter_commands, filter_folders, mail_folder_label, mail_row_unread, mail_same_thread,
-    mail_thread_size, App, Compose, OutlookFocus, Overlay, PushState, Screen, TeamsFocus,
-    TeamsMode, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY, COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO,
-    DEFAULT_FOLDER_PANEL_WIDTH,
+    filter_commands, filter_folders, folder_panel_height, mail_folder_label, mail_row_unread,
+    mail_same_thread, mail_thread_size, App, Compose, OutlookFocus, Overlay, PushState, Screen,
+    TeamsFocus, TeamsMode, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY, COMPOSE_CC, COMPOSE_SUBJECT,
+    COMPOSE_TO, DEFAULT_FOLDER_PANEL_WIDTH,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -219,7 +219,10 @@ fn pane_direction(app: &App) -> Direction {
 
 fn outlook_constraints(app: &App) -> [Constraint; 3] {
     if app.panes_vertical {
-        let folder_h = (app.outlook.folders.len().clamp(3, 12) as u16).saturating_add(2);
+        let folder_h = app
+            .outlook
+            .folder_height
+            .unwrap_or_else(|| folder_panel_height(&app.outlook.folders));
         [
             Constraint::Length(folder_h),
             Constraint::Percentage(35),
@@ -255,7 +258,7 @@ fn teams_list_constraint(app: &App) -> Constraint {
 // Outlook
 // ---------------------------------------------------------------------------
 
-fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
+fn render_outlook(f: &mut Frame, area: Rect, app: &mut App) {
     let cols = Layout::default()
         .direction(pane_direction(app))
         .constraints(outlook_constraints(app))
@@ -361,14 +364,14 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(cols[2]);
     f.render_widget(block, cols[2]);
 
-    match email_lines(app) {
-        Some(lines) => {
-            let (rows, _) = crate::wrap::wrap_all(&lines, inner.width as usize);
+    match email_flow(app) {
+        Some(flow) => {
+            let (rows, _) = wrap_flow(app, &flow, inner.width.max(1) as usize);
             // Tell the key handler how far it can usefully scroll.
             app.reading_max_scroll
-                .set((rows.len() as u16).saturating_sub(inner.height));
+                .set((display_row_count(&rows) as u16).saturating_sub(inner.height));
             let scroll = app.outlook.reading_scroll.min(app.reading_max_scroll.get());
-            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
+            render_display_rows(f, inner, &rows, scroll, app);
         }
         None => {
             app.reading_max_scroll.set(0);
@@ -381,6 +384,61 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
             );
         }
     }
+}
+
+fn email_flow(app: &App) -> Option<Vec<FlowItem>> {
+    let message = app.outlook.reading.as_ref()?;
+    if app.outlook.reading_thread.is_empty() {
+        let mut flow = email_lines(app)?.into_iter().map(FlowItem::Line).collect();
+        push_mail_images(&mut flow, app, &message.id);
+        return Some(flow);
+    }
+
+    let total = app.outlook.reading_thread.len();
+    let mut flow = Vec::new();
+    for (index, (message, body)) in app
+        .outlook
+        .reading_thread
+        .iter()
+        .zip(&app.outlook.reading_thread_bodies)
+        .enumerate()
+    {
+        if index > 0 {
+            flow.push(FlowItem::Line(Line::raw("")));
+        }
+        flow.push(FlowItem::Line(Line::from(Span::styled(
+            format!("── Message {} of {total} ──", index + 1),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))));
+        flow.push(FlowItem::Line(kv(
+            "Subject",
+            &message.subject.clone().unwrap_or_default(),
+        )));
+        flow.push(FlowItem::Line(kv("From", &message.sender_name())));
+        flow.push(FlowItem::Line(kv(
+            "Date",
+            message.mail_time().unwrap_or_default(),
+        )));
+        if index == 0 && !app.outlook.reading_attachments.is_empty() {
+            flow.push(FlowItem::Line(attachment_line(app)));
+        }
+        flow.push(FlowItem::Line(Line::raw("")));
+        flow.extend(body.lines.iter().cloned().map(FlowItem::Line));
+        push_mail_images(&mut flow, app, &message.id);
+    }
+    Some(flow)
+}
+
+fn push_mail_images(flow: &mut Vec<FlowItem>, app: &App, message_id: &str) {
+    flow.extend(
+        app.outlook
+            .reading_images
+            .iter()
+            .filter(|image| image.message_id == message_id)
+            .map(|image| FlowItem::Image {
+                key: crate::termimg::mail_cache_key(message_id, &image.image.src),
+            }),
+    );
 }
 
 /// Headers + rendered body of the open email, or `None` if nothing is open.
@@ -641,7 +699,7 @@ fn wrap_flow(app: &App, items: &[FlowItem], width: usize) -> (Vec<DisplayRow>, V
             }
             FlowItem::Image { key } => rows.push(DisplayRow::Image {
                 key: key.clone(),
-                height: app.image_display_rows(key),
+                height: app.image_display_rows(key, width as u16),
             }),
         }
     }
@@ -689,7 +747,7 @@ fn render_display_rows(
                 if let Some(img) = app.image_cache.get_mut(key) {
                     crate::termimg::render(f, dest, img);
                 } else {
-                    let label = if app.image_loading.contains(key) {
+                    let label = if app.image_is_pending(key) {
                         "  [image…]"
                     } else {
                         "  [image unavailable]"
@@ -786,7 +844,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     let composer_rows = app.teams.composer.wrap(composer_width).len().clamp(1, 6) as u16;
     // One extra row while a reply is being composed, for the quoted banner.
     let reply_row = u16::from(app.teams.replying_to.is_some());
-    let preview_h = composer_preview_height(app);
+    let preview_h = composer_preview_height(app, composer_width as u16);
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -912,7 +970,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
 // Overlays
 // ---------------------------------------------------------------------------
 
-fn composer_preview_height(app: &App) -> u16 {
+fn composer_preview_height(app: &App, width: u16) -> u16 {
     if app.teams.images.is_empty() {
         return 0;
     }
@@ -922,7 +980,12 @@ fn composer_preview_height(app: &App) -> u16 {
     app.teams
         .composer_previews
         .iter()
-        .map(|p| p.as_ref().map(|img| img.rows).unwrap_or(1))
+        .map(|preview| {
+            preview
+                .as_ref()
+                .map(|image| image.rows_for_width(width))
+                .unwrap_or(1)
+        })
         .sum()
 }
 
@@ -959,7 +1022,7 @@ fn render_composer_previews(f: &mut Frame, composer_inner: &mut Rect, app: &mut 
     for i in 0..n {
         let rows = app.teams.composer_previews[i]
             .as_ref()
-            .map(|img| img.rows)
+            .map(|image| image.rows_for_width(composer_inner.width))
             .unwrap_or(1)
             .min(composer_inner.height);
         if rows == 0 {

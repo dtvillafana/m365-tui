@@ -470,6 +470,8 @@ pub struct Attachment {
     pub size: Option<i64>,
     #[serde(default)]
     pub is_inline: Option<bool>,
+    #[serde(default)]
+    pub content_id: Option<String>,
     /// `#microsoft.graph.fileAttachment`, `itemAttachment`, `referenceAttachment`.
     #[serde(default, rename = "@odata.type")]
     pub odata_type: Option<String>,

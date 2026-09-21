@@ -89,8 +89,9 @@ pub async fn delta_messages(
 /// List a message's attachments. `$select` keeps `contentBytes` out of the
 /// response so listing stays cheap regardless of attachment size.
 pub async fn list_attachments(graph: &GraphClient, message_id: &str) -> Result<Vec<Attachment>> {
-    let path =
-        format!("me/messages/{message_id}/attachments?$select=id,name,contentType,size,isInline");
+    let path = format!(
+        "me/messages/{message_id}/attachments?$select=id,name,contentType,size,isInline,contentId"
+    );
     graph.get_collection(&path).await
 }
 
