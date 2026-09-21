@@ -203,7 +203,7 @@ Press `?` in the app for this list at any time.
 
 | Scope | Keys |
 |---|---|
-| **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `|` or `\` toggle pane layout · `?` help · `q` quit |
+| **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `s` settings · `|` or `\` toggle pane layout · `?` help · `q` quit |
 | **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · `g`/`G` top/bottom · `Shift+H`/`Shift+L` resize Outlook folders · arrows work the same · `Tab` cycles |
 | **Outlook** | `Enter` open · `t` threads/individual messages · `c` compose · `r` reply · `a` reply-all · `f` forward · `u` read/unread · `m` move folder · `d` trash · `/` search mail · folders pane `/` find folder · `e` calendar |
 | **Reading a mail** | `j`/`k` scroll · `g`/`G` or `Home`/`End` · `h` back to the list |
@@ -211,7 +211,7 @@ Press `?` in the app for this list at any time.
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
-| **Writing** | `←→↑↓` move · `Ctrl+←→` by word · `Home`/`End` · `Ctrl+W`/`Ctrl+U`/`Ctrl+K` delete · `Ctrl+X e` `$EDITOR` · `Ctrl+S` send · `Esc` cancel |
+| **Writing** | `←→↑↓` move · `Ctrl+←→` by word · `Home`/`End` · `Ctrl+W`/`Ctrl+U`/`Ctrl+K` delete · `Ctrl+R` reply/reply-all · `Ctrl+E` edit reply recipients · `Ctrl+X e` `$EDITOR` · `Ctrl+S` send · `Esc` cancel |
 
 `h` and `l` work like a file manager: `l` moves right into the pane beside you,
 opening whatever is selected, and `h` moves back out. `j`/`k` stay inside the
@@ -222,8 +222,8 @@ In the folders pane, `/` filters the list so you can jump to an inbox by name.
 Press `t` in Outlook to collapse the loaded message list into reply threads.
 Thread rows show the number of loaded messages in brackets; opening one fetches
 up to 50 messages from that conversation across the mailbox and displays them
-oldest first. Mail actions still apply to the newest message represented by the
-selected row. Press `t` again to return to individual messages.
+newest first. Retrieved messages and threads are cached for the rest of the app
+session. Press `t` again to return to individual messages.
 
 Scrolling to the end of a message list or conversation loads the next 50 items.
 
@@ -235,9 +235,17 @@ message, which clears itself after a few seconds.
 ## Things worth knowing
 
 **Sending attachments.** In the Outlook compose window, `Tab` to the `Attach:`
-field, type a file path (`~` works) and press `Enter` to stage it. `Ctrl+X x`
+field, type a file path (`~` works), press `Tab` to complete it, and press
+`Enter` to stage it. `Ctrl+X x`
 removes the last one. Files over 3 MB upload in chunks automatically; Graph's
 own ceiling is 150 MB per message.
+
+Type an image as `@~/Pictures/shot.png` in the mail body to complete and embed
+it inline, using the same syntax as the Teams composer.
+
+**Reading previews.** By default, selecting a message populates the reading pane
+without requiring `Enter`. Press `s` to change this; the setting persists across
+restarts.
 
 **Editing in `$EDITOR`.** While composing mail, `Ctrl+X e` (the same chord as
 the shell) leaves the TUI and opens `$VISUAL` or `$EDITOR` on the subject and

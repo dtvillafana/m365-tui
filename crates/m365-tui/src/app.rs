@@ -37,6 +37,7 @@ pub enum AppMessage {
     },
     MessageBody(MailMessage),
     MailThread {
+        conversation_id: String,
         items: Vec<MailMessage>,
         truncated: bool,
     },
@@ -62,6 +63,7 @@ pub enum AppMessage {
     },
     /// A send/action completed; optional status text and refresh hint.
     Done(String),
+    MailSent(String),
     /// A Teams message (with optional images) was posted.
     TeamsSent(String),
     /// A Teams send failed; restore the composer if it is still empty.
@@ -158,6 +160,9 @@ pub enum Overlay {
     React,
     /// Presence (status) picker for the signed-in user.
     Presence,
+    Settings {
+        sel: usize,
+    },
     /// Numbered links in the focused message, to open in a browser.
     Links,
     /// Attachments of the open mail message, to save to disk.
@@ -324,6 +329,7 @@ pub struct Compose {
     /// One of the `COMPOSE_*` field constants.
     pub field: usize,
     pub suggestion_sel: usize,
+    pub edit_recipients: bool,
     /// Waiting for the second key of a Ctrl+X chord.
     pub ctrl_x: bool,
 }
@@ -341,6 +347,7 @@ impl Compose {
             attachments: Vec::new(),
             field,
             suggestion_sel: 0,
+            edit_recipients: false,
             ctrl_x: false,
         }
     }
@@ -353,7 +360,7 @@ impl Compose {
         if raw.is_empty() {
             return String::new();
         }
-        let path = expand_tilde(raw);
+        let path = expand_tilde(&crate::images::unescape_path(raw));
         match std::fs::metadata(&path) {
             Ok(md) if md.is_file() => {
                 let size = md.len();
@@ -383,6 +390,23 @@ impl Compose {
             COMPOSE_CC => Some(&self.cc),
             COMPOSE_BCC => Some(&self.bcc),
             _ => None,
+        }
+    }
+
+    pub(crate) fn fields(&self) -> &'static [usize] {
+        match &self.kind {
+            ComposeKind::ReplyMail { .. } | ComposeKind::ReplyAllMail { .. }
+                if self.edit_recipients =>
+            {
+                &[
+                    COMPOSE_TO,
+                    COMPOSE_CC,
+                    COMPOSE_BCC,
+                    COMPOSE_BODY,
+                    COMPOSE_ATTACH,
+                ]
+            }
+            _ => self.kind.fields(),
         }
     }
 }
@@ -421,9 +445,19 @@ pub struct OutlookState {
     pub reading_links: Vec<String>,
     /// Attachments of the open message (fetched when it has any).
     pub reading_attachments: Vec<Attachment>,
+    message_cache: std::collections::HashMap<String, MailMessage>,
+    thread_cache: std::collections::HashMap<String, (Vec<MailMessage>, bool)>,
+    attachment_cache: std::collections::HashMap<String, Vec<Attachment>>,
+    pending_reading: Option<ReadingKey>,
     /// Line scroll offset of the reading pane.
     pub reading_scroll: u16,
     pub calendar: Vec<CalEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadingKey {
+    Message(String),
+    Thread(String),
 }
 
 pub struct TeamsState {
@@ -547,6 +581,7 @@ pub struct App {
     /// Leave the TUI and open `$EDITOR` on the compose subject and body.
     pub pending_external_edit: bool,
     pub should_quit: bool,
+    pub settings: crate::settings::Settings,
     /// Terminal graphics protocol, if the terminal can draw pixels.
     pub graphics: Option<crate::termimg::Graphics>,
     pub image_cache: std::collections::HashMap<String, crate::termimg::ReadyImage>,
@@ -573,6 +608,7 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("chat-sender", "Teams: chat with selected email's sender"),
     ("refresh", "Refresh current view"),
     ("help", "Show help"),
+    ("settings", "Open settings"),
     ("quit", "Quit"),
 ];
 
@@ -607,6 +643,7 @@ impl App {
             panes_vertical: false,
             pending_external_edit: false,
             should_quit: false,
+            settings: crate::settings::Settings::load(),
             graphics: None,
             image_cache: std::collections::HashMap::new(),
             image_loading: std::collections::HashSet::new(),
@@ -829,7 +866,11 @@ impl App {
         self.spawn(async move {
             let (items, truncated) =
                 mail::list_conversation(&s.graph, &conversation_id, PAGE_SIZE).await?;
-            Ok(AppMessage::MailThread { items, truncated })
+            Ok(AppMessage::MailThread {
+                conversation_id,
+                items,
+                truncated,
+            })
         });
     }
 
@@ -976,6 +1017,7 @@ impl App {
         match msg {
             AppMessage::Status(s) => self.status = s,
             AppMessage::Error(e) => {
+                self.outlook.pending_reading = None;
                 self.status = format!("error: {}", m365_core::util::graph_error_summary(&e));
             }
             AppMessage::Whoami(u) => {
@@ -1054,64 +1096,42 @@ impl App {
                     })
                     .unwrap_or(self.outlook.msg_sel)
                     .min(self.outlook.message_rows.len().saturating_sub(1));
+                if self.settings.preview_mail_on_hover
+                    && self.outlook_focus == OutlookFocus::Messages
+                {
+                    self.open_current_mail();
+                }
             }
             AppMessage::MessageBody(m) => {
                 self.cache_mail_contacts(std::slice::from_ref(&m));
-                let (ct, raw) = match &m.body {
-                    Some(b) => (
-                        b.content_type.as_deref(),
-                        b.content.clone().unwrap_or_default(),
-                    ),
-                    None => (Some("text"), m.body_preview.clone().unwrap_or_default()),
-                };
-                let rendered = content::render_body(ct, &raw);
-                self.outlook.reading_links = rendered.links;
-                self.outlook.reading_body = Some(rendered.text);
-                self.outlook.reading_thread.clear();
-                self.outlook.reading_thread_bodies.clear();
-                self.outlook.reading_attachments.clear();
-                self.outlook.reading_scroll = 0;
-                if m.has_attachments.unwrap_or(false) {
-                    self.load_attachments(m.id.clone());
+                let id = m.id.clone();
+                self.outlook.message_cache.insert(id.clone(), m.clone());
+                if self.outlook.pending_reading.as_ref() == Some(&ReadingKey::Message(id)) {
+                    self.outlook.pending_reading = None;
+                    self.show_message(m);
                 }
-                self.outlook.reading = Some(m);
             }
-            AppMessage::MailThread { items, truncated } => {
+            AppMessage::MailThread {
+                conversation_id,
+                items,
+                truncated,
+            } => {
                 self.cache_mail_contacts(&items);
-                let Some(latest) = items.first().cloned() else {
-                    self.status = "thread has no messages".into();
-                    return;
-                };
-                let mut bodies = Vec::with_capacity(items.len());
-                let mut latest_links = Vec::new();
-                for (index, message) in items.iter().enumerate() {
-                    let rendered = render_mail_body(message);
-                    if index == 0 {
-                        latest_links = rendered.links;
-                    }
-                    bodies.push(rendered.text);
+                self.outlook.message_cache.extend(
+                    items
+                        .iter()
+                        .cloned()
+                        .map(|message| (message.id.clone(), message)),
+                );
+                self.outlook
+                    .thread_cache
+                    .insert(conversation_id.clone(), (items.clone(), truncated));
+                if self.outlook.pending_reading.as_ref()
+                    == Some(&ReadingKey::Thread(conversation_id))
+                {
+                    self.outlook.pending_reading = None;
+                    self.show_thread(items, truncated);
                 }
-                self.outlook.reading = Some(latest.clone());
-                self.outlook.reading_body = None;
-                self.outlook.reading_thread = items;
-                self.outlook.reading_thread_bodies = bodies;
-                self.outlook.reading_links = latest_links;
-                self.outlook.reading_attachments.clear();
-                self.outlook.reading_scroll = 0;
-                if latest.has_attachments.unwrap_or(false) {
-                    self.load_attachments(latest.id.clone());
-                }
-                self.status = if truncated {
-                    format!(
-                        "{} thread messages loaded (more not shown)",
-                        self.outlook.reading_thread.len()
-                    )
-                } else {
-                    format!(
-                        "{} thread messages loaded",
-                        self.outlook.reading_thread.len()
-                    )
-                };
             }
             AppMessage::Calendar(e) => self.outlook.calendar = e,
             AppMessage::Chats(c) => {
@@ -1152,6 +1172,11 @@ impl App {
             }
             AppMessage::Done(s) => {
                 self.status = s;
+                self.refresh_current();
+            }
+            AppMessage::MailSent(s) => {
+                self.status = s;
+                self.outlook.thread_cache.clear();
                 self.refresh_current();
             }
             AppMessage::TeamsSent(s) => {
@@ -1210,6 +1235,9 @@ impl App {
             }
             AppMessage::InboxPeek(items) => self.notify_for_mail(&items),
             AppMessage::Attachments { message_id, items } => {
+                self.outlook
+                    .attachment_cache
+                    .insert(message_id.clone(), items.clone());
                 // Ignore a late response for a message we've navigated away from.
                 if self.outlook.reading.as_ref().map(|m| m.id.as_str()) == Some(&message_id) {
                     // Inline images (signatures, logos) aren't useful downloads.
@@ -1761,6 +1789,10 @@ impl App {
                 self.overlay = Some(Overlay::Presence);
                 return;
             }
+            (KeyCode::Char('s'), KeyModifiers::NONE) if !typing => {
+                self.overlay = Some(Overlay::Settings { sel: 0 });
+                return;
+            }
             (KeyCode::Char('A'), _) if !typing => {
                 if self.screen == Screen::Outlook {
                     if self.outlook.reading_attachments.is_empty() {
@@ -1898,10 +1930,14 @@ impl App {
             }
             OutlookFocus::Messages => {
                 let len = self.outlook.message_rows.len();
+                let previous = self.outlook.msg_sel;
                 self.outlook.msg_sel = step(self.outlook.msg_sel, delta, len);
                 // Scrolling down onto the last row pulls the next page.
                 if delta > 0 && len > 0 && self.outlook.msg_sel == len - 1 {
                     self.load_more_messages();
+                }
+                if self.settings.preview_mail_on_hover && self.outlook.msg_sel != previous {
+                    self.open_current_mail();
                 }
             }
         }
@@ -1931,6 +1967,9 @@ impl App {
                 };
             }
         }
+        if self.outlook_focus == OutlookFocus::Messages && self.settings.preview_mail_on_hover {
+            self.open_current_mail();
+        }
     }
 
     /// Move focus one pane left: Reading → Messages → Folders.
@@ -1959,14 +1998,8 @@ impl App {
                 }
             }
             OutlookFocus::Messages | OutlookFocus::Reading => {
-                if let Some(m) = self.current_mail() {
-                    if self.outlook.threaded {
-                        let conversation_id =
-                            m.conversation_id.clone().unwrap_or_else(|| m.id.clone());
-                        self.load_mail_thread(conversation_id);
-                    } else {
-                        self.load_body(m.id.clone());
-                    }
+                if self.current_mail().is_some() {
+                    self.open_current_mail();
                     self.outlook_focus = OutlookFocus::Reading;
                 }
             }
@@ -1978,6 +2011,92 @@ impl App {
             .message_rows
             .get(self.outlook.msg_sel)
             .and_then(|&i| self.outlook.messages.get(i))
+    }
+
+    fn open_current_mail(&mut self) {
+        let Some(message) = self.current_mail().cloned() else {
+            return;
+        };
+        if self.outlook.threaded {
+            let conversation_id = message
+                .conversation_id
+                .clone()
+                .unwrap_or_else(|| message.id.clone());
+            let key = ReadingKey::Thread(conversation_id.clone());
+            if let Some((items, truncated)) =
+                self.outlook.thread_cache.get(&conversation_id).cloned()
+            {
+                self.outlook.pending_reading = None;
+                self.show_thread(items, truncated);
+            } else if self.outlook.pending_reading.as_ref() != Some(&key) {
+                self.outlook.pending_reading = Some(key);
+                self.load_mail_thread(conversation_id);
+            }
+        } else {
+            let key = ReadingKey::Message(message.id.clone());
+            if let Some(cached) = self.outlook.message_cache.get(&message.id).cloned() {
+                self.outlook.pending_reading = None;
+                self.show_message(cached);
+            } else if self.outlook.pending_reading.as_ref() != Some(&key) {
+                self.outlook.pending_reading = Some(key);
+                self.status = "loading message…".into();
+                self.load_body(message.id);
+            }
+        }
+    }
+
+    fn show_message(&mut self, message: MailMessage) {
+        let rendered = render_mail_body(&message);
+        self.outlook.reading_links = rendered.links;
+        self.outlook.reading_body = Some(rendered.text);
+        self.outlook.reading_thread.clear();
+        self.outlook.reading_thread_bodies.clear();
+        self.show_cached_attachments(&message);
+        self.outlook.reading_scroll = 0;
+        self.outlook.reading = Some(message);
+    }
+
+    fn show_thread(&mut self, items: Vec<MailMessage>, truncated: bool) {
+        let Some(latest) = items.first().cloned() else {
+            self.status = "thread has no messages".into();
+            return;
+        };
+        let rendered: Vec<content::RenderedBody> = items.iter().map(render_mail_body).collect();
+        self.outlook.reading_links = rendered
+            .first()
+            .map(|body| body.links.clone())
+            .unwrap_or_default();
+        self.outlook.reading_body = None;
+        self.outlook.reading_thread_bodies = rendered.into_iter().map(|body| body.text).collect();
+        self.outlook.reading_thread = items;
+        self.show_cached_attachments(&latest);
+        self.outlook.reading_scroll = 0;
+        self.outlook.reading = Some(latest);
+        self.status = if truncated {
+            format!(
+                "{} thread messages loaded (more not shown)",
+                self.outlook.reading_thread.len()
+            )
+        } else {
+            format!(
+                "{} thread messages loaded",
+                self.outlook.reading_thread.len()
+            )
+        };
+    }
+
+    fn show_cached_attachments(&mut self, message: &MailMessage) {
+        self.outlook.reading_attachments = self
+            .outlook
+            .attachment_cache
+            .get(&message.id)
+            .cloned()
+            .unwrap_or_default();
+        if message.has_attachments.unwrap_or(false)
+            && !self.outlook.attachment_cache.contains_key(&message.id)
+        {
+            self.load_attachments(message.id.clone());
+        }
     }
 
     fn cache_mail_contacts(&mut self, messages: &[MailMessage]) {
@@ -2070,6 +2189,9 @@ impl App {
         } else {
             "mail: individual messages".into()
         };
+        if self.settings.preview_mail_on_hover && self.outlook_focus == OutlookFocus::Messages {
+            self.open_current_mail();
+        }
     }
 
     /// Toggle the selected message between read and unread.
@@ -2117,6 +2239,14 @@ impl App {
         }
         if let Some(message) = self.outlook.reading.as_mut().filter(|m| m.id == id) {
             message.is_read = Some(read);
+        }
+        if let Some(message) = self.outlook.message_cache.get_mut(id) {
+            message.is_read = Some(read);
+        }
+        for (messages, _) in self.outlook.thread_cache.values_mut() {
+            if let Some(message) = messages.iter_mut().find(|message| message.id == id) {
+                message.is_read = Some(read);
+            }
         }
 
         if in_current_folder {
@@ -2236,7 +2366,41 @@ impl App {
             ReplyMode::ReplyAll => (ComposeKind::ReplyAllMail { id }, COMPOSE_BODY),
             ReplyMode::Forward => (ComposeKind::ForwardMail { id }, COMPOSE_TO),
         };
-        self.overlay = Some(Overlay::Compose(Compose::new(kind, field)));
+        let mut compose = Compose::new(kind, field);
+        self.populate_reply_recipients(&mut compose);
+        self.overlay = Some(Overlay::Compose(compose));
+    }
+
+    fn populate_reply_recipients(&self, compose: &mut Compose) {
+        if !matches!(
+            compose.kind,
+            ComposeKind::ReplyMail { .. } | ComposeKind::ReplyAllMail { .. }
+        ) {
+            return;
+        }
+        let source = self
+            .outlook
+            .reading
+            .as_ref()
+            .or_else(|| self.current_mail());
+        let Some(source) = source else { return };
+        let me = self
+            .me
+            .as_ref()
+            .and_then(User::best_email)
+            .unwrap_or_default();
+        let sender = source.sender_address().unwrap_or_default();
+        let mut to = vec![sender];
+        let mut cc = Vec::new();
+        if matches!(compose.kind, ComposeKind::ReplyAllMail { .. }) {
+            to.extend(recipient_addresses(&source.to_recipients));
+            cc.extend(recipient_addresses(&source.cc_recipients));
+        }
+        dedup_addresses(&mut to, me);
+        dedup_addresses(&mut cc, me);
+        compose.to = TextInput::from(to.join(", ").as_str());
+        compose.cc = TextInput::from(cc.join(", ").as_str());
+        compose.bcc.clear();
     }
 
     fn on_key_teams(&mut self, key: KeyEvent) {
@@ -2619,6 +2783,36 @@ impl App {
         true
     }
 
+    fn complete_mail_path(&mut self, compose: &mut Compose) -> bool {
+        let completion = if compose.field == COMPOSE_BODY {
+            let Some(token) = crate::images::token_at(compose.body.chars(), compose.body.cursor())
+            else {
+                return false;
+            };
+            let Some(completion) = crate::images::complete(&token) else {
+                return false;
+            };
+            compose
+                .body
+                .replace_range(token.start, token.end, &completion.replacement);
+            completion
+        } else if compose.field == COMPOSE_ATTACH {
+            let Some(completion) =
+                crate::images::complete_attachment(compose.attach.chars(), compose.attach.cursor())
+            else {
+                return false;
+            };
+            compose
+                .attach
+                .replace_range(0, compose.attach.chars().len(), &completion.replacement);
+            completion
+        } else {
+            return false;
+        };
+        self.status = completion.status;
+        true
+    }
+
     fn paste_clipboard_image(&mut self) {
         match crate::clipboard::image_bytes() {
             Ok((_mime, bytes)) => {
@@ -2823,6 +3017,29 @@ impl App {
                 }
                 _ => self.overlay = Some(Overlay::Presence), // ignore other keys
             },
+            Some(Overlay::Settings { mut sel }) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    sel = sel.saturating_sub(1);
+                    self.overlay = Some(Overlay::Settings { sel });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.overlay = Some(Overlay::Settings { sel });
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.settings.preview_mail_on_hover = !self.settings.preview_mail_on_hover;
+                    self.status = match self.settings.save() {
+                        Ok(()) => "settings saved".into(),
+                        Err(error) => format!("could not save settings: {error:#}"),
+                    };
+                    if self.settings.preview_mail_on_hover
+                        && self.outlook_focus == OutlookFocus::Messages
+                    {
+                        self.open_current_mail();
+                    }
+                    self.overlay = Some(Overlay::Settings { sel });
+                }
+                _ => self.overlay = Some(Overlay::Settings { sel }),
+            },
             Some(Overlay::Search { mut query }) => match key.code {
                 KeyCode::Enter => {
                     let q = query.clone();
@@ -2967,19 +3184,46 @@ impl App {
 
         match key.code {
             // -- actions --
+            KeyCode::Char('r') if ctrl => {
+                c.kind = match &c.kind {
+                    ComposeKind::ReplyMail { id } => ComposeKind::ReplyAllMail { id: id.clone() },
+                    ComposeKind::ReplyAllMail { id } => ComposeKind::ReplyMail { id: id.clone() },
+                    _ => {
+                        self.overlay =
+                            Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
+                        return;
+                    }
+                };
+                if !c.edit_recipients {
+                    self.populate_reply_recipients(c);
+                }
+                self.status = format!("compose mode: {}", c.kind.title());
+            }
+            KeyCode::Char('e')
+                if ctrl
+                    && matches!(
+                        c.kind,
+                        ComposeKind::ReplyMail { .. } | ComposeKind::ReplyAllMail { .. }
+                    ) =>
+            {
+                c.edit_recipients = true;
+                c.field = COMPOSE_TO;
+                self.status = "reply recipients editable".into();
+            }
             KeyCode::Char('s') if ctrl => {
                 self.submit_compose(c);
                 return;
             }
+            KeyCode::Tab if self.complete_mail_path(c) => {}
             KeyCode::Tab if has_suggestions => {
                 let selected = c.suggestion_sel.min(suggestions.len() - 1);
                 accept_recipient_suggestion(c, &suggestions[selected]);
             }
             KeyCode::Tab => {
-                c.field = next_field(c.kind.fields(), c.field);
+                c.field = next_field(c.fields(), c.field);
                 c.suggestion_sel = 0;
             }
-            KeyCode::BackTab => c.field = prev_field(c.kind.fields(), c.field),
+            KeyCode::BackTab => c.field = prev_field(c.fields(), c.field),
             KeyCode::Enter => {
                 if has_suggestions {
                     let selected = c.suggestion_sel.min(suggestions.len() - 1);
@@ -2992,7 +3236,7 @@ impl App {
                         self.status = msg;
                     }
                 } else {
-                    c.field = next_field(c.kind.fields(), c.field);
+                    c.field = next_field(c.fields(), c.field);
                 }
             }
             // Ctrl+X is a prefix: e opens $EDITOR, x unstages the last file.
@@ -3034,8 +3278,8 @@ impl App {
             }
             KeyCode::Up if is_body => c.active_mut().move_row(-1, width),
             KeyCode::Down if is_body => c.active_mut().move_row(1, width),
-            KeyCode::Up => c.field = prev_field(c.kind.fields(), c.field),
-            KeyCode::Down => c.field = next_field(c.kind.fields(), c.field),
+            KeyCode::Up => c.field = prev_field(c.fields(), c.field),
+            KeyCode::Down => c.field = next_field(c.fields(), c.field),
             KeyCode::Home if ctrl => c.active_mut().start_of_text(),
             KeyCode::End if ctrl => c.active_mut().end_of_text(),
             KeyCode::Char('a') if ctrl => c.active_mut().home(),
@@ -3123,8 +3367,26 @@ impl App {
                     subject: c.subject.text(),
                 }
             }
-            ComposeKind::ReplyMail { id } => Outgoing::Reply { id: id.clone() },
-            ComposeKind::ReplyAllMail { id } => Outgoing::ReplyAll { id: id.clone() },
+            ComposeKind::ReplyMail { id } => Outgoing::Reply {
+                id: id.clone(),
+                recipients: c
+                    .edit_recipients
+                    .then(|| m365_core::mail::OutgoingRecipients {
+                        to: parse_recipients(&c.to.text()),
+                        cc: parse_recipients(&c.cc.text()),
+                        bcc: parse_recipients(&c.bcc.text()),
+                    }),
+            },
+            ComposeKind::ReplyAllMail { id } => Outgoing::ReplyAll {
+                id: id.clone(),
+                recipients: c
+                    .edit_recipients
+                    .then(|| m365_core::mail::OutgoingRecipients {
+                        to: parse_recipients(&c.to.text()),
+                        cc: parse_recipients(&c.cc.text()),
+                        bcc: parse_recipients(&c.bcc.text()),
+                    }),
+            },
             ComposeKind::ForwardMail { id } => {
                 let to = parse_recipients(&c.to.text());
                 let cc = parse_recipients(&c.cc.text());
@@ -3144,7 +3406,18 @@ impl App {
         };
 
         let paths = c.attachments.clone();
-        let body = c.body.text();
+        let body_text = c.body.text();
+        let prepared_mail = match crate::images::prepare_mail(&body_text) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status = error;
+                self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
+                return;
+            }
+        };
+        let body_is_html = prepared_mail.html.is_some();
+        let body = prepared_mail.html.unwrap_or(body_text);
+        let inline_images = prepared_mail.images;
         let label = match paths.len() {
             0 => "sending…".to_string(),
             1 => "sending with 1 attachment…".to_string(),
@@ -3156,7 +3429,7 @@ impl App {
         let s = self.session.clone();
         self.spawn(async move {
             // Read the staged files here, off the UI thread.
-            let mut attachments = Vec::with_capacity(paths.len());
+            let mut attachments = Vec::with_capacity(paths.len() + inline_images.len());
             for (path, _) in &paths {
                 let bytes =
                     std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -3164,11 +3437,26 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "attachment".to_string());
-                attachments.push(m365_core::mail::OutgoingAttachment { name, bytes });
+                attachments.push(m365_core::mail::OutgoingAttachment {
+                    name,
+                    bytes,
+                    content_type: None,
+                    content_id: None,
+                    is_inline: false,
+                });
+            }
+            for (image, content_id) in inline_images {
+                attachments.push(m365_core::mail::OutgoingAttachment {
+                    name: image.name,
+                    bytes: image.bytes,
+                    content_type: Some(image.mime.to_string()),
+                    content_id: Some(content_id),
+                    is_inline: true,
+                });
             }
             let count = attachments.len();
-            mail::send_message(&s.graph, kind, &body, attachments).await?;
-            Ok(AppMessage::Done(match count {
+            mail::send_message(&s.graph, kind, &body, body_is_html, attachments).await?;
+            Ok(AppMessage::MailSent(match count {
                 0 => "sent".to_string(),
                 1 => "sent with 1 attachment".to_string(),
                 n => format!("sent with {n} attachments"),
@@ -3226,6 +3514,7 @@ impl App {
             }
             "refresh" => self.refresh_current(),
             "help" => self.overlay = Some(Overlay::Help),
+            "settings" => self.overlay = Some(Overlay::Settings { sel: 0 }),
             "quit" => self.should_quit = true,
             _ => {}
         }
@@ -3351,6 +3640,21 @@ fn parse_recipients(s: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()
+}
+
+fn recipient_addresses(recipients: &[Recipient]) -> Vec<String> {
+    recipients
+        .iter()
+        .filter_map(|recipient| recipient.email_address.as_ref()?.address.clone())
+        .collect()
+}
+
+fn dedup_addresses(addresses: &mut Vec<String>, excluded: &str) {
+    let mut seen = std::collections::HashSet::new();
+    addresses.retain(|address| {
+        let key = address.trim().to_lowercase();
+        !key.is_empty() && !key.eq_ignore_ascii_case(excluded) && seen.insert(key)
+    });
 }
 
 fn cache_mail_contact(
@@ -3706,6 +4010,19 @@ mod tests {
                 COMPOSE_CC,
                 COMPOSE_BCC,
                 COMPOSE_SUBJECT,
+                COMPOSE_BODY,
+                COMPOSE_ATTACH
+            ]
+        );
+        let mut reply = Compose::new(ComposeKind::ReplyMail { id: "id".into() }, COMPOSE_BODY);
+        assert_eq!(reply.fields(), &[COMPOSE_BODY, COMPOSE_ATTACH]);
+        reply.edit_recipients = true;
+        assert_eq!(
+            reply.fields(),
+            &[
+                COMPOSE_TO,
+                COMPOSE_CC,
+                COMPOSE_BCC,
                 COMPOSE_BODY,
                 COMPOSE_ATTACH
             ]

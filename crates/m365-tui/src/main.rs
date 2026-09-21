@@ -21,6 +21,7 @@ mod images;
 mod navigation;
 mod notify;
 mod opener;
+mod settings;
 mod termimg;
 mod ui;
 mod wrap;

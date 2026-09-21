@@ -25,6 +25,7 @@ futures-util.workspace = true
 html5ever = "0.38"
 markup5ever_rcdom = "0.38"
 directories.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 

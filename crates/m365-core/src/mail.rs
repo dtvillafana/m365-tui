@@ -187,6 +187,14 @@ fn html_body(text: &str) -> serde_json::Value {
     json!({ "contentType": "HTML", "content": html_escape(text) })
 }
 
+fn outgoing_body(text: &str, is_html: bool) -> serde_json::Value {
+    if is_html {
+        json!({ "contentType": "HTML", "content": text })
+    } else {
+        html_body(text)
+    }
+}
+
 /// Send a new message.
 pub async fn send_mail(
     graph: &GraphClient,
@@ -195,11 +203,12 @@ pub async fn send_mail(
     bcc: &[String],
     subject: &str,
     body: &str,
+    body_is_html: bool,
 ) -> Result<()> {
     let payload = json!({
         "message": {
             "subject": subject,
-            "body": html_body(body),
+            "body": outgoing_body(body, body_is_html),
             "toRecipients": recipient_values(to),
             "ccRecipients": recipient_values(cc),
             "bccRecipients": recipient_values(bcc),
@@ -265,9 +274,11 @@ pub enum Outgoing {
     },
     Reply {
         id: String,
+        recipients: Option<OutgoingRecipients>,
     },
     ReplyAll {
         id: String,
+        recipients: Option<OutgoingRecipients>,
     },
     Forward {
         id: String,
@@ -277,11 +288,21 @@ pub enum Outgoing {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct OutgoingRecipients {
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+}
+
 /// A file to attach: display name plus its bytes.
 #[derive(Debug, Clone)]
 pub struct OutgoingAttachment {
     pub name: String,
     pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+    pub content_id: Option<String>,
+    pub is_inline: bool,
 }
 
 /// Send a message, with or without attachments.
@@ -294,17 +315,27 @@ pub async fn send_message(
     graph: &GraphClient,
     kind: Outgoing,
     body: &str,
+    body_is_html: bool,
     attachments: Vec<OutgoingAttachment>,
 ) -> Result<()> {
     let needs_recipient_draft = matches!(
         &kind,
         Outgoing::Forward { cc, bcc, .. } if !cc.is_empty() || !bcc.is_empty()
+    ) || matches!(
+        &kind,
+        Outgoing::Reply {
+            recipients: Some(_),
+            ..
+        } | Outgoing::ReplyAll {
+            recipients: Some(_),
+            ..
+        }
     );
     if attachments.is_empty() && !needs_recipient_draft {
-        return send_simple(graph, kind, body).await;
+        return send_simple(graph, kind, body, body_is_html).await;
     }
 
-    let draft = create_draft(graph, kind, body).await?;
+    let draft = create_draft(graph, kind, body, body_is_html).await?;
     for att in attachments {
         attach_to_draft(graph, &draft.id, att).await?;
     }
@@ -313,22 +344,32 @@ pub async fn send_message(
         .await
 }
 
-async fn send_simple(graph: &GraphClient, kind: Outgoing, body: &str) -> Result<()> {
+async fn send_simple(
+    graph: &GraphClient,
+    kind: Outgoing,
+    body: &str,
+    body_is_html: bool,
+) -> Result<()> {
     match kind {
         Outgoing::New {
             to,
             cc,
             bcc,
             subject,
-        } => send_mail(graph, &to, &cc, &bcc, &subject, body).await,
-        Outgoing::Reply { id } => reply(graph, &id, body).await,
-        Outgoing::ReplyAll { id } => reply_all(graph, &id, body).await,
+        } => send_mail(graph, &to, &cc, &bcc, &subject, body, body_is_html).await,
+        Outgoing::Reply { id, .. } => reply(graph, &id, body).await,
+        Outgoing::ReplyAll { id, .. } => reply_all(graph, &id, body).await,
         Outgoing::Forward { id, to, .. } => forward(graph, &id, &to, body).await,
     }
 }
 
 /// Create a draft for the given kind, with the user's text in place.
-async fn create_draft(graph: &GraphClient, kind: Outgoing, body: &str) -> Result<MailMessage> {
+async fn create_draft(
+    graph: &GraphClient,
+    kind: Outgoing,
+    body: &str,
+    body_is_html: bool,
+) -> Result<MailMessage> {
     match kind {
         Outgoing::New {
             to,
@@ -341,7 +382,7 @@ async fn create_draft(graph: &GraphClient, kind: Outgoing, body: &str) -> Result
                     "me/messages",
                     &json!({
                         "subject": subject,
-                        "body": html_body(body),
+                        "body": outgoing_body(body, body_is_html),
                         "toRecipients": recipient_values(&to),
                         "ccRecipients": recipient_values(&cc),
                         "bccRecipients": recipient_values(&bcc),
@@ -349,17 +390,19 @@ async fn create_draft(graph: &GraphClient, kind: Outgoing, body: &str) -> Result
                 )
                 .await
         }
-        Outgoing::Reply { id } => {
+        Outgoing::Reply { id, recipients } => {
             let draft: MailMessage = graph
                 .post_json(&format!("me/messages/{id}/createReply"), &json!({}))
                 .await?;
-            prepend_comment(graph, draft, body).await
+            patch_draft_recipients(graph, &draft.id, recipients.as_ref()).await?;
+            prepend_comment(graph, draft, body, body_is_html).await
         }
-        Outgoing::ReplyAll { id } => {
+        Outgoing::ReplyAll { id, recipients } => {
             let draft: MailMessage = graph
                 .post_json(&format!("me/messages/{id}/createReplyAll"), &json!({}))
                 .await?;
-            prepend_comment(graph, draft, body).await
+            patch_draft_recipients(graph, &draft.id, recipients.as_ref()).await?;
+            prepend_comment(graph, draft, body, body_is_html).await
         }
         Outgoing::Forward { id, to, cc, bcc } => {
             let draft: MailMessage = graph
@@ -375,9 +418,29 @@ async fn create_draft(graph: &GraphClient, kind: Outgoing, body: &str) -> Result
                     }),
                 )
                 .await?;
-            prepend_comment(graph, draft, body).await
+            prepend_comment(graph, draft, body, body_is_html).await
         }
     }
+}
+
+async fn patch_draft_recipients(
+    graph: &GraphClient,
+    draft_id: &str,
+    recipients: Option<&OutgoingRecipients>,
+) -> Result<()> {
+    let Some(recipients) = recipients else {
+        return Ok(());
+    };
+    graph
+        .patch(
+            &format!("me/messages/{draft_id}"),
+            &json!({
+                "toRecipients": recipient_values(&recipients.to),
+                "ccRecipients": recipient_values(&recipients.cc),
+                "bccRecipients": recipient_values(&recipients.bcc),
+            }),
+        )
+        .await
 }
 
 fn recipient_values(addresses: &[String]) -> Vec<serde_json::Value> {
@@ -393,6 +456,7 @@ async fn prepend_comment(
     graph: &GraphClient,
     draft: MailMessage,
     comment: &str,
+    comment_is_html: bool,
 ) -> Result<MailMessage> {
     if comment.trim().is_empty() {
         return Ok(draft);
@@ -402,7 +466,12 @@ async fn prepend_comment(
         .as_ref()
         .and_then(|b| b.content.clone())
         .unwrap_or_default();
-    let merged = format!("<div>{}</div>{}", html_escape(comment), original);
+    let comment = if comment_is_html {
+        comment.to_string()
+    } else {
+        html_escape(comment)
+    };
+    let merged = format!("<div>{comment}</div>{original}");
     graph
         .patch(
             &format!("me/messages/{}", draft.id),
@@ -418,15 +487,20 @@ async fn attach_to_draft(
     att: OutgoingAttachment,
 ) -> Result<()> {
     if att.bytes.len() <= INLINE_ATTACHMENT_LIMIT {
+        let mut payload = json!({
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": att.name,
+            "isInline": att.is_inline,
+            "contentBytes": base64_encode(&att.bytes),
+        });
+        if let Some(content_type) = att.content_type {
+            payload["contentType"] = json!(content_type);
+        }
+        if let Some(content_id) = att.content_id {
+            payload["contentId"] = json!(content_id);
+        }
         graph
-            .post_action(
-                &format!("me/messages/{draft_id}/attachments"),
-                &json!({
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": att.name,
-                    "contentBytes": base64_encode(&att.bytes),
-                }),
-            )
+            .post_action(&format!("me/messages/{draft_id}/attachments"), &payload)
             .await
     } else {
         upload_large_attachment(graph, draft_id, att).await
@@ -489,6 +563,12 @@ mod tests {
         let body = html_body("line1\nline2");
         assert_eq!(body["contentType"], "HTML");
         assert_eq!(body["content"], "line1<br>line2");
+    }
+
+    #[test]
+    fn prepared_html_body_is_not_escaped_again() {
+        let body = outgoing_body("<img src=\"cid:x\">", true);
+        assert_eq!(body["content"], "<img src=\"cid:x\">");
     }
 
     #[test]

@@ -266,6 +266,30 @@ pub struct Completion {
 
 /// Complete the path token. `None` if there is nothing to do.
 pub fn complete(token: &PathToken) -> Option<Completion> {
+    complete_filtered(token, true)
+}
+
+pub fn complete_attachment(chars: &[char], cursor: usize) -> Option<Completion> {
+    if chars.is_empty() || cursor > chars.len() {
+        return None;
+    }
+    let raw: String = chars.iter().collect();
+    let token = PathToken {
+        start: 0,
+        end: chars.len(),
+        unescaped: unescape_path(raw.trim()),
+        raw: raw.trim().to_string(),
+    };
+    let mut completion = complete_filtered(&token, false)?;
+    completion.replacement = completion
+        .replacement
+        .strip_prefix('@')
+        .unwrap_or(&completion.replacement)
+        .to_string();
+    Some(completion)
+}
+
+fn complete_filtered(token: &PathToken, images_only: bool) -> Option<Completion> {
     let unescaped = &token.unescaped;
     let (dir_user, prefix) = split_dir_prefix(unescaped);
     let dir_path = expand_tilde(&dir_user);
@@ -297,7 +321,7 @@ pub fn complete(token: &PathToken) -> Option<Completion> {
         let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
             dirs.push(name.to_string());
-        } else if image_ext(name) {
+        } else if !images_only || image_ext(name) {
             files.push(name.to_string());
         }
     }
@@ -312,7 +336,11 @@ pub fn complete(token: &PathToken) -> Option<Completion> {
     if matches.is_empty() {
         return Some(Completion {
             replacement: format!("@{}", token.raw),
-            status: "no image or directory matches".into(),
+            status: if images_only {
+                "no image or directory matches".into()
+            } else {
+                "no file or directory matches".into()
+            },
         });
     }
 
@@ -432,6 +460,50 @@ pub enum Prepared {
         html: String,
         images: Vec<HostedImage>,
     },
+}
+
+#[derive(Debug)]
+pub struct PreparedMail {
+    pub html: Option<String>,
+    pub images: Vec<(InlineImage, String)>,
+}
+
+/// Replace mail-body `@path` image tokens with cid references.
+pub fn prepare_mail(text: &str) -> Result<PreparedMail, String> {
+    let chars: Vec<char> = text.chars().collect();
+    let tokens = path_tokens(&chars);
+    if tokens.is_empty() {
+        return Ok(PreparedMail {
+            html: None,
+            images: Vec::new(),
+        });
+    }
+
+    let mut html = String::new();
+    let mut images = Vec::new();
+    let mut index = 0;
+    for token in tokens {
+        if token.start > index {
+            html.push_str(&html_escape(
+                &chars[index..token.start].iter().collect::<String>(),
+            ));
+        }
+        let image = InlineImage::from_path(&expand_tilde(&token.unescaped))?;
+        let content_id = format!("m365-inline-{}", images.len() + 1);
+        html.push_str(&format!(
+            "<img alt=\"{}\" src=\"cid:{content_id}\">",
+            html_escape_attr(&image.name)
+        ));
+        images.push((image, content_id));
+        index = token.end;
+    }
+    if index < chars.len() {
+        html.push_str(&html_escape(&chars[index..].iter().collect::<String>()));
+    }
+    Ok(PreparedMail {
+        html: Some(html),
+        images,
+    })
 }
 
 /// Build the outgoing Teams body from composer text and staged clipboard
@@ -638,6 +710,19 @@ mod tests {
     }
 
     #[test]
+    fn prepare_mail_uses_cid_inline_images() {
+        let dir = std::env::temp_dir().join(format!("m365-mail-img-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("shot.png"), TINY_PNG).unwrap();
+        let prepared = prepare_mail(&format!("hello @{}/shot.png", dir.display())).unwrap();
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].1, "m365-inline-1");
+        assert!(prepared.html.unwrap().contains("src=\"cid:m365-inline-1\""));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn prepare_rejects_non_images() {
         let dir = std::env::temp_dir().join(format!("m365-img-pdf-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -693,6 +778,20 @@ mod tests {
         let c = complete(&token).unwrap();
         assert!(c.replacement.ends_with("Picture.png"), "{}", c.replacement);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attachment_completion_includes_non_images() {
+        let dir = std::env::temp_dir().join(format!("m365-file-comp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), b"notes").unwrap();
+        let raw = format!("{}/not", dir.display());
+        let chars = chars(&raw);
+        let completion = complete_attachment(&chars, chars.len()).unwrap();
+        assert!(completion.replacement.ends_with("notes.txt"));
+        assert!(!completion.replacement.starts_with('@'));
         let _ = fs::remove_dir_all(&dir);
     }
 

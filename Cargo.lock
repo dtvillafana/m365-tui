@@ -1282,6 +1282,7 @@ dependencies = [
  "ratatui",
  "ratatui-image",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

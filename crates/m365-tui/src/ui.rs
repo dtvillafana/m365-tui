@@ -183,6 +183,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Attachments => "1-9 save · Esc close",
             Overlay::React => "1-7 react · Esc close",
             Overlay::Presence => "1-6 set · c clear · Esc close",
+            Overlay::Settings { .. } => "Space/Enter toggle · Esc close",
             Overlay::Search { .. } => "Enter search · Esc cancel",
             Overlay::FolderSearch { .. } => "↑↓ choose · Enter open · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
@@ -998,11 +999,11 @@ fn render_overlay(f: &mut Frame, app: &App) {
             let text = "\
  M365 TUI — keys\n\
  \n\
- Global:  F2 switch app · Ctrl+P palette · p set presence · | panes · ? help · q quit\n\
+ Global:  F2 switch app · Ctrl+P palette · p presence · s settings · | panes · ? help · q quit\n\
  \n\
  Links:   o list links in the message · 1-9 open in browser\n\
  Attach:  A list attachments · 1-9 save to your Downloads folder\n\
-          when writing: Tab to Attach, type a path, Enter to attach\n\
+          when writing: Tab to Attach, type a path, Tab complete, Enter attach\n\
  \n\
  Copying: y yank focused message · Y yank whole view\n\
           z copy mode (full-width, borderless — drag-select cleanly)\n\
@@ -1023,6 +1024,8 @@ fn render_overlay(f: &mut Frame, app: &App) {
  \n\
  Compose: To/Cc/Bcc autocomplete from seen mail · ↑/↓ + Tab/Enter choose\n\
           Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
+          replies: Ctrl+R reply/reply-all · Ctrl+E edit recipients\n\
+          body: @path Tab completes and embeds an inline image\n\
           Ctrl+X e $EDITOR (body + subject) · Ctrl+X x unstage last file\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
           Backspace/Delete · Ctrl+W word · Ctrl+U to line start · Ctrl+K to end\n\
@@ -1279,6 +1282,35 @@ fn render_overlay(f: &mut Frame, app: &App) {
                 area,
             );
         }
+        Overlay::Settings { sel } => {
+            let area = centered(58, 30, f.area());
+            f.render_widget(Clear, area);
+            let marker = if app.settings.preview_mail_on_hover {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let line = Line::styled(
+                format!("{marker} Preview selected email automatically"),
+                if *sel == 0 {
+                    Style::default().fg(Color::Black).bg(ACCENT)
+                } else {
+                    Style::default()
+                },
+            );
+            f.render_widget(
+                Paragraph::new(vec![
+                    line,
+                    Line::raw(""),
+                    Line::styled(
+                        "Space/Enter toggle · settings persist across restarts",
+                        Style::default().fg(DIM),
+                    ),
+                ])
+                .block(popup_block("Settings")),
+                area,
+            );
+        }
     }
 }
 
@@ -1349,7 +1381,7 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let fields = c.kind.fields();
+    let fields = c.fields();
     let show_to = fields.contains(&COMPOSE_TO);
     let show_cc = fields.contains(&COMPOSE_CC);
     let show_bcc = fields.contains(&COMPOSE_BCC);
@@ -1486,11 +1518,16 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
     let hint = if c.ctrl_x {
         "Ctrl+X — e $EDITOR · x unstage last attachment"
     } else if c.field == COMPOSE_ATTACH {
-        "Enter attach file · Ctrl+X x unstage · Ctrl+X e $EDITOR · Tab field · Ctrl+S send"
+        "Tab complete path · Enter attach · Ctrl+X x unstage · Ctrl+X e $EDITOR · Ctrl+S send"
     } else if !suggestions.is_empty() {
         "↑/↓ choose · Tab/Enter complete · keep typing to filter · Ctrl+S send"
+    } else if matches!(
+        c.kind,
+        crate::app::ComposeKind::ReplyMail { .. } | crate::app::ComposeKind::ReplyAllMail { .. }
+    ) {
+        "Tab field/complete @image · Ctrl+R reply mode · Ctrl+E recipients · Ctrl+S send"
     } else {
-        "Tab field · Ctrl+X e $EDITOR · Ctrl+S send · Esc cancel"
+        "Tab field/complete @image · Ctrl+X e $EDITOR · Ctrl+S send · Esc cancel"
     };
     f.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
