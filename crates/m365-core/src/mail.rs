@@ -49,7 +49,7 @@ pub async fn list_messages(
 ) -> Result<(Vec<MailMessage>, Option<String>)> {
     let path = format!(
         "me/mailFolders/{folder_id}/messages?$top={top}&$orderby=receivedDateTime desc\
-         &$select=id,conversationId,subject,bodyPreview,from,toRecipients,receivedDateTime,isRead,hasAttachments,webLink"
+         &$select=id,conversationId,subject,bodyPreview,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,isRead,hasAttachments,webLink"
     );
     // Single page only — `$top` bounds it; we don't want to walk the whole folder.
     graph.get_page_with_next(&path).await
@@ -67,7 +67,7 @@ pub async fn list_messages_more(
 /// Fetch a single message including its full body.
 pub async fn get_message(graph: &GraphClient, id: &str) -> Result<MailMessage> {
     let path = format!(
-        "me/messages/{id}?$select=id,conversationId,subject,body,bodyPreview,from,toRecipients,receivedDateTime,isRead,hasAttachments,webLink"
+        "me/messages/{id}?$select=id,conversationId,subject,body,bodyPreview,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,isRead,hasAttachments,webLink"
     );
     graph.get_json(&path).await
 }
@@ -81,7 +81,7 @@ pub async fn delta_messages(
 ) -> Result<DeltaPage<MailMessage>> {
     let path = match delta_link {
         Some(link) => link.to_string(),
-        None => format!("me/mailFolders/{folder_id}/messages/delta?$select=id,conversationId,subject,bodyPreview,from,receivedDateTime,isRead"),
+        None => format!("me/mailFolders/{folder_id}/messages/delta?$select=id,conversationId,subject,bodyPreview,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,isRead"),
     };
     graph.delta(&path).await
 }
@@ -113,7 +113,7 @@ pub async fn search(graph: &GraphClient, query: &str, top: u32) -> Result<Vec<Ma
     let escaped = query.replace('"', "");
     let path = format!(
         "me/messages?$search=\"{escaped}\"&$top={top}\
-         &$select=id,conversationId,subject,bodyPreview,from,receivedDateTime,isRead"
+         &$select=id,conversationId,subject,bodyPreview,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,isRead"
     );
     graph.get_page(&path).await
 }
@@ -129,12 +129,26 @@ pub async fn list_conversation(
     let escaped = escape_odata_string(conversation_id);
     let path = format!(
         "me/messages?$filter=conversationId eq '{escaped}'&$top={top}\
-         &$select=id,conversationId,subject,body,bodyPreview,from,toRecipients,receivedDateTime,isRead,hasAttachments,webLink"
+         &$select=id,conversationId,subject,body,bodyPreview,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,isRead,hasAttachments,webLink"
     );
     let (mut messages, next): (Vec<MailMessage>, Option<String>) =
         graph.get_page_with_next(&path).await?;
+    // Although `/me/messages` is mailbox-wide, explicitly merge Sent Items.
+    // Some mailbox configurations omit sent copies from that collection.
+    let sent_path = format!(
+        "me/mailFolders/sentitems/messages?$filter=conversationId eq '{escaped}'&$top={top}\
+         &$select=id,conversationId,subject,body,bodyPreview,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,isRead,hasAttachments,webLink"
+    );
+    let (sent, sent_next): (Vec<MailMessage>, Option<String>) =
+        graph.get_page_with_next(&sent_path).await?;
+    let known: std::collections::HashSet<String> =
+        messages.iter().map(|message| message.id.clone()).collect();
+    messages.extend(
+        sent.into_iter()
+            .filter(|message| !known.contains(&message.id)),
+    );
     sort_conversation_messages(&mut messages);
-    Ok((messages, next.is_some()))
+    Ok((messages, next.is_some() || sent_next.is_some()))
 }
 
 fn escape_odata_string(value: &str) -> String {
@@ -143,8 +157,8 @@ fn escape_odata_string(value: &str) -> String {
 
 fn sort_conversation_messages(messages: &mut [MailMessage]) {
     messages.sort_by(|a, b| {
-        b.received_date_time
-            .cmp(&a.received_date_time)
+        b.mail_time()
+            .cmp(&a.mail_time())
             .then_with(|| b.id.cmp(&a.id))
     });
 }
@@ -177,18 +191,18 @@ fn html_body(text: &str) -> serde_json::Value {
 pub async fn send_mail(
     graph: &GraphClient,
     to: &[String],
+    cc: &[String],
+    bcc: &[String],
     subject: &str,
     body: &str,
 ) -> Result<()> {
-    let recipients: Vec<_> = to
-        .iter()
-        .map(|addr| json!({ "emailAddress": { "address": addr } }))
-        .collect();
     let payload = json!({
         "message": {
             "subject": subject,
             "body": html_body(body),
-            "toRecipients": recipients,
+            "toRecipients": recipient_values(to),
+            "ccRecipients": recipient_values(cc),
+            "bccRecipients": recipient_values(bcc),
         },
         "saveToSentItems": true,
     });
@@ -243,10 +257,24 @@ const UPLOAD_CHUNK: usize = 10 * 320 * 1024;
 /// What kind of message is being sent.
 #[derive(Debug, Clone)]
 pub enum Outgoing {
-    New { to: Vec<String>, subject: String },
-    Reply { id: String },
-    ReplyAll { id: String },
-    Forward { id: String, to: Vec<String> },
+    New {
+        to: Vec<String>,
+        cc: Vec<String>,
+        bcc: Vec<String>,
+        subject: String,
+    },
+    Reply {
+        id: String,
+    },
+    ReplyAll {
+        id: String,
+    },
+    Forward {
+        id: String,
+        to: Vec<String>,
+        cc: Vec<String>,
+        bcc: Vec<String>,
+    },
 }
 
 /// A file to attach: display name plus its bytes.
@@ -268,7 +296,11 @@ pub async fn send_message(
     body: &str,
     attachments: Vec<OutgoingAttachment>,
 ) -> Result<()> {
-    if attachments.is_empty() {
+    let needs_recipient_draft = matches!(
+        &kind,
+        Outgoing::Forward { cc, bcc, .. } if !cc.is_empty() || !bcc.is_empty()
+    );
+    if attachments.is_empty() && !needs_recipient_draft {
         return send_simple(graph, kind, body).await;
     }
 
@@ -283,28 +315,36 @@ pub async fn send_message(
 
 async fn send_simple(graph: &GraphClient, kind: Outgoing, body: &str) -> Result<()> {
     match kind {
-        Outgoing::New { to, subject } => send_mail(graph, &to, &subject, body).await,
+        Outgoing::New {
+            to,
+            cc,
+            bcc,
+            subject,
+        } => send_mail(graph, &to, &cc, &bcc, &subject, body).await,
         Outgoing::Reply { id } => reply(graph, &id, body).await,
         Outgoing::ReplyAll { id } => reply_all(graph, &id, body).await,
-        Outgoing::Forward { id, to } => forward(graph, &id, &to, body).await,
+        Outgoing::Forward { id, to, .. } => forward(graph, &id, &to, body).await,
     }
 }
 
 /// Create a draft for the given kind, with the user's text in place.
 async fn create_draft(graph: &GraphClient, kind: Outgoing, body: &str) -> Result<MailMessage> {
     match kind {
-        Outgoing::New { to, subject } => {
-            let recipients: Vec<_> = to
-                .iter()
-                .map(|a| json!({ "emailAddress": { "address": a } }))
-                .collect();
+        Outgoing::New {
+            to,
+            cc,
+            bcc,
+            subject,
+        } => {
             graph
                 .post_json(
                     "me/messages",
                     &json!({
                         "subject": subject,
                         "body": html_body(body),
-                        "toRecipients": recipients,
+                        "toRecipients": recipient_values(&to),
+                        "ccRecipients": recipient_values(&cc),
+                        "bccRecipients": recipient_values(&bcc),
                     }),
                 )
                 .await
@@ -321,20 +361,30 @@ async fn create_draft(graph: &GraphClient, kind: Outgoing, body: &str) -> Result
                 .await?;
             prepend_comment(graph, draft, body).await
         }
-        Outgoing::Forward { id, to } => {
-            let recipients: Vec<_> = to
-                .iter()
-                .map(|a| json!({ "emailAddress": { "address": a } }))
-                .collect();
+        Outgoing::Forward { id, to, cc, bcc } => {
             let draft: MailMessage = graph
-                .post_json(
-                    &format!("me/messages/{id}/createForward"),
-                    &json!({ "toRecipients": recipients }),
+                .post_json(&format!("me/messages/{id}/createForward"), &json!({}))
+                .await?;
+            graph
+                .patch(
+                    &format!("me/messages/{}", draft.id),
+                    &json!({
+                        "toRecipients": recipient_values(&to),
+                        "ccRecipients": recipient_values(&cc),
+                        "bccRecipients": recipient_values(&bcc),
+                    }),
                 )
                 .await?;
             prepend_comment(graph, draft, body).await
         }
     }
+}
+
+fn recipient_values(addresses: &[String]) -> Vec<serde_json::Value> {
+    addresses
+        .iter()
+        .map(|address| json!({ "emailAddress": { "address": address } }))
+        .collect()
 }
 
 /// A reply/forward draft already contains the quoted original; put the user's
@@ -459,6 +509,11 @@ mod tests {
             message("new", "2026-09-17T15:00:00Z"),
             message("old", "2026-09-17T13:00:00Z"),
             message("middle", "2026-09-17T14:00:00Z"),
+            serde_json::from_value(serde_json::json!({
+                "id": "sent",
+                "sentDateTime": "2026-09-17T16:00:00Z"
+            }))
+            .unwrap(),
         ];
         sort_conversation_messages(&mut messages);
         assert_eq!(
@@ -466,7 +521,14 @@ mod tests {
                 .iter()
                 .map(|message| message.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["new", "middle", "old"]
+            vec!["sent", "new", "middle", "old"]
         );
+    }
+
+    #[test]
+    fn recipient_values_build_graph_addresses() {
+        let values = recipient_values(&["a@example.com".into(), "b@example.com".into()]);
+        assert_eq!(values[0]["emailAddress"]["address"], "a@example.com");
+        assert_eq!(values[1]["emailAddress"]["address"], "b@example.com");
     }
 }

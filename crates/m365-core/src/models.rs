@@ -82,7 +82,13 @@ pub struct MailMessage {
     #[serde(default)]
     pub to_recipients: Vec<Recipient>,
     #[serde(default)]
+    pub cc_recipients: Vec<Recipient>,
+    #[serde(default)]
+    pub bcc_recipients: Vec<Recipient>,
+    #[serde(default)]
     pub received_date_time: Option<String>,
+    #[serde(default)]
+    pub sent_date_time: Option<String>,
     #[serde(default)]
     pub is_read: Option<bool>,
     #[serde(default)]
@@ -95,6 +101,12 @@ pub struct MailMessage {
 }
 
 impl MailMessage {
+    pub fn mail_time(&self) -> Option<&str> {
+        self.received_date_time
+            .as_deref()
+            .or(self.sent_date_time.as_deref())
+    }
+
     pub fn sender_name(&self) -> String {
         self.from
             .as_ref()

@@ -7,8 +7,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    filter_commands, filter_folders, mail_folder_label, mail_same_thread, mail_thread_size, App,
-    Compose, OutlookFocus, Overlay, PushState, Screen, TeamsFocus, TeamsMode,
+    filter_commands, filter_folders, mail_folder_label, mail_row_unread, mail_same_thread,
+    mail_thread_size, App, Compose, OutlookFocus, Overlay, PushState, Screen, TeamsFocus,
+    TeamsMode, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY, COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO,
     DEFAULT_FOLDER_PANEL_WIDTH,
 };
 
@@ -275,55 +276,56 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
     );
 
     // Messages
-    let msgs: Vec<ListItem> =
-        app.outlook
-            .message_rows
-            .iter()
-            .filter_map(|&i| app.outlook.messages.get(i))
-            .map(|m| {
-                let members =
-                    app.outlook.messages.iter().filter(|candidate| {
-                        !app.outlook.threaded || mail_same_thread(candidate, m)
-                    });
-                let unread = members
-                    .clone()
-                    .any(|message| !message.is_read.unwrap_or(true));
-                let marker = if unread { "●" } else { " " };
-                let clip = if members
-                    .clone()
-                    .any(|message| message.has_attachments.unwrap_or(false))
-                {
-                    "📎"
-                } else {
-                    ""
-                };
-                let mut subject = m.subject.clone().unwrap_or_else(|| "(no subject)".into());
+    let msgs: Vec<ListItem> = app
+        .outlook
+        .message_rows
+        .iter()
+        .filter_map(|&i| app.outlook.messages.get(i))
+        .map(|m| {
+            let members = app.outlook.messages.iter().filter(|candidate| {
                 if app.outlook.threaded {
-                    let count = mail_thread_size(&app.outlook.messages, m);
-                    if count > 1 {
-                        subject.push_str(&format!(" [{count}]"));
-                    }
+                    mail_same_thread(candidate, m)
+                } else {
+                    candidate.id == m.id
                 }
-                let line = Line::from(vec![
-                    Span::styled(format!("{marker} "), Style::default().fg(ACCENT)),
-                    Span::styled(
-                        truncate(&m.sender_name(), 18),
-                        Style::default().fg(Color::LightGreen),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(clip.to_string(), Style::default().fg(DIM)),
-                    Span::styled(
-                        subject,
-                        if unread {
-                            Style::default().add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                ]);
-                ListItem::new(line)
-            })
-            .collect();
+            });
+            let unread = mail_row_unread(&app.outlook.messages, m, app.outlook.threaded);
+            let marker = if unread { "●" } else { " " };
+            let clip = if members
+                .clone()
+                .any(|message| message.has_attachments.unwrap_or(false))
+            {
+                "📎"
+            } else {
+                ""
+            };
+            let mut subject = m.subject.clone().unwrap_or_else(|| "(no subject)".into());
+            if app.outlook.threaded {
+                let count = mail_thread_size(&app.outlook.messages, m);
+                if count > 1 {
+                    subject.push_str(&format!(" [{count}]"));
+                }
+            }
+            let line = Line::from(vec![
+                Span::styled(format!("{marker} "), Style::default().fg(ACCENT)),
+                Span::styled(
+                    truncate(&m.sender_name(), 18),
+                    Style::default().fg(Color::LightGreen),
+                ),
+                Span::raw("  "),
+                Span::styled(clip.to_string(), Style::default().fg(DIM)),
+                Span::styled(
+                    subject,
+                    if unread {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
     let mut mstate = ListState::default();
     mstate.select(Some(app.outlook.msg_sel));
     let kind = if app.outlook.threaded {
@@ -403,10 +405,7 @@ pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
             )));
             lines.push(kv("Subject", &message.subject.clone().unwrap_or_default()));
             lines.push(kv("From", &message.sender_name()));
-            lines.push(kv(
-                "Date",
-                &message.received_date_time.clone().unwrap_or_default(),
-            ));
+            lines.push(kv("Date", message.mail_time().unwrap_or_default()));
             if i == 0 && !app.outlook.reading_attachments.is_empty() {
                 lines.push(attachment_line(app));
             }
@@ -418,7 +417,7 @@ pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
     let mut lines = vec![
         kv("Subject", &m.subject.clone().unwrap_or_default()),
         kv("From", &m.sender_name()),
-        kv("Date", &m.received_date_time.clone().unwrap_or_default()),
+        kv("Date", m.mail_time().unwrap_or_default()),
         Line::raw(""),
     ];
     if !app.outlook.reading_attachments.is_empty() {
@@ -1022,7 +1021,8 @@ fn render_overlay(f: &mut Frame, app: &App) {
           i type · r reply · Enter send · Ctrl+V paste image\n\
           @path Tab complete image · Ctrl+X remove last image\n\
  \n\
- Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
+ Compose: To/Cc/Bcc autocomplete from seen mail · ↑/↓ + Tab/Enter choose\n\
+          Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
           Ctrl+X e $EDITOR (body + subject) · Ctrl+X x unstage last file\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
           Backspace/Delete · Ctrl+W word · Ctrl+U to line start · Ctrl+K to end\n\
@@ -1350,14 +1350,26 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
     f.render_widget(block, area);
 
     let fields = c.kind.fields();
-    let show_to = fields.contains(&0);
-    let show_subject = fields.contains(&1);
+    let show_to = fields.contains(&COMPOSE_TO);
+    let show_cc = fields.contains(&COMPOSE_CC);
+    let show_bcc = fields.contains(&COMPOSE_BCC);
+    let show_subject = fields.contains(&COMPOSE_SUBJECT);
+    let suggestions = app.compose_suggestions(c);
 
-    // header rows (To/Subject) + "Body:" label + body + attach + staged + hint
+    // Recipient/subject rows + autocomplete + body + attachments + hint.
     let staged = c.attachments.len() as u16;
     let mut constraints = Vec::new();
     if show_to {
         constraints.push(Constraint::Length(1));
+    }
+    if show_cc {
+        constraints.push(Constraint::Length(1));
+    }
+    if show_bcc {
+        constraints.push(Constraint::Length(1));
+    }
+    if !suggestions.is_empty() {
+        constraints.push(Constraint::Length(suggestions.len() as u16));
     }
     if show_subject {
         constraints.push(Constraint::Length(1));
@@ -1375,15 +1387,53 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
     let mut cursor: Option<(u16, u16)> = None;
     let mut i = 0;
     if show_to {
-        cursor = render_line_field(f, rows[i], "To:      ", &c.to, c.field == 0).or(cursor);
+        cursor =
+            render_line_field(f, rows[i], "To:      ", &c.to, c.field == COMPOSE_TO).or(cursor);
+        i += 1;
+    }
+    if show_cc {
+        cursor =
+            render_line_field(f, rows[i], "Cc:      ", &c.cc, c.field == COMPOSE_CC).or(cursor);
+        i += 1;
+    }
+    if show_bcc {
+        cursor =
+            render_line_field(f, rows[i], "Bcc:     ", &c.bcc, c.field == COMPOSE_BCC).or(cursor);
+        i += 1;
+    }
+    if !suggestions.is_empty() {
+        let selected = c.suggestion_sel.min(suggestions.len() - 1);
+        let lines = suggestions.iter().enumerate().map(|(index, contact)| {
+            let marker = if index == selected { "▶" } else { " " };
+            let label = match contact.name.as_deref() {
+                Some(name) => format!("  {marker} {name} <{}>", contact.address),
+                None => format!("  {marker} {}", contact.address),
+            };
+            Line::styled(
+                label,
+                if index == selected {
+                    Style::default().fg(Color::Black).bg(ACCENT)
+                } else {
+                    Style::default().fg(DIM)
+                },
+            )
+        });
+        f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), rows[i]);
         i += 1;
     }
     if show_subject {
-        cursor = render_line_field(f, rows[i], "Subject: ", &c.subject, c.field == 1).or(cursor);
+        cursor = render_line_field(
+            f,
+            rows[i],
+            "Subject: ",
+            &c.subject,
+            c.field == COMPOSE_SUBJECT,
+        )
+        .or(cursor);
         i += 1;
     }
 
-    let body_style = if c.field == 2 {
+    let body_style = if c.field == COMPOSE_BODY {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -1394,11 +1444,18 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
     let body_area = rows[i];
     // Tell the key handler what width Up/Down should move by.
     app.text_width_hint.set(body_area.width.max(1) as usize);
-    cursor = render_text_area(f, body_area, &c.body, c.field == 2).or(cursor);
+    cursor = render_text_area(f, body_area, &c.body, c.field == COMPOSE_BODY).or(cursor);
     i += 1;
 
     // Attach: type a path, Enter stages it.
-    cursor = render_line_field(f, rows[i], "Attach:  ", &c.attach, c.field == 3).or(cursor);
+    cursor = render_line_field(
+        f,
+        rows[i],
+        "Attach:  ",
+        &c.attach,
+        c.field == COMPOSE_ATTACH,
+    )
+    .or(cursor);
     i += 1;
 
     // Staged files (most recent last), capped to the rows we reserved.
@@ -1428,8 +1485,10 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
 
     let hint = if c.ctrl_x {
         "Ctrl+X — e $EDITOR · x unstage last attachment"
-    } else if c.field == 3 {
+    } else if c.field == COMPOSE_ATTACH {
         "Enter attach file · Ctrl+X x unstage · Ctrl+X e $EDITOR · Tab field · Ctrl+S send"
+    } else if !suggestions.is_empty() {
+        "↑/↓ choose · Tab/Enter complete · keep typing to filter · Ctrl+S send"
     } else {
         "Tab field · Ctrl+X e $EDITOR · Ctrl+S send · Esc cancel"
     };

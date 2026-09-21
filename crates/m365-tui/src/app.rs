@@ -11,7 +11,8 @@ use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
-    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence, Team, User,
+    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence, Recipient,
+    Team, User,
 };
 use m365_core::{calendar, channels, chats, mail, people, OutgoingBody, Session};
 use ratatui::text::{Line, Text};
@@ -23,6 +24,7 @@ use crate::navigation;
 
 /// Messages sent from background tasks to the UI loop.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Mail payloads stay inline and are immediately applied.
 pub enum AppMessage {
     Status(String),
     Error(String),
@@ -135,6 +137,7 @@ pub enum TeamsFocus {
 }
 
 /// A transient full-screen/modal overlay.
+#[allow(clippy::large_enum_variant)] // Only one overlay exists; boxing complicates input handling.
 pub enum Overlay {
     Help,
     Palette {
@@ -256,6 +259,13 @@ pub const PRESENCE_OPTIONS: &[PresenceOption] = &[
 pub const PRESENCE_SESSION_LEASE: &str = "PT1H";
 pub const PRESENCE_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+pub(crate) const COMPOSE_TO: usize = 0;
+pub(crate) const COMPOSE_CC: usize = 1;
+pub(crate) const COMPOSE_BCC: usize = 2;
+pub(crate) const COMPOSE_SUBJECT: usize = 3;
+pub(crate) const COMPOSE_BODY: usize = 4;
+pub(crate) const COMPOSE_ATTACH: usize = 5;
+
 #[allow(clippy::enum_variant_names)] // the "Mail" suffix distinguishes from Teams compose
 pub enum ComposeKind {
     NewMail,
@@ -266,12 +276,27 @@ pub enum ComposeKind {
 
 impl ComposeKind {
     /// Which compose fields are shown/editable:
-    /// 0 = To, 1 = Subject, 2 = Body, 3 = Attach (a file path to stage).
+    /// To, Cc, Bcc, Subject, Body, Attach.
     pub fn fields(&self) -> &'static [usize] {
         match self {
-            ComposeKind::NewMail => &[0, 1, 2, 3],
-            ComposeKind::ReplyMail { .. } | ComposeKind::ReplyAllMail { .. } => &[2, 3],
-            ComposeKind::ForwardMail { .. } => &[0, 2, 3],
+            ComposeKind::NewMail => &[
+                COMPOSE_TO,
+                COMPOSE_CC,
+                COMPOSE_BCC,
+                COMPOSE_SUBJECT,
+                COMPOSE_BODY,
+                COMPOSE_ATTACH,
+            ],
+            ComposeKind::ReplyMail { .. } | ComposeKind::ReplyAllMail { .. } => {
+                &[COMPOSE_BODY, COMPOSE_ATTACH]
+            }
+            ComposeKind::ForwardMail { .. } => &[
+                COMPOSE_TO,
+                COMPOSE_CC,
+                COMPOSE_BCC,
+                COMPOSE_BODY,
+                COMPOSE_ATTACH,
+            ],
         }
     }
 
@@ -288,14 +313,17 @@ impl ComposeKind {
 pub struct Compose {
     pub kind: ComposeKind,
     pub to: TextInput,
+    pub cc: TextInput,
+    pub bcc: TextInput,
     pub subject: TextInput,
     pub body: TextInput,
     /// Path being typed in the Attach field.
     pub attach: TextInput,
     /// Files staged for sending, as (path, size).
     pub attachments: Vec<(std::path::PathBuf, u64)>,
-    /// 0 = To, 1 = Subject, 2 = Body, 3 = Attach.
+    /// One of the `COMPOSE_*` field constants.
     pub field: usize,
+    pub suggestion_sel: usize,
     /// Waiting for the second key of a Ctrl+X chord.
     pub ctrl_x: bool,
 }
@@ -305,11 +333,14 @@ impl Compose {
         Self {
             kind,
             to: TextInput::new(),
+            cc: TextInput::new(),
+            bcc: TextInput::new(),
             subject: TextInput::new(),
             body: TextInput::new(),
             attach: TextInput::new(),
             attachments: Vec::new(),
             field,
+            suggestion_sel: 0,
             ctrl_x: false,
         }
     }
@@ -337,12 +368,29 @@ impl Compose {
 
     fn active_mut(&mut self) -> &mut TextInput {
         match self.field {
-            0 => &mut self.to,
-            1 => &mut self.subject,
-            3 => &mut self.attach,
+            COMPOSE_TO => &mut self.to,
+            COMPOSE_CC => &mut self.cc,
+            COMPOSE_BCC => &mut self.bcc,
+            COMPOSE_SUBJECT => &mut self.subject,
+            COMPOSE_ATTACH => &mut self.attach,
             _ => &mut self.body,
         }
     }
+
+    fn active_recipient(&self) -> Option<&TextInput> {
+        match self.field {
+            COMPOSE_TO => Some(&self.to),
+            COMPOSE_CC => Some(&self.cc),
+            COMPOSE_BCC => Some(&self.bcc),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MailContact {
+    pub name: Option<String>,
+    pub address: String,
 }
 
 #[derive(Default)]
@@ -504,6 +552,8 @@ pub struct App {
     pub image_cache: std::collections::HashMap<String, crate::termimg::ReadyImage>,
     pub image_loading: std::collections::HashSet<String>,
     pub image_failed: std::collections::HashSet<String>,
+    /// Contacts learned only from mail already loaded during this session.
+    mail_contacts: std::collections::BTreeMap<String, MailContact>,
 }
 
 /// Palette command identifiers.
@@ -561,6 +611,7 @@ impl App {
             image_cache: std::collections::HashMap::new(),
             image_loading: std::collections::HashSet::new(),
             image_failed: std::collections::HashSet::new(),
+            mail_contacts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -963,6 +1014,7 @@ impl App {
                 }
             }
             AppMessage::Messages { items, next, mode } => {
+                self.cache_mail_contacts(&items);
                 self.outlook.loading_more = false;
                 let selected_key = self.current_mail().map(|m| self.mail_selection_key(m));
 
@@ -1004,6 +1056,7 @@ impl App {
                     .min(self.outlook.message_rows.len().saturating_sub(1));
             }
             AppMessage::MessageBody(m) => {
+                self.cache_mail_contacts(std::slice::from_ref(&m));
                 let (ct, raw) = match &m.body {
                     Some(b) => (
                         b.content_type.as_deref(),
@@ -1024,6 +1077,7 @@ impl App {
                 self.outlook.reading = Some(m);
             }
             AppMessage::MailThread { items, truncated } => {
+                self.cache_mail_contacts(&items);
                 let Some(latest) = items.first().cloned() else {
                     self.status = "thread has no messages".into();
                     return;
@@ -1926,6 +1980,57 @@ impl App {
             .and_then(|&i| self.outlook.messages.get(i))
     }
 
+    fn cache_mail_contacts(&mut self, messages: &[MailMessage]) {
+        for message in messages {
+            for recipient in message
+                .from
+                .iter()
+                .chain(message.to_recipients.iter())
+                .chain(message.cc_recipients.iter())
+                .chain(message.bcc_recipients.iter())
+            {
+                cache_mail_contact(&mut self.mail_contacts, recipient);
+            }
+        }
+    }
+
+    pub(crate) fn compose_suggestions(&self, compose: &Compose) -> Vec<MailContact> {
+        let Some(input) = compose.active_recipient() else {
+            return Vec::new();
+        };
+        let (_, _, query) = recipient_token(input);
+        let query = query.to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches: Vec<(bool, MailContact)> = self
+            .mail_contacts
+            .values()
+            .filter_map(|contact| {
+                let address = contact.address.to_lowercase();
+                let name = contact.name.as_deref().unwrap_or_default().to_lowercase();
+                (address.contains(&query) || name.contains(&query)).then(|| {
+                    (
+                        address.starts_with(&query) || name.starts_with(&query),
+                        contact.clone(),
+                    )
+                })
+            })
+            .collect();
+        matches.sort_by(|(a_prefix, a), (b_prefix, b)| {
+            b_prefix
+                .cmp(a_prefix)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        matches
+            .into_iter()
+            .map(|(_, contact)| contact)
+            .take(5)
+            .collect()
+    }
+
     fn mail_selection_key(&self, message: &MailMessage) -> String {
         if self.outlook.threaded {
             message
@@ -2127,9 +2232,9 @@ impl App {
         };
         let id = m.id.clone();
         let (kind, field) = match mode {
-            ReplyMode::Reply => (ComposeKind::ReplyMail { id }, 2),
-            ReplyMode::ReplyAll => (ComposeKind::ReplyAllMail { id }, 2),
-            ReplyMode::Forward => (ComposeKind::ForwardMail { id }, 0),
+            ReplyMode::Reply => (ComposeKind::ReplyMail { id }, COMPOSE_BODY),
+            ReplyMode::ReplyAll => (ComposeKind::ReplyAllMail { id }, COMPOSE_BODY),
+            ReplyMode::Forward => (ComposeKind::ForwardMail { id }, COMPOSE_TO),
         };
         self.overlay = Some(Overlay::Compose(Compose::new(kind, field)));
     }
@@ -2835,7 +2940,9 @@ impl App {
 
     fn on_key_compose(&mut self, key: KeyEvent, c: &mut Compose) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let is_body = c.field == 2;
+        let is_body = c.field == COMPOSE_BODY;
+        let suggestions = self.compose_suggestions(c);
+        let has_suggestions = !suggestions.is_empty();
         // Width the body is laid out at, so Up/Down follow what's on screen.
         let width = self.text_width_hint.get();
 
@@ -2864,12 +2971,22 @@ impl App {
                 self.submit_compose(c);
                 return;
             }
-            KeyCode::Tab => c.field = next_field(c.kind.fields(), c.field),
+            KeyCode::Tab if has_suggestions => {
+                let selected = c.suggestion_sel.min(suggestions.len() - 1);
+                accept_recipient_suggestion(c, &suggestions[selected]);
+            }
+            KeyCode::Tab => {
+                c.field = next_field(c.kind.fields(), c.field);
+                c.suggestion_sel = 0;
+            }
             KeyCode::BackTab => c.field = prev_field(c.kind.fields(), c.field),
             KeyCode::Enter => {
-                if is_body {
+                if has_suggestions {
+                    let selected = c.suggestion_sel.min(suggestions.len() - 1);
+                    accept_recipient_suggestion(c, &suggestions[selected]);
+                } else if is_body {
                     c.active_mut().insert('\n');
-                } else if c.field == 3 {
+                } else if c.field == COMPOSE_ATTACH {
                     let msg = c.stage_attachment();
                     if !msg.is_empty() {
                         self.status = msg;
@@ -2885,17 +3002,36 @@ impl App {
             }
 
             // -- deletion --
-            KeyCode::Backspace => c.active_mut().backspace(),
-            KeyCode::Delete => c.active_mut().delete(),
-            KeyCode::Char('w') if ctrl => c.active_mut().delete_word_before(),
-            KeyCode::Char('u') if ctrl => c.active_mut().delete_to_line_start(),
-            KeyCode::Char('k') if ctrl => c.active_mut().delete_to_line_end(),
+            KeyCode::Backspace => {
+                c.active_mut().backspace();
+                c.suggestion_sel = 0;
+            }
+            KeyCode::Delete => {
+                c.active_mut().delete();
+                c.suggestion_sel = 0;
+            }
+            KeyCode::Char('w') if ctrl => {
+                c.active_mut().delete_word_before();
+                c.suggestion_sel = 0;
+            }
+            KeyCode::Char('u') if ctrl => {
+                c.active_mut().delete_to_line_start();
+                c.suggestion_sel = 0;
+            }
+            KeyCode::Char('k') if ctrl => {
+                c.active_mut().delete_to_line_end();
+                c.suggestion_sel = 0;
+            }
 
             // -- movement --
             KeyCode::Left if ctrl => c.active_mut().word_left(),
             KeyCode::Right if ctrl => c.active_mut().word_right(),
             KeyCode::Left => c.active_mut().left(),
             KeyCode::Right => c.active_mut().right(),
+            KeyCode::Up if has_suggestions => c.suggestion_sel = c.suggestion_sel.saturating_sub(1),
+            KeyCode::Down if has_suggestions => {
+                c.suggestion_sel = (c.suggestion_sel + 1).min(suggestions.len() - 1)
+            }
             KeyCode::Up if is_body => c.active_mut().move_row(-1, width),
             KeyCode::Down if is_body => c.active_mut().move_row(1, width),
             KeyCode::Up => c.field = prev_field(c.kind.fields(), c.field),
@@ -2910,7 +3046,10 @@ impl App {
             KeyCode::PageDown => c.active_mut().move_row(10, width),
 
             // -- typing (ignore other Ctrl chords so they can't insert junk) --
-            KeyCode::Char(ch) if !ctrl => c.active_mut().insert(ch),
+            KeyCode::Char(ch) if !ctrl => {
+                c.active_mut().insert(ch);
+                c.suggestion_sel = 0;
+            }
             _ => {}
         }
         // Put the (mutated) compose overlay back.
@@ -2940,6 +3079,7 @@ impl App {
         match self.overlay.take() {
             Some(Overlay::Compose(mut c)) => {
                 c.active_mut().insert_str(&text);
+                c.suggestion_sel = 0;
                 self.overlay = Some(Overlay::Compose(c));
             }
             Some(Overlay::Search { mut query }) => {
@@ -2969,6 +3109,8 @@ impl App {
         let kind = match &c.kind {
             ComposeKind::NewMail => {
                 let to = parse_recipients(&c.to.text());
+                let cc = parse_recipients(&c.cc.text());
+                let bcc = parse_recipients(&c.bcc.text());
                 if to.is_empty() {
                     self.status = "add at least one recipient".into();
                     self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
@@ -2976,6 +3118,8 @@ impl App {
                 }
                 Outgoing::New {
                     to,
+                    cc,
+                    bcc,
                     subject: c.subject.text(),
                 }
             }
@@ -2983,12 +3127,19 @@ impl App {
             ComposeKind::ReplyAllMail { id } => Outgoing::ReplyAll { id: id.clone() },
             ComposeKind::ForwardMail { id } => {
                 let to = parse_recipients(&c.to.text());
+                let cc = parse_recipients(&c.cc.text());
+                let bcc = parse_recipients(&c.bcc.text());
                 if to.is_empty() {
                     self.status = "add at least one recipient to forward to".into();
                     self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
                     return;
                 }
-                Outgoing::Forward { id: id.clone(), to }
+                Outgoing::Forward {
+                    id: id.clone(),
+                    to,
+                    cc,
+                    bcc,
+                }
             }
         };
 
@@ -3098,7 +3249,7 @@ impl App {
             }
         }
         c.body = TextInput::from(body.as_str());
-        c.field = 2;
+        c.field = COMPOSE_BODY;
         c.ctrl_x = false;
         self.status = "edited in $EDITOR".into();
     }
@@ -3202,6 +3353,74 @@ fn parse_recipients(s: &str) -> Vec<String> {
         .collect()
 }
 
+fn cache_mail_contact(
+    contacts: &mut std::collections::BTreeMap<String, MailContact>,
+    recipient: &Recipient,
+) {
+    let Some(email) = recipient.email_address.as_ref() else {
+        return;
+    };
+    let Some(address) = email
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let name = email
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let key = address.to_lowercase();
+    contacts
+        .entry(key)
+        .and_modify(|contact| {
+            if contact.name.is_none() && name.is_some() {
+                contact.name = name.clone();
+            }
+        })
+        .or_insert_with(|| MailContact {
+            name,
+            address: address.to_string(),
+        });
+}
+
+fn recipient_token(input: &TextInput) -> (usize, usize, String) {
+    let chars = input.chars();
+    let cursor = input.cursor();
+    let delimiter = |character: &char| matches!(character, ',' | ';');
+    let raw_start = chars[..cursor]
+        .iter()
+        .rposition(delimiter)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let start = raw_start
+        + chars[raw_start..cursor]
+            .iter()
+            .take_while(|character| character.is_whitespace())
+            .count();
+    let end = chars[cursor..]
+        .iter()
+        .position(delimiter)
+        .map(|index| cursor + index)
+        .unwrap_or(chars.len());
+    let query = chars[start..cursor].iter().collect::<String>();
+    (start, end, query.trim().to_string())
+}
+
+fn accept_recipient_suggestion(compose: &mut Compose, contact: &MailContact) {
+    let Some(input) = compose.active_recipient() else {
+        return;
+    };
+    let (start, end, _) = recipient_token(input);
+    let input = compose.active_mut();
+    input.replace_range(start, end, &format!("{}, ", contact.address));
+    compose.suggestion_sel = 0;
+}
+
 /// Given the allowed field ids and the current one, return the next (wrapping).
 fn next_field(fields: &[usize], current: usize) -> usize {
     let pos = fields.iter().position(|&f| f == current).unwrap_or(0);
@@ -3289,6 +3508,21 @@ pub(crate) fn mail_thread_size(messages: &[MailMessage], message: &MailMessage) 
         .count()
 }
 
+pub(crate) fn mail_row_unread(
+    messages: &[MailMessage],
+    message: &MailMessage,
+    threaded: bool,
+) -> bool {
+    messages.iter().any(|candidate| {
+        let belongs = if threaded {
+            mail_same_thread(candidate, message)
+        } else {
+            candidate.id == message.id
+        };
+        belongs && !candidate.is_read.unwrap_or(true)
+    })
+}
+
 /// Move a selection index by `delta`, clamped to `[0, len)`.
 fn step(idx: usize, delta: i32, len: usize) -> usize {
     if len == 0 {
@@ -3353,9 +3587,11 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_folders, folder_panel_width, format_compose_file, mail_row_indices,
-        mail_thread_size, merge_newest_first, next_field, parse_compose_file, parse_recipients,
-        step,
+        accept_recipient_suggestion, cache_mail_contact, filter_folders, folder_panel_width,
+        format_compose_file, mail_row_indices, mail_row_unread, mail_thread_size,
+        merge_newest_first, next_field, parse_compose_file, parse_recipients, recipient_token,
+        step, Compose, ComposeKind, MailContact, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY,
+        COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO,
     };
 
     #[test]
@@ -3463,6 +3699,17 @@ mod tests {
         assert_eq!(next_field(&[0, 1, 2], 2), 0);
         assert_eq!(next_field(&[2], 2), 2, "reply has only a body field");
         assert_eq!(next_field(&[0, 2], 0), 2, "forward skips subject");
+        assert_eq!(
+            ComposeKind::NewMail.fields(),
+            &[
+                COMPOSE_TO,
+                COMPOSE_CC,
+                COMPOSE_BCC,
+                COMPOSE_SUBJECT,
+                COMPOSE_BODY,
+                COMPOSE_ATTACH
+            ]
+        );
     }
 
     #[test]
@@ -3472,6 +3719,39 @@ mod tests {
             vec!["a@x.pt", "b@x.pt", "c@x.pt", "d@x.pt"]
         );
         assert!(parse_recipients("  ,; ").is_empty());
+    }
+
+    #[test]
+    fn recipient_autocomplete_replaces_only_the_active_recipient() {
+        let mut compose = Compose::new(ComposeKind::NewMail, COMPOSE_TO);
+        compose.to = crate::editor::TextInput::from("first@example.com; dav");
+        assert_eq!(recipient_token(&compose.to), (19, 22, "dav".into()));
+        accept_recipient_suggestion(
+            &mut compose,
+            &MailContact {
+                name: Some("David Example".into()),
+                address: "david@example.com".into(),
+            },
+        );
+        assert_eq!(compose.to.text(), "first@example.com; david@example.com, ");
+    }
+
+    #[test]
+    fn contact_cache_deduplicates_addresses_and_learns_names() {
+        let recipient = |name: Option<&str>| {
+            serde_json::from_value(serde_json::json!({
+                "emailAddress": { "name": name, "address": "Person@Example.com" }
+            }))
+            .unwrap()
+        };
+        let mut contacts = std::collections::BTreeMap::new();
+        cache_mail_contact(&mut contacts, &recipient(None));
+        cache_mail_contact(&mut contacts, &recipient(Some("A Person")));
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            contacts["person@example.com"].name.as_deref(),
+            Some("A Person")
+        );
     }
 
     #[test]
@@ -3528,5 +3808,20 @@ mod tests {
         assert_eq!(mail_row_indices(&messages, true), vec![0, 1, 3, 4]);
         assert_eq!(mail_thread_size(&messages, &messages[0]), 2);
         assert_eq!(mail_thread_size(&messages, &messages[3]), 1);
+    }
+
+    #[test]
+    fn single_message_unread_state_ignores_other_rows() {
+        let message = |id: &str, read: bool| {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "conversationId": "thread",
+                "isRead": read
+            }))
+            .unwrap()
+        };
+        let messages = [message("read", true), message("unread", false)];
+        assert!(!mail_row_unread(&messages, &messages[0], false));
+        assert!(mail_row_unread(&messages, &messages[0], true));
     }
 }
