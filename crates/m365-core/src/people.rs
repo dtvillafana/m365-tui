@@ -103,6 +103,17 @@ pub async fn user_id_for_email(graph: &GraphClient, email: &str) -> Result<Optio
     }
 }
 
+/// Profile photo bytes (`GET /users/{id}/photo/$value`).
+///
+/// `User.Read` covers the signed-in user. Other people's photos need
+/// `User.Read.All` or `ProfilePhoto.Read.All`; without those Graph returns 404
+/// and the caller should treat it as "no photo".
+pub async fn photo(graph: &GraphClient, user_id: &str) -> Result<Vec<u8>> {
+    graph
+        .get_bytes(&format!("users/{user_id}/photo/$value"))
+        .await
+}
+
 /// Presence for a set of user ids (Teams status dots).
 pub async fn presences(graph: &GraphClient, user_ids: &[String]) -> Result<Vec<Presence>> {
     if user_ids.is_empty() {

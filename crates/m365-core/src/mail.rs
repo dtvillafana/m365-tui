@@ -89,28 +89,41 @@ pub async fn delta_messages(
 /// List a message's attachments. `$select` keeps `contentBytes` out of the
 /// response so listing stays cheap regardless of attachment size.
 ///
-/// `contentId` is not on the base `attachment` type. Graph rejects it in
-/// `$select` even after an OData `fileAttachment` cast, so CID values are
-/// read from unselected inline attachments instead — those payloads are
-/// small, and extra fields such as `contentBytes` are ignored here.
+/// `contentId` is not on the base `attachment` type, so `$select=contentId`
+/// is rejected. Inline images are re-fetched by id (typed as
+/// `fileAttachment`) to get `contentId` and, for small files, `contentBytes`.
 pub async fn list_attachments(graph: &GraphClient, message_id: &str) -> Result<Vec<Attachment>> {
     let path =
         format!("me/messages/{message_id}/attachments?$select=id,name,contentType,size,isInline");
     let mut attachments: Vec<Attachment> = graph.get_collection(&path).await?;
-    if !attachments.iter().any(|a| a.is_inline.unwrap_or(false)) {
-        return Ok(attachments);
-    }
-    let inline: Vec<Attachment> = graph
-        .get_collection(&format!(
-            "me/messages/{message_id}/attachments?$filter=isInline eq true"
-        ))
-        .await?;
-    for file in inline {
-        if let Some(attachment) = attachments.iter_mut().find(|a| a.id == file.id) {
-            attachment.content_id = file.content_id;
+    for att in &mut attachments {
+        if !attachment_may_be_inline_image(att) {
+            continue;
+        }
+        let Ok(full) = graph
+            .get_json::<Attachment>(&format!("me/messages/{message_id}/attachments/{}", att.id))
+            .await
+        else {
+            continue;
+        };
+        att.content_id = full.content_id.or(att.content_id.take());
+        att.content_bytes = full.content_bytes;
+        if att.content_type.is_none() {
+            att.content_type = full.content_type;
+        }
+        if att.is_inline.is_none() {
+            att.is_inline = full.is_inline;
         }
     }
     Ok(attachments)
+}
+
+fn attachment_may_be_inline_image(att: &Attachment) -> bool {
+    att.is_inline.unwrap_or(false)
+        || att
+            .content_type
+            .as_deref()
+            .is_some_and(|t| t.to_ascii_lowercase().starts_with("image/"))
 }
 
 /// Download one attachment's raw bytes.

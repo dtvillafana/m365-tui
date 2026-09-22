@@ -7,10 +7,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    filter_commands, filter_folders, folder_panel_height, mail_folder_label, mail_row_unread,
-    mail_same_thread, mail_thread_size, App, Compose, OutlookFocus, Overlay, PushState, Screen,
-    TeamsFocus, TeamsMode, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY, COMPOSE_CC, COMPOSE_SUBJECT,
-    COMPOSE_TO, DEFAULT_FOLDER_PANEL_WIDTH,
+    filter_commands, filter_folders, folder_panel_height, mail_folder_label, mail_image_is_local,
+    mail_row_unread, mail_same_thread, mail_thread_size, App, Compose, OutlookFocus, Overlay,
+    PushState, Screen, TeamsFocus, TeamsMode, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY,
+    COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO, DEFAULT_FOLDER_PANEL_WIDTH,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -30,6 +30,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // full-width text so a terminal drag-select grabs only the message body.
     if app.copy_mode {
         render_copy_mode(f, app);
+        return;
+    }
+
+    // A full-image overlay must be the only thing drawn this frame. Terminal
+    // graphics protocols keep pixels from earlier widgets unless they are not
+    // rendered at all.
+    if matches!(app.overlay, Some(Overlay::ViewImage { .. })) {
+        render_overlay(f, app);
         return;
     }
 
@@ -182,6 +190,8 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Links => "1-9 open · y copy · Esc close",
             Overlay::Attachments => "1-9 save · Esc close",
             Overlay::React => "1-7 react · Esc close",
+            Overlay::ViewImage { keys, .. } if keys.len() > 1 => "j/k next image · Esc close",
+            Overlay::ViewImage { .. } => "Esc close",
             Overlay::Presence => "1-6 set · c clear · Esc close",
             Overlay::Settings { .. } => "Space/Enter toggle · Esc close",
             Overlay::Search { .. } => "Enter search · Esc cancel",
@@ -203,7 +213,7 @@ fn context_hints(app: &App) -> &'static str {
         },
         Screen::Teams => match app.teams.focus {
             TeamsFocus::List => "j/k move · g/G · l open · t chats/channels",
-            TeamsFocus::Messages => "j/k select · g/G · h back · r reply · e react",
+            TeamsFocus::Messages => "j/k select · g/G · h back · r reply · e react · v image",
             TeamsFocus::Composer => "Enter send · Ctrl+V image · @path Tab · Esc leave",
         },
     }
@@ -389,8 +399,13 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &mut App) {
 fn email_flow(app: &App) -> Option<Vec<FlowItem>> {
     let message = app.outlook.reading.as_ref()?;
     if app.outlook.reading_thread.is_empty() {
-        let mut flow = email_lines(app)?.into_iter().map(FlowItem::Line).collect();
-        push_mail_images(&mut flow, app, &message.id);
+        let mut flow = email_header_lines(app, message, None, 0, 1)
+            .into_iter()
+            .map(FlowItem::Line)
+            .collect();
+        if let Some(body) = &app.outlook.reading_body {
+            push_mail_body(&mut flow, app, &message.id, body.lines.as_ref());
+        }
         return Some(flow);
     }
 
@@ -406,39 +421,59 @@ fn email_flow(app: &App) -> Option<Vec<FlowItem>> {
         if index > 0 {
             flow.push(FlowItem::Line(Line::raw("")));
         }
-        flow.push(FlowItem::Line(Line::from(Span::styled(
-            format!("── Message {} of {total} ──", index + 1),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ))));
-        flow.push(FlowItem::Line(kv(
-            "Subject",
-            &message.subject.clone().unwrap_or_default(),
-        )));
-        flow.push(FlowItem::Line(kv("From", &message.sender_name())));
-        flow.push(FlowItem::Line(kv(
-            "Date",
-            message.mail_time().unwrap_or_default(),
-        )));
-        if index == 0 && !app.outlook.reading_attachments.is_empty() {
-            flow.push(FlowItem::Line(attachment_line(app)));
-        }
-        flow.push(FlowItem::Line(Line::raw("")));
-        flow.extend(body.lines.iter().cloned().map(FlowItem::Line));
-        push_mail_images(&mut flow, app, &message.id);
+        flow.extend(
+            email_header_lines(app, message, Some(index), total, index)
+                .into_iter()
+                .map(FlowItem::Line),
+        );
+        push_mail_body(&mut flow, app, &message.id, body.lines.as_ref());
     }
     Some(flow)
 }
 
-fn push_mail_images(flow: &mut Vec<FlowItem>, app: &App, message_id: &str) {
-    flow.extend(
-        app.outlook
-            .reading_images
-            .iter()
-            .filter(|image| image.message_id == message_id)
-            .map(|image| FlowItem::Image {
-                key: crate::termimg::mail_cache_key(message_id, &image.image.src),
-            }),
-    );
+fn email_header_lines(
+    app: &App,
+    message: &m365_core::models::MailMessage,
+    index: Option<usize>,
+    total: usize,
+    attach_on: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(i) = index {
+        lines.push(Line::from(Span::styled(
+            format!("── Message {} of {total} ──", i + 1),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(kv("Subject", &message.subject.clone().unwrap_or_default()));
+    lines.push(kv("From", &message.sender_name()));
+    lines.push(kv("Date", message.mail_time().unwrap_or_default()));
+    if attach_on == 0 && !app.outlook.reading_attachments.is_empty() {
+        lines.push(attachment_line(app));
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
+fn push_mail_body(flow: &mut Vec<FlowItem>, app: &App, message_id: &str, lines: &[Line<'static>]) {
+    let images: Vec<crate::content::BodyImage> = app
+        .outlook
+        .reading_images
+        .iter()
+        .filter(|image| image.message_id == message_id)
+        .map(|image| image.image.clone())
+        .collect();
+    for piece in crate::content::body_pieces(lines, &images) {
+        match piece {
+            crate::content::BodyPiece::Line(line) => flow.push(FlowItem::Line(line.clone())),
+            crate::content::BodyPiece::Image(image) if mail_image_is_local(&image.src) => {
+                flow.push(FlowItem::Image {
+                    key: crate::termimg::mail_cache_key(message_id, &image.src),
+                });
+            }
+            crate::content::BodyPiece::Image(_) => {}
+        }
+    }
 }
 
 /// Headers + rendered body of the open email, or `None` if nothing is open.
@@ -503,19 +538,36 @@ fn attachment_line(app: &App) -> Line<'static> {
 
 enum FlowItem {
     Line(Line<'static>),
-    Image { key: String },
+    Image {
+        key: String,
+    },
+    LineWithPhoto {
+        line: Line<'static>,
+        photo_key: String,
+    },
 }
 
 enum DisplayRow {
     Line(Line<'static>),
-    Image { key: String, height: u16 },
+    Image {
+        key: String,
+        height: u16,
+    },
+    LineWithPhoto {
+        lines: Vec<Line<'static>>,
+        photo_key: String,
+        photo_width: u16,
+        height: u16,
+    },
 }
 
 impl DisplayRow {
     fn height(&self) -> u16 {
         match self {
             DisplayRow::Line(_) => 1,
-            DisplayRow::Image { height, .. } => (*height).max(1),
+            DisplayRow::Image { height, .. } | DisplayRow::LineWithPhoto { height, .. } => {
+                (*height).max(1)
+            }
         }
     }
 }
@@ -528,7 +580,7 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
     let lines = flow
         .into_iter()
         .map(|item| match item {
-            FlowItem::Line(l) => l,
+            FlowItem::Line(l) | FlowItem::LineWithPhoto { line: l, .. } => l,
             FlowItem::Image { .. } => Line::from("[image]"),
         })
         .collect();
@@ -602,12 +654,20 @@ fn conversation_flow(app: &App, selectable: bool) -> (Vec<FlowItem>, Vec<usize>)
                 .as_ref()
                 .is_some_and(|(a, t)| continues_run(a, *t, &author, when));
 
-        let mut body: Vec<Line<'static>> = app
+        let body: Vec<Line<'static>> = app
             .teams
             .messages_rendered
             .get(i)
             .map(|b| b.lines.clone())
             .unwrap_or_default();
+        let imgs = app
+            .teams
+            .messages_images
+            .get(i)
+            .cloned()
+            .unwrap_or_default();
+        let mut pieces: Vec<crate::content::BodyPiece<'_>> =
+            crate::content::body_pieces(&body, &imgs);
 
         // A reply carries the message it answers as a `messageReference`
         // attachment, not as HTML, so it has to be drawn explicitly — and it
@@ -628,16 +688,19 @@ fn conversation_flow(app: &App, selectable: bool) -> (Vec<FlowItem>, Vec<usize>)
             (true, Some(quote)) => flow.push(FlowItem::Line(lead(quote))),
             // Grouped message: the text starts right after the time.
             (true, None) => {
-                let first = if body.is_empty() {
-                    Vec::new()
-                } else {
-                    body.remove(0).spans
+                let first = match pieces.first() {
+                    Some(crate::content::BodyPiece::Line(line)) => {
+                        let spans = line.spans.clone();
+                        pieces.remove(0);
+                        spans
+                    }
+                    _ => Vec::new(),
                 };
                 flow.push(FlowItem::Line(lead(first)));
             }
             // New author: name on the lead line, then the quote if there is one.
             (false, quote) => {
-                flow.push(FlowItem::Line(lead(vec![Span::styled(
+                let name = lead(vec![Span::styled(
                     author.clone(),
                     Style::default()
                         .fg(if selected {
@@ -646,7 +709,15 @@ fn conversation_flow(app: &App, selectable: bool) -> (Vec<FlowItem>, Vec<usize>)
                             Color::LightGreen
                         })
                         .add_modifier(Modifier::BOLD),
-                )])));
+                )]);
+                if let Some(id) = m.author_id().filter(|id| !id.is_empty()) {
+                    flow.push(FlowItem::LineWithPhoto {
+                        line: name,
+                        photo_key: crate::termimg::photo_cache_key(id),
+                    });
+                } else {
+                    flow.push(FlowItem::Line(name));
+                }
                 if let Some(quote) = quote {
                     let mut spans = vec![Span::raw(gutter.clone())];
                     spans.extend(quote);
@@ -655,10 +726,19 @@ fn conversation_flow(app: &App, selectable: bool) -> (Vec<FlowItem>, Vec<usize>)
             }
         }
 
-        for line in body {
-            let mut spans = vec![Span::raw(gutter.clone())];
-            spans.extend(line.spans);
-            flow.push(FlowItem::Line(Line::from(spans)));
+        for piece in pieces {
+            match piece {
+                crate::content::BodyPiece::Line(line) => {
+                    let mut spans = vec![Span::raw(gutter.clone())];
+                    spans.extend(line.spans.clone());
+                    flow.push(FlowItem::Line(Line::from(spans)));
+                }
+                crate::content::BodyPiece::Image(img) => {
+                    let hosted = crate::termimg::hosted_content_id(&img.src);
+                    let key = crate::termimg::cache_key(&img.src, hosted);
+                    flow.push(FlowItem::Image { key });
+                }
+            }
         }
         for att in &m.attachments {
             if let Some(name) = &att.name {
@@ -666,13 +746,6 @@ fn conversation_flow(app: &App, selectable: bool) -> (Vec<FlowItem>, Vec<usize>)
                     Span::raw(gutter.clone()),
                     Span::styled(format!("📎 {name}"), Style::default().fg(Color::LightBlue)),
                 ])));
-            }
-        }
-        if let Some(imgs) = app.teams.messages_images.get(i) {
-            for img in imgs {
-                let hosted = crate::termimg::hosted_content_id(&img.src);
-                let key = crate::termimg::cache_key(&img.src, hosted);
-                flow.push(FlowItem::Image { key });
             }
         }
         if let Some(reactions) = m.reactions_summary() {
@@ -701,6 +774,24 @@ fn wrap_flow(app: &App, items: &[FlowItem], width: usize) -> (Vec<DisplayRow>, V
                 key: key.clone(),
                 height: app.image_display_rows(key, width as u16),
             }),
+            FlowItem::LineWithPhoto { line, photo_key } => match app.avatar_cell_size(photo_key) {
+                Some((pw, ph)) if (pw as usize) + 1 < width => {
+                    let text_w = width - pw as usize - 1;
+                    let wrapped = crate::wrap::wrap_line(line, text_w.max(1));
+                    let height = (wrapped.len() as u16).max(ph).max(1);
+                    rows.push(DisplayRow::LineWithPhoto {
+                        lines: wrapped,
+                        photo_key: photo_key.clone(),
+                        photo_width: pw,
+                        height,
+                    });
+                }
+                _ => {
+                    for row in crate::wrap::wrap_line(line, width) {
+                        rows.push(DisplayRow::Line(row));
+                    }
+                }
+            },
         }
     }
     (rows, starts)
@@ -756,6 +847,42 @@ fn render_display_rows(
                         Paragraph::new(Span::styled(label, Style::default().fg(DIM))),
                         dest,
                     );
+                }
+            }
+            DisplayRow::LineWithPhoto {
+                lines,
+                photo_key,
+                photo_width,
+                ..
+            } => {
+                let text_w = dest.width.saturating_sub(*photo_width);
+                for (i, line) in lines.iter().enumerate() {
+                    let y = dest.y.saturating_add(i as u16);
+                    if y >= dest.bottom() {
+                        break;
+                    }
+                    f.render_widget(
+                        Paragraph::new(line.clone()),
+                        Rect {
+                            x: dest.x,
+                            y,
+                            width: text_w.max(1),
+                            height: 1,
+                        },
+                    );
+                }
+                let name_w = lines.first().map(line_width).unwrap_or(0);
+                let img_x = dest.x.saturating_add(name_w.saturating_add(1));
+                if *photo_width > 0 && img_x < dest.right() {
+                    let img_area = Rect {
+                        x: img_x,
+                        y: dest.y,
+                        width: (*photo_width).min(dest.right().saturating_sub(img_x)),
+                        height: dest.height,
+                    };
+                    if let Some(img) = app.image_cache.get_mut(photo_key) {
+                        crate::termimg::render(f, img_area, img);
+                    }
                 }
             }
         }
@@ -884,7 +1011,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     let title = if app.teams.unseen > 0 {
         format!("Conversation — ▼ {} new (G to jump)", app.teams.unseen)
     } else if focused {
-        "Conversation (j/k select · g/G · e react · z copy-mode)".to_string()
+        "Conversation (j/k select · g/G · e react · v image · z copy-mode)".to_string()
     } else {
         "Conversation".to_string()
     };
@@ -1051,11 +1178,71 @@ fn render_composer_previews(f: &mut Frame, composer_inner: &mut Rect, app: &mut 
     }
 }
 
-fn render_overlay(f: &mut Frame, app: &App) {
+fn render_view_image(f: &mut Frame, app: &mut App, keys: &[String], sel: usize) {
+    let area = f.area();
+    f.render_widget(Clear, area);
+    let hint = if keys.len() > 1 {
+        format!(
+            " {} / {}  · j/k next · Esc close ",
+            sel.saturating_add(1).min(keys.len()),
+            keys.len()
+        )
+    } else {
+        " Esc close ".to_string()
+    };
+    let hint_h = u16::from(area.height > 0);
+    let img_area = Rect {
+        height: area.height.saturating_sub(hint_h),
+        ..area
+    };
+    if hint_h == 1 {
+        f.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
+            Rect {
+                x: area.x,
+                y: area.bottom().saturating_sub(1),
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
+    let Some(key) = keys.get(sel) else {
+        return;
+    };
+    if let Some(img) = app.image_cache.get_mut(key) {
+        let (w, h) = img.fit_contain(img_area.width, img_area.height);
+        let dest = Rect {
+            x: img_area.x + img_area.width.saturating_sub(w) / 2,
+            y: img_area.y + img_area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        crate::termimg::render(f, dest, img);
+    } else {
+        let label = if app.image_is_pending(key) {
+            "[image…]"
+        } else {
+            "[image unavailable]"
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(label, Style::default().fg(DIM))),
+            img_area,
+        );
+    }
+}
+
+fn render_overlay(f: &mut Frame, app: &mut App) {
+    if let Some(Overlay::ViewImage { keys, sel }) = &app.overlay {
+        let keys = keys.clone();
+        let sel = *sel;
+        render_view_image(f, app, &keys, sel);
+        return;
+    }
     let Some(overlay) = &app.overlay else {
         return;
     };
     match overlay {
+        Overlay::ViewImage { .. } => {}
         Overlay::Help => {
             let area = centered(60, 60, f.area());
             f.render_widget(Clear, area);
@@ -1081,7 +1268,7 @@ fn render_overlay(f: &mut Frame, app: &App) {
            t toggles threads/individual messages\n\
           folders pane / finds a folder · reading pane j/k scroll · g/G\n\
  \n\
- Teams:   t chats/channels · j/k select message · g oldest · G newest · e react\n\
+ Teams:   t chats/channels · j/k select message · g oldest · G newest · e react · v full image\n\
           i type · r reply · Enter send · Ctrl+V paste image\n\
           @path Tab complete image · Ctrl+X remove last image\n\
  \n\

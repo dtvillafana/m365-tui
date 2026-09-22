@@ -32,6 +32,7 @@ pub const DEFAULT_SCOPES: &[&str] = &[
     "profile",
     "offline_access",
     "User.Read",
+    "ProfilePhoto.Read.All",
     "People.Read",
     "Mail.ReadWrite",
     "Mail.Send",

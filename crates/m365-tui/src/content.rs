@@ -33,6 +33,31 @@ pub struct RenderedBody {
 pub struct BodyImage {
     pub alt: String,
     pub src: String,
+    /// Insert this image before the rendered body line at this index.
+    pub at_line: usize,
+}
+
+/// A body line or an image that belongs at that point in the document.
+#[derive(Debug, Clone, Copy)]
+pub enum BodyPiece<'a> {
+    Line(&'a Line<'static>),
+    Image(&'a BodyImage),
+}
+
+/// Interleave body lines with `<img>` tags at their original positions.
+pub fn body_pieces<'a>(lines: &'a [Line<'static>], images: &'a [BodyImage]) -> Vec<BodyPiece<'a>> {
+    let mut out = Vec::with_capacity(lines.len() + images.len());
+    let mut imgs = images.iter().peekable();
+    for (i, line) in lines.iter().enumerate() {
+        while imgs.peek().is_some_and(|img| img.at_line == i) {
+            out.push(BodyPiece::Image(imgs.next().unwrap()));
+        }
+        out.push(BodyPiece::Line(line));
+    }
+    for img in imgs {
+        out.push(BodyPiece::Image(img));
+    }
+    out
 }
 
 /// Render a Graph body to styled text. HTML is parsed and walked; plain text is
@@ -309,6 +334,9 @@ impl Renderer {
                 }
             }
             "img" => {
+                if self.line_has_content() {
+                    self.flush_line();
+                }
                 let alt = attr(attrs, "alt");
                 let label = alt
                     .as_deref()
@@ -317,7 +345,11 @@ impl Renderer {
                     .unwrap_or("image")
                     .to_string();
                 let src = attr(attrs, "src").unwrap_or_default();
-                self.images.push(BodyImage { alt: label, src });
+                self.images.push(BodyImage {
+                    alt: label,
+                    src,
+                    at_line: self.lines.len(),
+                });
             }
             "tr" => {
                 self.walk_children(node, style);
@@ -478,6 +510,26 @@ mod tests {
         assert!(s.contains("hi"));
         assert!(s.contains("there"));
         assert!(!s.contains("hostedContents"));
+        assert!(body_pieces(&out.text.lines, &out.images)
+            .iter()
+            .any(|p| matches!(p, BodyPiece::Image(img) if img.src.contains("hostedContents"))));
+    }
+
+    #[test]
+    fn images_are_interleaved_at_their_html_position() {
+        let out = render_html("<p>before</p><img src=\"cid:shot\"><p>after</p>");
+        let pieces = body_pieces(&out.text.lines, &out.images);
+        let kinds: Vec<&str> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                BodyPiece::Line(l) if l.spans.iter().any(|s| !s.content.trim().is_empty()) => {
+                    Some("text")
+                }
+                BodyPiece::Line(_) => None,
+                BodyPiece::Image(_) => Some("image"),
+            })
+            .collect();
+        assert_eq!(kinds, ["text", "image", "text"]);
     }
 
     #[test]

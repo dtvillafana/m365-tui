@@ -163,6 +163,11 @@ pub enum Overlay {
     Calendar,
     /// Emoji reaction picker for the selected Teams message.
     React,
+    /// Full-terminal view of an image in the selected Teams message.
+    ViewImage {
+        keys: Vec<String>,
+        sel: usize,
+    },
     /// Presence (status) picker for the signed-in user.
     Presence,
     Settings {
@@ -689,6 +694,21 @@ impl App {
                 self.outlook.attachment_loading.contains(&image.message_id)
                     && crate::termimg::mail_cache_key(&image.message_id, &image.image.src) == key
             })
+    }
+
+    /// Cell size of a Teams author photo, if one should be reserved.
+    pub fn avatar_cell_size(&self, key: &str) -> Option<(u16, u16)> {
+        if self.image_failed.contains(key) {
+            return None;
+        }
+        let rows = crate::termimg::AVATAR_IMAGE_ROWS;
+        if let Some(img) = self.image_cache.get(key) {
+            return Some((img.cols_for_rows(rows).clamp(1, 8), rows));
+        }
+        if self.image_loading.contains(key) {
+            return Some((rows.saturating_mul(2).max(1), rows));
+        }
+        None
     }
 
     /// Kick off the initial data loads.
@@ -1287,10 +1307,17 @@ impl App {
             }
             AppMessage::HostedImage { key, bytes } => {
                 self.image_loading.remove(&key);
+                let max_rows = if crate::termimg::is_photo_key(&key) {
+                    crate::termimg::AVATAR_IMAGE_ROWS
+                } else if key.starts_with("mail:") {
+                    crate::termimg::MAIL_IMAGE_ROWS
+                } else {
+                    crate::termimg::CONVO_IMAGE_ROWS
+                };
                 let decoded = self
                     .graphics
                     .as_ref()
-                    .and_then(|g| g.decode(&bytes, crate::termimg::CONVO_IMAGE_ROWS).ok());
+                    .and_then(|g| g.decode(&bytes, max_rows).ok());
                 match decoded {
                     Some(img) => {
                         self.image_cache.insert(key, img);
@@ -1501,6 +1528,7 @@ impl App {
         self.teams.messages_images = rendered.iter().map(|r| r.images.clone()).collect();
         self.teams.messages_rendered = rendered.into_iter().map(|r| r.text).collect();
         self.fetch_message_images();
+        self.fetch_user_photos();
 
         let last = self.teams.messages.len().saturating_sub(1);
         self.teams.msg_sel = match mode {
@@ -2636,6 +2664,11 @@ impl App {
             {
                 self.overlay = Some(Overlay::React);
             }
+            KeyCode::Char('v')
+                if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
+            {
+                self.open_full_image();
+            }
             // g/Home oldest (top), G/End newest (bottom) — vim-style.
             KeyCode::Home | KeyCode::Char('g')
                 if self.teams.focus == TeamsFocus::Messages
@@ -3061,6 +3094,63 @@ impl App {
         }
     }
 
+    fn fetch_user_photos(&mut self) {
+        if self.graphics.is_none() {
+            return;
+        }
+        let mut ids: Vec<String> = self
+            .teams
+            .messages
+            .iter()
+            .filter_map(|m| m.author_id().map(str::to_string))
+            .filter(|id| !id.is_empty())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        for id in ids {
+            let key = crate::termimg::photo_cache_key(&id);
+            if self.image_cache.contains_key(&key)
+                || self.image_failed.contains(&key)
+                || self.image_loading.contains(&key)
+            {
+                continue;
+            }
+            self.image_loading.insert(key.clone());
+            let s = self.session.clone();
+            self.spawn(async move {
+                match people::photo(&s.graph, &id).await {
+                    Ok(bytes) => Ok(AppMessage::HostedImage { key, bytes }),
+                    Err(_) => Ok(AppMessage::HostedImageFailed { key }),
+                }
+            });
+        }
+    }
+
+    fn selected_message_image_keys(&self) -> Vec<String> {
+        let Some(imgs) = self.teams.messages_images.get(self.teams.msg_sel) else {
+            return Vec::new();
+        };
+        imgs.iter()
+            .map(|img| {
+                let hosted = crate::termimg::hosted_content_id(&img.src);
+                crate::termimg::cache_key(&img.src, hosted)
+            })
+            .collect()
+    }
+
+    fn open_full_image(&mut self) {
+        if self.graphics.is_none() {
+            self.status = "this terminal cannot display images".into();
+            return;
+        }
+        let keys = self.selected_message_image_keys();
+        if keys.is_empty() {
+            self.status = "no image in this message".into();
+            return;
+        }
+        self.overlay = Some(Overlay::ViewImage { keys, sel: 0 });
+    }
+
     fn fetch_mail_images(&mut self) {
         if self.graphics.is_none() {
             return;
@@ -3079,7 +3169,7 @@ impl App {
                 match decoded.ok().and_then(|image| {
                     self.graphics.as_ref().and_then(|graphics| {
                         graphics
-                            .decode(&image.bytes, crate::termimg::CONVO_IMAGE_ROWS)
+                            .decode(&image.bytes, crate::termimg::MAIL_IMAGE_ROWS)
                             .ok()
                     })
                 }) {
@@ -3093,28 +3183,53 @@ impl App {
                 continue;
             }
 
+            if let Some(path) = graph_attachment_path(&mail_image.image.src) {
+                self.image_loading.insert(key.clone());
+                let session = self.session.clone();
+                self.spawn(async move {
+                    match session.graph.get_bytes(&path).await {
+                        Ok(bytes) => Ok(AppMessage::HostedImage { key, bytes }),
+                        Err(_) => Ok(AppMessage::HostedImageFailed { key }),
+                    }
+                });
+                continue;
+            }
+
             let Some(content_id) = mail_content_id(&mail_image.image.src) else {
-                // Deliberately do not load remote images: doing so leaks that the
-                // message was opened and may expose Graph credentials to a third party.
-                self.image_failed.insert(key);
+                // Remote tracking pixels / third-party images: do not fetch, and
+                // do not reserve a slot in the reading pane.
                 continue;
             };
             let Some(attachments) = self.outlook.attachment_cache.get(&mail_image.message_id)
             else {
                 continue;
             };
-            let attachment = attachments.iter().find(|attachment| {
-                attachment.content_id.as_deref().is_some_and(|id| {
-                    normalize_content_id(id).eq_ignore_ascii_case(normalize_content_id(content_id))
-                }) || attachment
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(content_id))
-            });
+            let attachment = attachments
+                .iter()
+                .find(|attachment| cid_matches(attachment, content_id));
             let Some(attachment) = attachment else {
                 self.image_failed.insert(key);
                 continue;
             };
+            if let Some(bytes) = attachment
+                .content_bytes
+                .as_deref()
+                .and_then(|b| m365_core::util::base64_decode(b).ok())
+            {
+                match self
+                    .graphics
+                    .as_ref()
+                    .and_then(|g| g.decode(&bytes, crate::termimg::MAIL_IMAGE_ROWS).ok())
+                {
+                    Some(image) => {
+                        self.image_cache.insert(key, image);
+                    }
+                    None => {
+                        self.image_failed.insert(key);
+                    }
+                }
+                continue;
+            }
             let message_id = mail_image.message_id;
             let attachment_id = attachment.id.clone();
             self.image_loading.insert(key.clone());
@@ -3181,6 +3296,21 @@ impl App {
                     self.overlay = Some(Overlay::React); // ignore other keys
                 }
             }
+            Some(Overlay::ViewImage { keys, mut sel }) => match key.code {
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('l') | KeyCode::Right => {
+                    if !keys.is_empty() {
+                        sel = (sel + 1) % keys.len();
+                    }
+                    self.overlay = Some(Overlay::ViewImage { keys, sel });
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('h') | KeyCode::Left => {
+                    if !keys.is_empty() {
+                        sel = (sel + keys.len() - 1) % keys.len();
+                    }
+                    self.overlay = Some(Overlay::ViewImage { keys, sel });
+                }
+                _ => self.overlay = Some(Overlay::ViewImage { keys, sel }),
+            },
             Some(Overlay::Attachments) => match key.code {
                 KeyCode::Char(c @ '1'..='9') => {
                     self.download_attachment((c as u8 - b'1') as usize);
@@ -3987,6 +4117,45 @@ fn normalize_content_id(id: &str) -> &str {
     id.trim().trim_start_matches('<').trim_end_matches('>')
 }
 
+fn cid_local_part(id: &str) -> &str {
+    normalize_content_id(id).split('@').next().unwrap_or(id)
+}
+
+fn cid_matches(attachment: &Attachment, content_id: &str) -> bool {
+    let want = normalize_content_id(content_id);
+    let want_local = cid_local_part(content_id);
+    if let Some(id) = attachment.content_id.as_deref() {
+        let got = normalize_content_id(id);
+        if got.eq_ignore_ascii_case(want) || cid_local_part(id).eq_ignore_ascii_case(want_local) {
+            return true;
+        }
+    }
+    attachment.name.as_deref().is_some_and(|name| {
+        name.eq_ignore_ascii_case(want) || name.eq_ignore_ascii_case(want_local)
+    })
+}
+
+/// Graph-hosted attachment `$value` URLs are safe to fetch with our token.
+fn graph_attachment_path(src: &str) -> Option<String> {
+    let src = src.trim();
+    let rest = src
+        .strip_prefix("https://graph.microsoft.com/v1.0/")
+        .or_else(|| src.strip_prefix("https://graph.microsoft.com/beta/"))?;
+    let path = rest.split('?').next().unwrap_or(rest);
+    if path.contains("/attachments/") && path.contains("/$value") {
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn mail_image_is_local(src: &str) -> bool {
+    let src = src.trim();
+    mail_content_id(src).is_some()
+        || src.to_ascii_lowercase().starts_with("data:image/")
+        || graph_attachment_path(src).is_some()
+}
+
 fn render_mail_body(message: &MailMessage) -> content::RenderedBody {
     let (content_type, raw) = match &message.body {
         Some(body) => (
@@ -4131,12 +4300,12 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_recipient_suggestion, cache_mail_contact, filter_folders, folder_panel_height,
-        folder_panel_width, format_compose_file, mail_content_id, mail_row_indices,
-        mail_row_unread, mail_thread_size, merge_newest_first, next_field, normalize_content_id,
-        parse_compose_file, parse_recipients, recipient_token, resize_panel_extent, step, Compose,
-        ComposeKind, MailContact, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY, COMPOSE_CC,
-        COMPOSE_SUBJECT, COMPOSE_TO,
+        accept_recipient_suggestion, cache_mail_contact, cid_matches, filter_folders,
+        folder_panel_height, folder_panel_width, format_compose_file, graph_attachment_path,
+        mail_content_id, mail_image_is_local, mail_row_indices, mail_row_unread, mail_thread_size,
+        merge_newest_first, next_field, normalize_content_id, parse_compose_file, parse_recipients,
+        recipient_token, resize_panel_extent, step, Compose, ComposeKind, MailContact,
+        COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY, COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO,
     };
 
     #[test]
@@ -4305,6 +4474,27 @@ mod tests {
         );
         assert_eq!(normalize_content_id(" <logo@example> "), "logo@example");
         assert_eq!(mail_content_id("https://example.com/logo.png"), None);
+        assert!(!mail_image_is_local("https://example.com/pixel.gif"));
+        assert!(mail_image_is_local("cid:shot.png"));
+        assert!(mail_image_is_local(
+            "https://graph.microsoft.com/v1.0/me/messages/m/attachments/a/$value"
+        ));
+        assert_eq!(
+            graph_attachment_path(
+                "https://graph.microsoft.com/v1.0/me/messages/m/attachments/a/$value?foo=1"
+            )
+            .as_deref(),
+            Some("me/messages/m/attachments/a/$value")
+        );
+        let att: m365_core::models::Attachment = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "name": "image001.png",
+            "contentId": "image001.png@01DABC"
+        }))
+        .unwrap();
+        assert!(cid_matches(&att, "image001.png@01DABC"));
+        assert!(cid_matches(&att, "image001.png"));
+        assert!(cid_matches(&att, "<image001.png@01DABC>"));
     }
 
     #[test]
