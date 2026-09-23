@@ -250,6 +250,8 @@ restarts.
 Inline images attached to an email are shown in terminals that support Kitty,
 Sixel, or iTerm2 graphics. They preserve their aspect ratio and resize when the
 pane width changes. Remote tracking images are not downloaded automatically.
+Press `i` for a scrollable numbered preview of the message's images, then a
+number to view one full-screen.
 
 **Editing in `$EDITOR`.** While composing mail, `Ctrl+X e` (the same chord as
 the shell) leaves the TUI and opens `$VISUAL` or `$EDITOR` on the subject and

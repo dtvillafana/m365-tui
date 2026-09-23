@@ -36,7 +36,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // A full-image overlay must be the only thing drawn this frame. Terminal
     // graphics protocols keep pixels from earlier widgets unless they are not
     // rendered at all.
-    if matches!(app.overlay, Some(Overlay::ViewImage { .. })) {
+    if matches!(
+        app.overlay,
+        Some(Overlay::ViewImage { .. }) | Some(Overlay::MailImages { .. })
+    ) {
         render_overlay(f, app);
         return;
     }
@@ -188,6 +191,11 @@ fn context_hints(app: &App) -> &'static str {
         return match overlay {
             Overlay::Compose(_) => "Ctrl+S send · Ctrl+X e $EDITOR · Esc cancel",
             Overlay::Links => "1-9 open · y copy · Esc close",
+            Overlay::MailImages {
+                fullscreen: Some(_),
+                ..
+            } => "1-9 jump · j/k next · Esc back",
+            Overlay::MailImages { .. } => "1-9 fullscreen · j/k scroll · Esc close",
             Overlay::Attachments => "1-9 save · Esc close",
             Overlay::React => "1-7 react · Esc close",
             Overlay::ViewImage { keys, .. } if keys.len() > 1 => "j/k next image · Esc close",
@@ -208,7 +216,7 @@ fn context_hints(app: &App) -> &'static str {
                 "j/k move · g/G · l read · t threads · h back · c compose · r reply · u read · m move · d trash · / search"
             }
             OutlookFocus::Reading => {
-                "j/k scroll · g/G · h back · u read · m move · d trash · o links · A attach · y copy"
+                "j/k scroll · g/G · h back · u read · m move · d trash · o links · i images · A attach · y copy"
             }
         },
         Screen::Teams => match app.teams.focus {
@@ -1178,17 +1186,18 @@ fn render_composer_previews(f: &mut Frame, composer_inner: &mut Rect, app: &mut 
     }
 }
 
-fn render_view_image(f: &mut Frame, app: &mut App, keys: &[String], sel: usize) {
+fn render_view_image(f: &mut Frame, app: &mut App, keys: &[String], sel: usize, back: bool) {
     let area = f.area();
     f.render_widget(Clear, area);
+    let esc = if back { "Esc back" } else { "Esc close" };
     let hint = if keys.len() > 1 {
         format!(
-            " {} / {}  · j/k next · Esc close ",
+            " {} / {}  · j/k next · {esc} ",
             sel.saturating_add(1).min(keys.len()),
             keys.len()
         )
     } else {
-        " Esc close ".to_string()
+        format!(" {esc} ")
     };
     let hint_h = u16::from(area.height > 0);
     let img_area = Rect {
@@ -1231,18 +1240,120 @@ fn render_view_image(f: &mut Frame, app: &mut App, keys: &[String], sel: usize) 
     }
 }
 
+fn render_mail_images(f: &mut Frame, app: &mut App, scroll: u16, fullscreen: Option<usize>) {
+    let entries = app.reading_image_entries();
+    if let Some(sel) = fullscreen {
+        let keys: Vec<String> = entries.into_iter().map(|(key, _)| key).collect();
+        render_view_image(f, app, &keys, sel, true);
+        return;
+    }
+
+    let area = f.area();
+    f.render_widget(Clear, area);
+    let block = popup_block("Images — press 1-9 to fullscreen · j/k scroll · Esc close");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        app.images_max_scroll.set(0);
+        return;
+    }
+
+    let preview_cap = crate::termimg::MAIL_PREVIEW_ROWS;
+    let mut heights: Vec<u16> = Vec::with_capacity(entries.len());
+    for (i, (key, _)) in entries.iter().enumerate() {
+        let img_h = app.image_display_rows(key, inner.width).min(preview_cap);
+        let gap = u16::from(i + 1 < entries.len());
+        heights.push(1 + img_h + gap);
+    }
+    let total: u16 = heights.iter().copied().sum();
+    let max = total.saturating_sub(inner.height);
+    app.images_max_scroll.set(max);
+    let scroll = scroll.min(max);
+
+    let mut y_off = 0u16;
+    for (i, ((key, alt), h)) in entries.iter().zip(&heights).enumerate() {
+        let start = y_off;
+        y_off = y_off.saturating_add(*h);
+        if y_off <= scroll || start >= scroll.saturating_add(inner.height) {
+            continue;
+        }
+        if start < scroll {
+            continue;
+        }
+        let dest_y = inner.y + (start - scroll);
+        if dest_y >= inner.bottom() {
+            break;
+        }
+        let n = i + 1;
+        let caption = if alt.is_empty() {
+            "image"
+        } else {
+            alt.as_str()
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("{n} "),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(caption.to_string()),
+            ])),
+            Rect {
+                x: inner.x,
+                y: dest_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        let img_y = dest_y.saturating_add(1);
+        if img_y >= inner.bottom() {
+            continue;
+        }
+        let img_h = app.image_display_rows(key, inner.width).min(preview_cap);
+        let draw_h = img_h.min(inner.bottom().saturating_sub(img_y));
+        if draw_h == 0 {
+            continue;
+        }
+        let img_area = Rect {
+            x: inner.x,
+            y: img_y,
+            width: inner.width,
+            height: draw_h,
+        };
+        if let Some(img) = app.image_cache.get_mut(key) {
+            crate::termimg::render(f, img_area, img);
+        } else {
+            let label = if app.image_is_pending(key) {
+                "[image…]"
+            } else {
+                "[image unavailable]"
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(label, Style::default().fg(DIM))),
+                img_area,
+            );
+        }
+    }
+}
+
 fn render_overlay(f: &mut Frame, app: &mut App) {
     if let Some(Overlay::ViewImage { keys, sel }) = &app.overlay {
         let keys = keys.clone();
         let sel = *sel;
-        render_view_image(f, app, &keys, sel);
+        render_view_image(f, app, &keys, sel, false);
+        return;
+    }
+    if let Some(Overlay::MailImages { scroll, fullscreen }) = &app.overlay {
+        let scroll = *scroll;
+        let fullscreen = *fullscreen;
+        render_mail_images(f, app, scroll, fullscreen);
         return;
     }
     let Some(overlay) = &app.overlay else {
         return;
     };
     match overlay {
-        Overlay::ViewImage { .. } => {}
+        Overlay::ViewImage { .. } | Overlay::MailImages { .. } => {}
         Overlay::Help => {
             let area = centered(60, 60, f.area());
             f.render_widget(Clear, area);
@@ -1252,6 +1363,7 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
  Global:  F2 switch app · Ctrl+P palette · p presence · s settings · | panes · ? help · q quit\n\
  \n\
  Links:   o list links in the message · 1-9 open in browser\n\
+ Images:  i list images in the open mail · 1-9 fullscreen\n\
  Attach:  A list attachments · 1-9 save to your Downloads folder\n\
           when writing: Tab to Attach, type a path, Tab complete, Enter attach\n\
  \n\

@@ -175,6 +175,12 @@ pub enum Overlay {
     },
     /// Numbered links in the focused message, to open in a browser.
     Links,
+    /// Inline images of the open mail: a scrollable numbered gallery, then
+    /// 1-9 to view one full-terminal.
+    MailImages {
+        scroll: u16,
+        fullscreen: Option<usize>,
+    },
     /// Attachments of the open mail message, to save to disk.
     Attachments,
     /// Pick a folder to move the selected mail into.
@@ -595,6 +601,8 @@ pub struct App {
     /// Largest useful reading-pane scroll offset, set by the renderer once it
     /// knows the wrapped height of the open message.
     pub reading_max_scroll: std::cell::Cell<u16>,
+    /// Largest useful mail-image gallery scroll offset, set by the renderer.
+    pub images_max_scroll: std::cell::Cell<u16>,
     /// Largest useful copy-mode scroll offset, set by the renderer.
     pub copy_max_scroll: std::cell::Cell<u16>,
     /// Borderless full-width view for clean terminal text selection.
@@ -662,6 +670,7 @@ impl App {
             status_ticks: 0,
             text_width_hint: std::cell::Cell::new(60),
             reading_max_scroll: std::cell::Cell::new(0),
+            images_max_scroll: std::cell::Cell::new(0),
             copy_max_scroll: std::cell::Cell::new(0),
             copy_mode: false,
             copy_scroll: 0,
@@ -1930,6 +1939,7 @@ impl App {
             KeyCode::Char('f') => self.open_reply(ReplyMode::Forward),
             KeyCode::Char('u') => self.toggle_mail_read(),
             KeyCode::Char('m') => self.open_move_mail(),
+            KeyCode::Char('i') => self.open_mail_images(),
             KeyCode::Char('d') | KeyCode::Delete => self.trash_current_mail(),
             KeyCode::Up | KeyCode::Char('k') => self.outlook_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.outlook_move(1),
@@ -3151,6 +3161,34 @@ impl App {
         self.overlay = Some(Overlay::ViewImage { keys, sel: 0 });
     }
 
+    /// Cache keys (and alt text) of inline images in the open mail, skipping
+    /// remote tracking pixels that we never fetch.
+    pub fn reading_image_entries(&self) -> Vec<(String, String)> {
+        reading_mail_image_entries(&self.outlook.reading_images)
+    }
+
+    fn reading_image_keys(&self) -> Vec<String> {
+        self.reading_image_entries()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    fn open_mail_images(&mut self) {
+        if self.graphics.is_none() {
+            self.status = "this terminal cannot display images".into();
+            return;
+        }
+        if self.reading_image_keys().is_empty() {
+            self.status = "no images in this message".into();
+            return;
+        }
+        self.overlay = Some(Overlay::MailImages {
+            scroll: 0,
+            fullscreen: None,
+        });
+    }
+
     fn fetch_mail_images(&mut self) {
         if self.graphics.is_none() {
             return;
@@ -3276,6 +3314,18 @@ impl App {
                     return;
                 }
             }
+            if let Some(Overlay::MailImages {
+                fullscreen: Some(_),
+                scroll,
+            }) = &self.overlay
+            {
+                let scroll = *scroll;
+                self.overlay = Some(Overlay::MailImages {
+                    scroll,
+                    fullscreen: None,
+                });
+                return;
+            }
             self.overlay = None;
             return;
         }
@@ -3329,6 +3379,9 @@ impl App {
                 }
                 _ => self.overlay = Some(Overlay::Links),
             },
+            Some(Overlay::MailImages { scroll, fullscreen }) => {
+                self.on_key_mail_images(key, scroll, fullscreen);
+            }
             Some(Overlay::Presence) => match key.code {
                 KeyCode::Char(c @ '1'..='6') => {
                     let idx = (c as u8 - b'1') as usize;
@@ -3488,6 +3541,62 @@ impl App {
                 _ => self.overlay = Some(Overlay::MoveMail { sel }),
             },
             None => {}
+        }
+    }
+
+    fn on_key_mail_images(&mut self, key: KeyEvent, mut scroll: u16, fullscreen: Option<usize>) {
+        let keys = self.reading_image_keys();
+        let n = keys.len();
+        let put = |scroll, fullscreen| Overlay::MailImages { scroll, fullscreen };
+        if let Some(sel) = fullscreen {
+            match key.code {
+                KeyCode::Char(c @ '1'..='9') => {
+                    let idx = (c as u8 - b'1') as usize;
+                    self.overlay = Some(put(scroll, if idx < n { Some(idx) } else { Some(sel) }));
+                }
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('l') | KeyCode::Right => {
+                    let sel = if n == 0 { 0 } else { (sel + 1) % n };
+                    self.overlay = Some(put(scroll, Some(sel)));
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('h') | KeyCode::Left => {
+                    let sel = if n == 0 { 0 } else { (sel + n - 1) % n };
+                    self.overlay = Some(put(scroll, Some(sel)));
+                }
+                _ => self.overlay = Some(put(scroll, Some(sel))),
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = (c as u8 - b'1') as usize;
+                self.overlay = Some(put(scroll, if idx < n { Some(idx) } else { None }));
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                scroll = scroll.saturating_add(1).min(self.images_max_scroll.get());
+                self.overlay = Some(put(scroll, None));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                scroll = scroll.saturating_sub(1);
+                self.overlay = Some(put(scroll, None));
+            }
+            KeyCode::PageDown => {
+                scroll = scroll.saturating_add(10).min(self.images_max_scroll.get());
+                self.overlay = Some(put(scroll, None));
+            }
+            KeyCode::PageUp => {
+                scroll = scroll.saturating_sub(10);
+                self.overlay = Some(put(scroll, None));
+            }
+            KeyCode::Home | KeyCode::Char('g') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.overlay = Some(put(0, None));
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.overlay = Some(put(self.images_max_scroll.get(), None));
+            }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.overlay = Some(put(self.images_max_scroll.get(), None));
+            }
+            _ => self.overlay = Some(put(scroll, None)),
         }
     }
 
@@ -4156,6 +4265,19 @@ pub(crate) fn mail_image_is_local(src: &str) -> bool {
         || graph_attachment_path(src).is_some()
 }
 
+pub(crate) fn reading_mail_image_entries(images: &[MailBodyImage]) -> Vec<(String, String)> {
+    images
+        .iter()
+        .filter(|img| mail_image_is_local(&img.image.src))
+        .map(|img| {
+            (
+                crate::termimg::mail_cache_key(&img.message_id, &img.image.src),
+                img.image.alt.clone(),
+            )
+        })
+        .collect()
+}
+
 fn render_mail_body(message: &MailMessage) -> content::RenderedBody {
     let (content_type, raw) = match &message.body {
         Some(body) => (
@@ -4304,8 +4426,9 @@ mod tests {
         folder_panel_height, folder_panel_width, format_compose_file, graph_attachment_path,
         mail_content_id, mail_image_is_local, mail_row_indices, mail_row_unread, mail_thread_size,
         merge_newest_first, next_field, normalize_content_id, parse_compose_file, parse_recipients,
-        recipient_token, resize_panel_extent, step, Compose, ComposeKind, MailContact,
-        COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY, COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO,
+        reading_mail_image_entries, recipient_token, resize_panel_extent, step, Compose,
+        ComposeKind, MailBodyImage, MailContact, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY,
+        COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO,
     };
 
     #[test]
@@ -4486,6 +4609,27 @@ mod tests {
             .as_deref(),
             Some("me/messages/m/attachments/a/$value")
         );
+        let entries = reading_mail_image_entries(&[
+            MailBodyImage {
+                message_id: "m".into(),
+                image: crate::content::BodyImage {
+                    alt: "shot".into(),
+                    src: "cid:shot.png".into(),
+                    at_line: 0,
+                },
+            },
+            MailBodyImage {
+                message_id: "m".into(),
+                image: crate::content::BodyImage {
+                    alt: "pixel".into(),
+                    src: "https://example.com/pixel.gif".into(),
+                    at_line: 1,
+                },
+            },
+        ]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "shot");
+        assert!(entries[0].0.contains("cid:shot.png"));
         let att: m365_core::models::Attachment = serde_json::from_value(serde_json::json!({
             "id": "1",
             "name": "image001.png",

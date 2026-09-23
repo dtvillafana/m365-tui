@@ -16,6 +16,8 @@ pub const CONVO_IMAGE_ROWS: u16 = 8;
 pub const COMPOSER_IMAGE_ROWS: u16 = 5;
 /// Email reading pane is one message at a time; allow screenshots more room.
 pub const MAIL_IMAGE_ROWS: u16 = 24;
+/// Image gallery overlay: keep several previews on screen; 1-9 opens one full-size.
+pub const MAIL_PREVIEW_ROWS: u16 = 10;
 /// Profile photos sit beside an author name; two rows is enough to read a face
 /// without making the header taller than the message itself.
 pub const AVATAR_IMAGE_ROWS: u16 = 2;
