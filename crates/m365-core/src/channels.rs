@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::graph::GraphClient;
-use crate::hosted::{outgoing_payload, OutgoingBody};
+use crate::hosted::{outgoing_payload, update_payload, OutgoingBody};
 use crate::models::{Channel, ChatMessage, Team};
 
 /// Teams the signed-in user has joined.
@@ -74,6 +74,28 @@ pub async fn set_reaction(
             &json!({ "reactionType": emoji }),
         )
         .await
+}
+
+/// Replace the body of an existing channel message. Replies use the nested
+/// `/replies/{id}` path; Graph 403s without `ChannelMessage.ReadWrite`.
+pub async fn update_message(
+    graph: &GraphClient,
+    team_id: &str,
+    channel_id: &str,
+    original: &ChatMessage,
+    body: OutgoingBody<'_>,
+) -> Result<()> {
+    let path = match original.reply_to_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(parent) => format!(
+            "teams/{team_id}/channels/{channel_id}/messages/{parent}/replies/{}",
+            original.id
+        ),
+        None => format!(
+            "teams/{team_id}/channels/{channel_id}/messages/{}",
+            original.id
+        ),
+    };
+    graph.patch(&path, &update_payload(original, body)).await
 }
 
 /// Post a message to a channel — plain text, or HTML with inline images.

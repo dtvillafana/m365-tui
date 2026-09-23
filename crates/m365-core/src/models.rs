@@ -304,6 +304,8 @@ pub struct ChatMessage {
     #[serde(default)]
     pub created_date_time: Option<String>,
     #[serde(default)]
+    pub last_edited_date_time: Option<String>,
+    #[serde(default)]
     pub from: Option<IdentitySet>,
     #[serde(default)]
     pub body: Option<ItemBody>,
@@ -311,6 +313,9 @@ pub struct ChatMessage {
     pub message_type: Option<String>,
     #[serde(default)]
     pub deleted_date_time: Option<String>,
+    /// Parent message id when this is a channel reply. Unused in chats.
+    #[serde(default)]
+    pub reply_to_id: Option<String>,
     #[serde(default)]
     pub reactions: Vec<MessageReaction>,
     #[serde(default)]
@@ -421,6 +426,107 @@ impl ChatMessage {
             Some(out)
         }
     }
+
+    /// Whether this message has been edited after sending.
+    pub fn was_edited(&self) -> bool {
+        self.last_edited_date_time
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+    }
+
+    /// The signed-in user can edit their own, still-present chat messages.
+    pub fn can_edit(&self, my_user_id: Option<&str>) -> bool {
+        let Some(me) = my_user_id.filter(|id| !id.is_empty()) else {
+            return false;
+        };
+        self.deleted_date_time.is_none()
+            && self.author_id() == Some(me)
+            && self.message_type.as_deref().unwrap_or("message") == "message"
+    }
+
+    /// Body text for the composer: HTML tags stripped, `<br>`/`</p>` as newlines.
+    pub fn editable_text(&self) -> String {
+        html_to_editable(&self.text())
+    }
+}
+
+/// Convert a Teams HTML body into the plain text a user would retype.
+fn html_to_editable(html: &str) -> String {
+    let chars: Vec<char> = html.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '<' => {
+                i += 1;
+                let tag_start = i;
+                while i < chars.len() && chars[i] != '>' {
+                    i += 1;
+                }
+                let tag: String = chars[tag_start..i].iter().collect();
+                if i < chars.len() {
+                    i += 1;
+                }
+                let trimmed = tag.trim();
+                let is_close = trimmed.starts_with('/');
+                let name = trimmed
+                    .trim_start_matches('/')
+                    .split(|c: char| c.is_whitespace() || c == '/')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let block_end = is_close
+                    && matches!(
+                        name.as_str(),
+                        "p" | "div"
+                            | "li"
+                            | "tr"
+                            | "h1"
+                            | "h2"
+                            | "h3"
+                            | "h4"
+                            | "h5"
+                            | "h6"
+                            | "blockquote"
+                    );
+                if (name == "br" || block_end) && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            '&' => {
+                let rest: String = chars[i..].iter().take(10).collect();
+                let (ch, skip) = if rest.starts_with("&amp;") {
+                    ('&', 5)
+                } else if rest.starts_with("&lt;") {
+                    ('<', 4)
+                } else if rest.starts_with("&gt;") {
+                    ('>', 4)
+                } else if rest.starts_with("&quot;") {
+                    ('"', 6)
+                } else if rest.starts_with("&#39;") {
+                    ('\'', 5)
+                } else if rest.starts_with("&apos;") {
+                    ('\'', 6)
+                } else if rest.starts_with("&nbsp;") {
+                    (' ', 6)
+                } else {
+                    ('&', 1)
+                };
+                out.push(ch);
+                i += skip;
+            }
+            _ => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    out.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -505,19 +611,22 @@ impl Attachment {
 
 /// Something attached to a Teams message: a shared file, or — for a reply —
 /// a `messageReference` pointing at the message being answered.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Serialize` is needed so an edit can send the existing attachments back:
+/// Graph `PATCH` treats omitted fields as cleared, which would drop the quote.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageAttachment {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
     /// For `messageReference`, a JSON *string* describing the quoted message.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 }
 
@@ -599,5 +708,46 @@ mod tests {
         .unwrap();
         assert_eq!(m.text_preview(100), "one two three");
         assert_eq!(m.text_preview(5).chars().count(), 6); // 5 + the ellipsis
+    }
+
+    #[test]
+    fn editable_text_keeps_line_breaks_and_drops_quote_markup() {
+        let m = reply_message();
+        assert_eq!(m.editable_text(), "Confirma por favor");
+
+        let html: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "body": {
+                "contentType": "html",
+                "content": "<p>one</p><p>two &amp; three<br>four</p><img alt=\"x\" src=\"../hostedContents/1/$value\">"
+            }
+        }))
+        .unwrap();
+        assert_eq!(html.editable_text(), "one\ntwo & three\nfour");
+    }
+
+    #[test]
+    fn only_the_author_can_edit_a_live_message() {
+        let mut m = reply_message();
+        m.from = Some(IdentitySet {
+            user: Some(Identity {
+                id: Some("me".into()),
+                display_name: Some("Me".into()),
+            }),
+            application: None,
+        });
+        assert!(m.can_edit(Some("me")));
+        assert!(!m.can_edit(Some("other")));
+        assert!(!m.can_edit(None));
+        m.deleted_date_time = Some("2026-08-04T16:00:00Z".into());
+        assert!(!m.can_edit(Some("me")));
+    }
+
+    #[test]
+    fn edited_flag_follows_last_edited_date_time() {
+        let mut m = reply_message();
+        assert!(!m.was_edited());
+        m.last_edited_date_time = Some("2026-08-04T16:00:00Z".into());
+        assert!(m.was_edited());
     }
 }

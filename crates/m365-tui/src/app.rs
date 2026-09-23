@@ -516,6 +516,8 @@ pub struct TeamsState {
     pub unseen: usize,
     /// Index of the message being replied to, while composing a reply.
     pub replying_to: Option<usize>,
+    /// Id of the message being edited, while composing a replacement.
+    pub editing: Option<String>,
     pub open_chat_id: Option<String>,
     pub open_channel: Option<(String, String)>,
     pub composer: TextInput,
@@ -549,6 +551,7 @@ impl Default for TeamsState {
             loading_more: false,
             unseen: 0,
             replying_to: None,
+            editing: None,
             open_chat_id: None,
             open_channel: None,
             composer: TextInput::new(),
@@ -1247,6 +1250,7 @@ impl App {
             AppMessage::TeamsSent(s) => {
                 self.teams.sending = false;
                 self.teams.pending_restore = None;
+                self.teams.editing = None;
                 self.status = s;
                 self.refresh_current();
             }
@@ -2587,6 +2591,12 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.teams.replying_to = None;
+                    if self.teams.editing.take().is_some() {
+                        self.teams.composer.clear();
+                        self.teams.images.clear();
+                        self.teams.composer_previews.clear();
+                        self.status = "edit cancelled".into();
+                    }
                     self.teams.focus = TeamsFocus::Messages;
                 }
                 KeyCode::Tab => {
@@ -2605,6 +2615,13 @@ impl App {
                     self.teams.composer.insert('\n')
                 }
                 KeyCode::Enter => self.teams_send(),
+                KeyCode::Up
+                    if self.teams.editing.is_none()
+                        && self.teams.composer.is_empty()
+                        && self.teams.images.is_empty() =>
+                {
+                    self.teams_edit_last_own();
+                }
                 KeyCode::Up => self.teams.composer.move_row(-1, self.text_width_hint.get()),
                 KeyCode::Down => self.teams.composer.move_row(1, self.text_width_hint.get()),
                 KeyCode::Backspace => self.teams.composer.backspace(),
@@ -2666,8 +2683,21 @@ impl App {
             KeyCode::Char('r')
                 if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
             {
+                self.teams.editing = None;
                 self.teams.replying_to = Some(self.teams.msg_sel);
                 self.teams.focus = TeamsFocus::Composer;
+            }
+            KeyCode::Char('E')
+                if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
+            {
+                self.teams_edit_selected();
+            }
+            KeyCode::Char('e')
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.teams.focus == TeamsFocus::Messages
+                    && !self.teams.messages.is_empty() =>
+            {
+                self.teams_edit_selected();
             }
             KeyCode::Char('e')
                 if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
@@ -2813,6 +2843,7 @@ impl App {
                     self.teams.loading_more = false;
                     self.teams.unseen = 0;
                     self.teams.replying_to = None;
+                    self.teams.editing = None;
                     self.load_chat_messages(id, ListUpdate::Replace);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -2839,6 +2870,7 @@ impl App {
                     self.teams.loading_more = false;
                     self.teams.unseen = 0;
                     self.teams.replying_to = None;
+                    self.teams.editing = None;
                     self.load_channel_messages(team_id, ch_id, ListUpdate::Replace);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -2871,12 +2903,18 @@ impl App {
         self.teams.images.clear();
         self.teams.composer_previews.clear();
         self.teams.sending = true;
+        let editing = self.teams.editing.clone();
         let replying_to = self.teams.replying_to.take();
         self.status = match n_images {
             0 => "sending…".into(),
             1 => "sending image…".into(),
             n => format!("sending {n} images…"),
         };
+
+        if let Some(id) = editing {
+            self.teams_update(id, prepared);
+            return;
+        }
 
         match (replying_to, self.teams.mode) {
             // Replying in a chat: quote the original in the body, which is how
@@ -2938,6 +2976,97 @@ impl App {
                 }
             }
         }
+    }
+
+    fn teams_update(&mut self, id: String, prepared: crate::images::Prepared) {
+        let Some(original) = self.teams.messages.iter().find(|m| m.id == id).cloned() else {
+            self.restore_teams_composer();
+            self.status = "message to edit is no longer loaded".into();
+            return;
+        };
+        let s = self.session.clone();
+        self.status = "saving edit…".into();
+        match self.teams.mode {
+            TeamsMode::Chats => {
+                let Some(chat_id) = self.teams.open_chat_id.clone() else {
+                    self.restore_teams_composer();
+                    return;
+                };
+                self.spawn(async move {
+                    let body = prepared_body(&prepared);
+                    match chats::update_message(&s.graph, &chat_id, &original, body).await {
+                        Ok(()) => Ok(AppMessage::TeamsSent("message updated".into())),
+                        Err(e) => Ok(AppMessage::TeamsSendFailed(format!("{e:#}"))),
+                    }
+                });
+            }
+            TeamsMode::Channels => {
+                let Some((team_id, channel_id)) = self.teams.open_channel.clone() else {
+                    self.restore_teams_composer();
+                    return;
+                };
+                self.spawn(async move {
+                    let body = prepared_body(&prepared);
+                    match channels::update_message(&s.graph, &team_id, &channel_id, &original, body)
+                        .await
+                    {
+                        Ok(()) => Ok(AppMessage::TeamsSent("message updated".into())),
+                        Err(e) => Ok(AppMessage::TeamsSendFailed(format!("{e:#}"))),
+                    }
+                });
+            }
+        }
+    }
+
+    fn teams_edit_selected(&mut self) {
+        self.teams_edit_index(self.teams.msg_sel);
+    }
+
+    fn teams_edit_last_own(&mut self) {
+        let my_id = self.me.as_ref().map(|m| m.id.as_str());
+        let Some(idx) = self.teams.messages.iter().rposition(|m| m.can_edit(my_id)) else {
+            self.status = "no message of yours to edit".into();
+            return;
+        };
+        self.teams.msg_sel = idx;
+        self.teams_edit_index(idx);
+    }
+
+    fn teams_edit_index(&mut self, idx: usize) {
+        let Some(m) = self.teams.messages.get(idx) else {
+            return;
+        };
+        let my_id = self.me.as_ref().map(|u| u.id.as_str());
+        if my_id.is_none() {
+            self.status = "still loading your profile".into();
+            return;
+        }
+        if !m.can_edit(my_id) {
+            self.status = if m.deleted_date_time.is_some() {
+                "can't edit a deleted message".into()
+            } else if m.author_id() != my_id {
+                "you can only edit your own messages".into()
+            } else {
+                "can't edit this message".into()
+            };
+            return;
+        }
+        if self.teams.sending {
+            self.status = "already sending…".into();
+            return;
+        }
+        if self.teams.editing.is_none()
+            && (!self.teams.composer.is_empty() || !self.teams.images.is_empty())
+        {
+            self.status = "composer has unsent text — Esc first".into();
+            return;
+        }
+        let text = m.editable_text();
+        self.teams.editing = Some(m.id.clone());
+        self.teams.replying_to = None;
+        self.teams.composer = TextInput::from(text.as_str());
+        self.teams.focus = TeamsFocus::Composer;
+        self.status = "editing message — Enter to save · Esc to cancel".into();
     }
 
     fn restore_teams_composer(&mut self) {

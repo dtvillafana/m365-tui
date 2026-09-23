@@ -6,6 +6,7 @@
 
 use serde_json::{json, Value};
 
+use crate::models::ChatMessage;
 use crate::util::{base64_encode, html_escape};
 
 /// Raw bytes plus the MIME type Graph should store. The TUI validates these
@@ -88,6 +89,66 @@ pub fn images_of(body: OutgoingBody<'_>) -> &[HostedImage] {
     }
 }
 
+/// JSON body for `PATCH …/messages/{id}`.
+///
+/// Graph treats omitted fields as cleared, so existing attachments (the quote
+/// on a chat reply) and `<img>` tags have to go back with the new text.
+pub fn update_payload(original: &ChatMessage, body: OutgoingBody<'_>) -> Value {
+    let quote_id = original
+        .quoted()
+        .map(|q| q.message_id)
+        .filter(|id| !id.is_empty());
+    let retained = retained_img_html(&original.text());
+    let images = images_of(body);
+    let needs_html = quote_id.is_some()
+        || !retained.is_empty()
+        || !images.is_empty()
+        || matches!(body, OutgoingBody::Html { .. });
+
+    if !needs_html {
+        return outgoing_payload(body);
+    }
+
+    let inner = body.inner_html();
+    let mut content = String::new();
+    if let Some(id) = &quote_id {
+        content.push_str(&format!("<attachment id=\"{id}\"></attachment>"));
+    }
+    if !inner.is_empty() {
+        content.push_str(&format!("<p>{inner}</p>"));
+    }
+    content.push_str(&retained);
+
+    let mut payload = json!({
+        "body": {
+            "contentType": "html",
+            "content": content,
+        }
+    });
+    if !original.attachments.is_empty() {
+        payload["attachments"] =
+            serde_json::to_value(&original.attachments).expect("attachments are serializable");
+    }
+    with_hosted_contents(payload, images)
+}
+
+/// Existing `<img>` tags in a body, kept so a text edit does not drop images.
+fn retained_img_html(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("<img") {
+        let start = from + rel;
+        let Some(rel_end) = html[start..].find('>') else {
+            break;
+        };
+        let end = start + rel_end + 1;
+        out.push_str(&html[start..end]);
+        from = end;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +204,55 @@ mod tests {
             images: std::slice::from_ref(&img),
         });
         assert_eq!(v["hostedContents"].as_array().unwrap().len(), 1);
+    }
+
+    fn reply_message() -> crate::models::ChatMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": "1785859178276",
+            "body": {
+                "contentType": "html",
+                "content": "<attachment id=\"1785858892876\"></attachment><p>old</p><img alt=\"shot.png\" src=\"../hostedContents/1/$value\">"
+            },
+            "attachments": [{
+                "id": "1785858892876",
+                "contentType": "messageReference",
+                "content": "{\"messageId\":\"1785858892876\",\"messagePreview\":\"Sounds good\",\"messageSender\":{\"user\":{\"displayName\":\"Alex\"}}}"
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn edit_keeps_the_quote_attachment_and_existing_images() {
+        let original = reply_message();
+        let v = update_payload(&original, OutgoingBody::Text("new text"));
+        let content = v["body"]["content"].as_str().unwrap();
+        assert!(
+            content.contains("<attachment id=\"1785858892876\"></attachment>"),
+            "quote tag missing: {content}"
+        );
+        assert!(
+            content.contains("<p>new text</p>"),
+            "new body missing: {content}"
+        );
+        assert!(
+            content.contains("<img alt=\"shot.png\" src=\"../hostedContents/1/$value\">"),
+            "existing image dropped: {content}"
+        );
+        assert_eq!(v["attachments"][0]["contentType"], "messageReference");
+        assert_eq!(v["attachments"][0]["id"], "1785858892876");
+    }
+
+    #[test]
+    fn plain_edit_stays_plain_text() {
+        let original: crate::models::ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "body": { "contentType": "text", "content": "hello" }
+        }))
+        .unwrap();
+        let v = update_payload(&original, OutgoingBody::Text("hello world"));
+        assert_eq!(v["body"]["contentType"], "text");
+        assert_eq!(v["body"]["content"], "hello world");
+        assert!(v.get("attachments").is_none());
     }
 }

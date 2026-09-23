@@ -187,6 +187,19 @@ the line that would otherwise carry it.
 Sending falls back to a plain `<blockquote>` if a tenant rejects the reference
 attachment, so a reply is never lost to a failed post.
 
+### Edits
+
+A message is updated in place (`PATCH …/messages/{id}`). Graph treats omitted
+fields as cleared, so the quote attachment on a chat reply has to go back with
+the new body — otherwise the edit would silently un-thread it. Existing `<img>`
+tags are kept for the same reason.
+
+Only the sender can edit. `E` on a selected message of yours opens the composer
+on its text; `Up` in an empty composer edits the last one, the way other chat
+clients do. Channel edits need `ChannelMessage.ReadWrite`, which is not in the
+default scope set (see [Authentication](#authentication)); chat edits work with
+`Chat.ReadWrite`.
+
 ### Inline images
 
 Graph has no “attach this file to a chat message” upload. Images are sent as

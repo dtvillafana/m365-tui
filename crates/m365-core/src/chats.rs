@@ -4,7 +4,9 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::graph::{DeltaPage, GraphClient};
-use crate::hosted::{images_of, outgoing_payload, with_hosted_contents, OutgoingBody};
+use crate::hosted::{
+    images_of, outgoing_payload, update_payload, with_hosted_contents, OutgoingBody,
+};
 use crate::models::{Chat, ChatMessage};
 use crate::util::html_escape;
 
@@ -136,6 +138,22 @@ pub async fn send_reply(
                 .await
         }
     }
+}
+
+/// Replace the body of an existing chat message. Graph treats omitted fields
+/// as cleared, so the original is passed through to keep quote attachments.
+pub async fn update_message(
+    graph: &GraphClient,
+    chat_id: &str,
+    original: &ChatMessage,
+    body: OutgoingBody<'_>,
+) -> Result<()> {
+    graph
+        .patch(
+            &format!("chats/{chat_id}/messages/{}", original.id),
+            &update_payload(original, body),
+        )
+        .await
 }
 
 /// React to a chat message with an emoji (unicode, e.g. "👍").

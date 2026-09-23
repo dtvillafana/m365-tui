@@ -221,7 +221,10 @@ fn context_hints(app: &App) -> &'static str {
         },
         Screen::Teams => match app.teams.focus {
             TeamsFocus::List => "j/k move · g/G · l open · t chats/channels",
-            TeamsFocus::Messages => "j/k select · g/G · h back · r reply · e react · v image",
+            TeamsFocus::Messages => {
+                "j/k select · g/G · h back · r reply · E edit · e react · v image"
+            }
+            TeamsFocus::Composer if app.teams.editing.is_some() => "Enter save · Esc cancel",
             TeamsFocus::Composer => "Enter send · Ctrl+V image · @path Tab · Esc leave",
         },
     }
@@ -762,6 +765,15 @@ fn conversation_flow(app: &App, selectable: bool) -> (Vec<FlowItem>, Vec<usize>)
                 Span::styled(reactions, Style::default().fg(DIM)),
             ])));
         }
+        if m.was_edited() {
+            flow.push(FlowItem::Line(Line::from(vec![
+                Span::raw(gutter.clone()),
+                Span::styled(
+                    "edited",
+                    Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+                ),
+            ])));
+        }
         prev = Some((author, when));
     }
     (flow, starts)
@@ -977,8 +989,8 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     // pinned date header, and a couple of message rows on small terminals.
     let composer_width = cols[1].width.saturating_sub(2).max(1) as usize;
     let composer_rows = app.teams.composer.wrap(composer_width).len().clamp(1, 6) as u16;
-    // One extra row while a reply is being composed, for the quoted banner.
-    let reply_row = u16::from(app.teams.replying_to.is_some());
+    // One extra row while a reply or edit is in progress, for the banner.
+    let reply_row = u16::from(app.teams.replying_to.is_some() || app.teams.editing.is_some());
     let preview_h = composer_preview_height(app, composer_width as u16);
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -1041,7 +1053,9 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     render_display_rows(f, pane[1], &rows, scroll, app);
 
     let composing = app.teams.focus == TeamsFocus::Composer;
-    let title = if composing {
+    let title = if composing && app.teams.editing.is_some() {
+        "Message (Enter save · Esc cancel)"
+    } else if composing {
         "Message (Enter send · Ctrl+V image · @path Tab)"
     } else {
         "Message"
@@ -1050,8 +1064,25 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     let mut composer_inner = composer_block.inner(right[1]);
     f.render_widget(composer_block, right[1]);
 
-    // Show what's being replied to, so the quote isn't a surprise on send.
-    if let Some(idx) = app.teams.replying_to {
+    // Show what's being replied to or edited, so Enter isn't a surprise.
+    if app.teams.editing.is_some() {
+        let banner = Rect {
+            height: 1,
+            ..composer_inner
+        };
+        composer_inner = Rect {
+            y: composer_inner.y + 1,
+            height: composer_inner.height.saturating_sub(1),
+            ..composer_inner
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                "┃ editing message",
+                Style::default().fg(ACCENT),
+            )])),
+            banner,
+        );
+    } else if let Some(idx) = app.teams.replying_to {
         let banner = Rect {
             height: 1,
             ..composer_inner
@@ -1381,8 +1412,8 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
           folders pane / finds a folder · reading pane j/k scroll · g/G\n\
  \n\
  Teams:   t chats/channels · j/k select message · g oldest · G newest · e react · v full image\n\
-          i type · r reply · Enter send · Ctrl+V paste image\n\
-          @path Tab complete image · Ctrl+X remove last image\n\
+          i type · r reply · E edit (Up in empty composer = last of yours) · Enter send\n\
+          Ctrl+V paste image · @path Tab complete image · Ctrl+X remove last image\n\
  \n\
  Compose: To/Cc/Bcc autocomplete from seen mail · ↑/↓ + Tab/Enter choose\n\
           Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\

@@ -207,7 +207,7 @@ Press `?` in the app for this list at any time.
 | **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · `g`/`G` top/bottom · `Shift+H`/`Shift+L` resize Outlook folders · arrows work the same · `Tab` cycles |
 | **Outlook** | `Enter` open · `t` threads/individual messages · `c` compose · `r` reply · `a` reply-all · `f` forward · `u` read/unread · `m` move folder · `d` trash · `/` search mail · folders pane `/` find folder · `e` calendar |
 | **Reading a mail** | `j`/`k` scroll · `g`/`G` or `Home`/`End` · `h` back to the list |
-| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` oldest · `G` newest · `e` react · `v` full image · `r` reply · `i` write · `Enter` send · `Ctrl+V` paste image · `@path` `Tab` complete |
+| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` oldest · `G` newest · `e` react · `v` full image · `r` reply · `E` edit · `i` write · `Enter` send · `Ctrl+V` paste image · `@path` `Tab` complete |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
