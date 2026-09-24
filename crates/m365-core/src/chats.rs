@@ -20,6 +20,24 @@ pub async fn list_chats(graph: &GraphClient, top: u32) -> Result<Vec<Chat>> {
     graph.get_page(&path).await
 }
 
+pub fn looks_like_user_guid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 if byte == b'-' => {}
+            8 | 13 | 18 | 23 => return false,
+            _ if byte.is_ascii_hexdigit() => {}
+            _ => return false,
+        }
+    }
+
+    true
+}
+
 /// List the first page of messages in a chat, newest first. Also returns the
 /// `@odata.nextLink` for fetching older messages, if there are any.
 pub async fn list_messages(

@@ -40,7 +40,7 @@ pub struct Recipient {
     pub email_address: Option<EmailAddress>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemBody {
     #[serde(default)]
@@ -144,6 +144,15 @@ pub struct Attendee {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ResponseStatus {
+    #[serde(default)]
+    pub response: Option<String>,
+    #[serde(default)]
+    pub time: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Event {
     pub id: String,
     #[serde(default)]
@@ -164,6 +173,16 @@ pub struct Event {
     pub online_meeting: Option<OnlineMeetingInfo>,
     #[serde(default)]
     pub body_preview: Option<String>,
+    #[serde(default)]
+    pub response_status: Option<ResponseStatus>,
+    #[serde(default)]
+    pub is_organizer: Option<bool>,
+    #[serde(default)]
+    pub is_cancelled: Option<bool>,
+    #[serde(default)]
+    pub is_all_day: Option<bool>,
+    #[serde(default)]
+    pub response_requested: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,6 +211,8 @@ pub struct Chat {
     pub topic: Option<String>,
     #[serde(default)]
     pub chat_type: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     #[serde(default)]
     pub last_updated_date_time: Option<String>,
     #[serde(default)]
@@ -227,12 +248,16 @@ impl Chat {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationMember {
+    #[serde(rename = "@odata.type", default)]
+    pub odata_type: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
     pub user_id: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     #[serde(default)]
     pub email: Option<String>,
 }
@@ -251,7 +276,7 @@ pub struct LastMessagePreview {
 }
 
 /// An `@mention` inside a Teams message.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessageMention {
     #[serde(default)]
@@ -278,7 +303,7 @@ pub struct Channel {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentitySet {
     #[serde(default)]
@@ -287,17 +312,21 @@ pub struct IdentitySet {
     pub application: Option<Identity>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Identity {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub user_identity_type: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 /// A Teams `chatMessage` (channel or chat).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub id: String,
@@ -311,6 +340,9 @@ pub struct ChatMessage {
     pub body: Option<ItemBody>,
     #[serde(default)]
     pub message_type: Option<String>,
+    /// Raw Microsoft Graph details for a `systemEventMessage`.
+    #[serde(default)]
+    pub event_detail: Option<serde_json::Value>,
     #[serde(default)]
     pub deleted_date_time: Option<String>,
     /// Parent message id when this is a channel reply. Unused in chats.
@@ -324,7 +356,7 @@ pub struct ChatMessage {
     pub mentions: Vec<ChatMessageMention>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageReaction {
     #[serde(default)]
@@ -733,6 +765,8 @@ mod tests {
             user: Some(Identity {
                 id: Some("me".into()),
                 display_name: Some("Me".into()),
+                user_identity_type: None,
+                tenant_id: None,
             }),
             application: None,
         });

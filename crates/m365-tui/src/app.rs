@@ -43,6 +43,13 @@ pub enum AppMessage {
         truncated: bool,
     },
     Calendar(Vec<CalEvent>),
+    CalendarReminders(Vec<CalEvent>),
+    ChatCacheWarmed {
+        chat_id: String,
+        messages: Vec<ChatMessage>,
+    },
+    DiagnosticsLoaded(crate::diagnostics::DiagnosticsRemote),
+    ContactDiagnosticsLoaded(crate::diagnostics::ContactDiagnosticsRemote),
     Chats(Vec<Chat>),
     PeopleSearch {
         query: String,
@@ -118,6 +125,7 @@ pub enum AppMessage {
 pub enum Screen {
     Outlook,
     Teams,
+    Calendar,
 }
 
 /// Which kind of reply the user asked for.
@@ -170,7 +178,9 @@ pub enum Overlay {
         loading: bool,
     },
     Compose(Compose),
-    Calendar,
+    CalendarEvent,
+    Diagnostics,
+    ContactDiagnostics,
     /// Emoji reaction picker for the selected Teams message.
     React,
     /// Full-terminal view of an image in the selected Teams message.
@@ -219,6 +229,10 @@ const STATUS_TICKS_TO_LIVE: u32 = 5;
 /// How many items to fetch per page — mail messages and Teams messages alike.
 /// Scrolling to the end of a list pulls the next page of this size.
 pub const PAGE_SIZE: u32 = 50;
+const DEFAULT_CALENDAR_DAYS: i64 = 30;
+const CALENDAR_RANGES: &[i64] = &[7, 14, 30, 60, 90, 180, 365];
+const CALENDAR_MONTH_MIN_WIDTH: u16 = 68;
+const CALENDAR_MONTH_MIN_HEIGHT: u16 = 23;
 
 /// Wait this long after the selection settles before fetching a mail body or
 /// thread, so moving through the list does not fire a Graph call per row.
@@ -441,6 +455,32 @@ impl Compose {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CalendarView {
+    Agenda,
+    Month,
+}
+
+pub struct CalendarState {
+    pub events: Vec<CalEvent>,
+    pub selected: usize,
+    pub days: i64,
+    pub view: CalendarView,
+    pub month_offset: i32,
+}
+
+impl Default for CalendarState {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            selected: 0,
+            days: DEFAULT_CALENDAR_DAYS,
+            view: CalendarView::Agenda,
+            month_offset: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MailContact {
     pub name: Option<String>,
@@ -486,7 +526,6 @@ pub struct OutlookState {
     mail_fetch_generation: u64,
     /// Line scroll offset of the reading pane.
     pub reading_scroll: u16,
-    pub calendar: Vec<CalEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -529,6 +568,9 @@ pub struct TeamsState {
     /// Id of the message being edited, while composing a replacement.
     pub editing: Option<String>,
     pub open_chat_id: Option<String>,
+    /// Cache-only preview while moving through the chat list; not marked read.
+    pub preview_chat_id: Option<String>,
+    pub last_chat_id: Option<String>,
     pub open_channel: Option<(String, String)>,
     pub composer: TextInput,
     /// Clipboard / data-URI images staged for the next send.
@@ -563,6 +605,8 @@ impl Default for TeamsState {
             replying_to: None,
             editing: None,
             open_chat_id: None,
+            preview_chat_id: None,
+            last_chat_id: None,
             open_channel: None,
             composer: TextInput::new(),
             images: Vec::new(),
@@ -581,6 +625,7 @@ pub struct App {
     pub outlook: OutlookState,
     pub outlook_focus: OutlookFocus,
     pub teams: TeamsState,
+    pub calendar: CalendarState,
     pub overlay: Option<Overlay>,
     pub status: String,
     pub me: Option<User>,
@@ -635,12 +680,29 @@ pub struct App {
     pub image_failed: std::collections::HashSet<String>,
     /// Contacts learned only from mail already loaded during this session.
     mail_contacts: std::collections::BTreeMap<String, MailContact>,
+    pub diagnostics: crate::diagnostics::DiagnosticsState,
+    pub diagnostics_scroll: u16,
+    pub diagnostics_max_scroll: std::cell::Cell<u16>,
+    pub contact_diagnostics: crate::diagnostics::ContactDiagnosticsState,
+    pub contact_diagnostics_scroll: u16,
+    pub contact_diagnostics_max_scroll: std::cell::Cell<u16>,
+    contact_diagnostics_mri: Option<String>,
+    contact_diagnostics_lookup: Option<String>,
+    contact_diagnostics_probe_id: Option<String>,
+    contact_diagnostics_personal: bool,
+    calendar_reminder_events: Vec<CalEvent>,
+    calendar_reminder_fired: std::collections::HashSet<String>,
+    calendar_reminder_last_refresh: Option<std::time::Instant>,
+    last_poll: Option<std::time::Instant>,
+    chat_cache_warmup_started: bool,
+    contact_user_ids: std::collections::HashMap<String, String>,
 }
 
 /// Palette command identifiers.
 const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("outlook", "Switch to Outlook"),
     ("teams", "Switch to Teams"),
+    ("calendar", "Switch to Calendar"),
     ("compose", "Compose new mail"),
     ("reply", "Reply to the selected mail"),
     ("reply-all", "Reply-all to the selected mail"),
@@ -650,7 +712,6 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("trash", "Move the selected mail to Deleted Items"),
     ("layout", "Toggle horizontal/vertical pane layout"),
     ("threads", "Toggle mail threads/individual messages"),
-    ("calendar", "Open calendar (today)"),
     ("chat-sender", "Teams: chat with selected email's sender"),
     ("new-chat", "Teams: find a person and start a chat"),
     ("refresh", "Refresh current view"),
@@ -658,6 +719,95 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("settings", "Open settings"),
     ("quit", "Quit"),
 ];
+
+fn calendar_month_first(offset: i32) -> chrono::NaiveDate {
+    let today = chrono::Local::now().date_naive();
+    let month_index =
+        chrono::Datelike::year(&today) * 12 + chrono::Datelike::month0(&today) as i32 + offset;
+    let year = month_index.div_euclid(12);
+    let month = month_index.rem_euclid(12) as u32 + 1;
+    chrono::NaiveDate::from_ymd_opt(year, month, 1).expect("valid calendar month")
+}
+
+fn calendar_state_local_datetime(
+    value: &m365_core::models::DateTimeTimeZone,
+) -> Option<chrono::DateTime<chrono::Local>> {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&value.date_time) {
+        return Some(parsed.with_timezone(&chrono::Local));
+    }
+
+    let naive = chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S"))
+        .ok()?;
+
+    Some(
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+            .with_timezone(&chrono::Local),
+    )
+}
+
+fn calendar_reminder_threshold_minutes(seconds_until: i64) -> Option<u16> {
+    match seconds_until {
+        1..=300 => Some(5),
+        301..=900 => Some(15),
+        _ => None,
+    }
+}
+
+fn calendar_event_reminder(
+    event: &CalEvent,
+    now: &chrono::DateTime<chrono::Local>,
+) -> Option<(u16, chrono::DateTime<chrono::Local>)> {
+    if event.is_cancelled.unwrap_or(false) || event.is_all_day.unwrap_or(false) {
+        return None;
+    }
+    if event
+        .response_status
+        .as_ref()
+        .and_then(|status| status.response.as_deref())
+        .is_some_and(|response| response.eq_ignore_ascii_case("declined"))
+    {
+        return None;
+    }
+
+    let start = event
+        .start
+        .as_ref()
+        .and_then(calendar_state_local_datetime)?;
+    let seconds_until = start.signed_duration_since(*now).num_seconds();
+    let minutes = calendar_reminder_threshold_minutes(seconds_until)?;
+    Some((minutes, start))
+}
+
+fn calendar_state_event_dates(event: &CalEvent) -> Option<(chrono::NaiveDate, chrono::NaiveDate)> {
+    let start = event
+        .start
+        .as_ref()
+        .and_then(calendar_state_local_datetime)?;
+    let end = event.end.as_ref().and_then(calendar_state_local_datetime)?;
+    let start_date = start.date_naive();
+    let mut end_date = end.date_naive();
+
+    if end_date > start_date
+        && end.time() == chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("valid midnight")
+    {
+        end_date -= chrono::Duration::days(1);
+    }
+    if end_date < start_date {
+        end_date = start_date;
+    }
+
+    Some((start_date, end_date))
+}
+
+fn calendar_event_intersects_month(event: &CalEvent, month_offset: i32) -> bool {
+    let Some((event_start, event_end)) = calendar_state_event_dates(event) else {
+        return false;
+    };
+    let month_start = calendar_month_first(month_offset);
+    let next_month = calendar_month_first(month_offset + 1);
+    event_start < next_month && event_end >= month_start
+}
 
 impl App {
     pub fn new(session: Session, tx: mpsc::Sender<AppMessage>) -> Self {
@@ -668,6 +818,7 @@ impl App {
             outlook: OutlookState::default(),
             outlook_focus: OutlookFocus::Messages,
             teams: TeamsState::default(),
+            calendar: CalendarState::default(),
             overlay: None,
             status: "loading…".into(),
             me: None,
@@ -697,6 +848,22 @@ impl App {
             image_loading: std::collections::HashSet::new(),
             image_failed: std::collections::HashSet::new(),
             mail_contacts: std::collections::BTreeMap::new(),
+            diagnostics: crate::diagnostics::DiagnosticsState::default(),
+            diagnostics_scroll: 0,
+            diagnostics_max_scroll: std::cell::Cell::new(0),
+            contact_diagnostics: crate::diagnostics::ContactDiagnosticsState::default(),
+            contact_diagnostics_scroll: 0,
+            contact_diagnostics_max_scroll: std::cell::Cell::new(0),
+            contact_diagnostics_mri: None,
+            contact_diagnostics_lookup: None,
+            contact_diagnostics_probe_id: None,
+            contact_diagnostics_personal: false,
+            calendar_reminder_events: Vec::new(),
+            calendar_reminder_fired: std::collections::HashSet::new(),
+            calendar_reminder_last_refresh: None,
+            last_poll: None,
+            chat_cache_warmup_started: false,
+            contact_user_ids: std::collections::HashMap::new(),
         }
     }
 
@@ -740,6 +907,438 @@ impl App {
         self.load_presence();
         self.load_folders();
         self.load_chats();
+        self.refresh_calendar_reminders();
+        if self.screen == Screen::Calendar {
+            self.load_calendar();
+        }
+    }
+
+    pub fn poll_elapsed(&self) -> Duration {
+        self.last_poll
+            .map(|at| at.elapsed())
+            .unwrap_or(Duration::from_secs(0))
+    }
+
+    fn switch_screen(&mut self, screen: Screen) {
+        self.screen = screen;
+        match screen {
+            Screen::Calendar => self.load_calendar(),
+            Screen::Teams if self.teams.chats.is_empty() => self.load_chats(),
+            _ => {}
+        }
+    }
+
+    fn calendar_month_view_available() -> bool {
+        crossterm::terminal::size()
+            .ok()
+            .is_some_and(|(width, height)| {
+                width >= CALENDAR_MONTH_MIN_WIDTH && height >= CALENDAR_MONTH_MIN_HEIGHT
+            })
+    }
+
+    fn refresh_calendar_reminders_if_due(&mut self) {
+        let due = self
+            .calendar_reminder_last_refresh
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(60));
+        if due {
+            self.refresh_calendar_reminders();
+        }
+        self.check_calendar_reminders();
+    }
+
+    fn refresh_calendar_reminders(&mut self) {
+        if !self.session.config.calendar_notify.enabled() {
+            return;
+        }
+        self.calendar_reminder_last_refresh = Some(std::time::Instant::now());
+        let s = self.session.clone();
+        let start = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let end = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let start = start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let end = end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.spawn(async move {
+            Ok(AppMessage::CalendarReminders(
+                calendar::calendar_view(&s.graph, &start, &end).await?,
+            ))
+        });
+    }
+
+    fn check_calendar_reminders(&mut self) {
+        if !self.session.config.calendar_notify.enabled() {
+            return;
+        }
+        let now = chrono::Local::now();
+        let mut internal = Vec::new();
+        for event in &self.calendar_reminder_events {
+            let Some((minutes, start)) = calendar_event_reminder(event, &now) else {
+                continue;
+            };
+            let key = format!("{}:{minutes}", event.id);
+            if !self.calendar_reminder_fired.insert(key) {
+                continue;
+            }
+            let subject = event.subject.as_deref().unwrap_or("(no subject)");
+            let when = start.format("%H:%M");
+            let text = format!("{subject} in {minutes} min ({when})");
+            if self.session.config.calendar_notify.internal() {
+                internal.push(text.clone());
+            }
+            if self.session.config.calendar_notify.external() && self.session.config.notifications
+            {
+                crate::notify::send("Calendar", &text);
+            }
+        }
+        if let Some(first) = internal.first() {
+            self.status = if internal.len() == 1 {
+                format!("📅 {first}")
+            } else {
+                format!("📅 {first} (+{} more)", internal.len() - 1)
+            };
+        }
+    }
+
+    fn restore_teams_conversation_cache(&mut self, chat_id: &str) -> bool {
+        let Some(root) = self.session.config.teams_image_cache_dir.clone() else {
+            return false;
+        };
+        let Some(messages) = crate::teams_cache::load_conversation(&root, chat_id) else {
+            return false;
+        };
+        if messages.is_empty() {
+            return false;
+        }
+        self.set_teams_messages(messages, None, ListUpdate::Replace);
+        true
+    }
+
+    fn persist_teams_conversation_cache(&self, chat_id: &str, messages: &[ChatMessage]) {
+        let Some(root) = self.session.config.teams_image_cache_dir.clone() else {
+            return;
+        };
+        let messages = messages.to_vec();
+        let chat_id = chat_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = crate::teams_cache::store_conversation(&root, &chat_id, &messages)
+            {
+                tracing::debug!("could not persist Teams conversation cache: {error}");
+            }
+        });
+    }
+
+    fn preview_selected_teams_chat(&mut self) {
+        let Some(chat) = self.teams.chats.get(self.teams.chat_sel) else {
+            return;
+        };
+        let id = chat.id.clone();
+        self.teams.preview_chat_id = Some(id.clone());
+        self.teams.open_chat_id = None;
+        self.teams.open_channel = None;
+        self.teams.messages.clear();
+        self.teams.messages_rendered.clear();
+        self.teams.messages_links.clear();
+        self.teams.messages_images.clear();
+        self.teams.msg_sel = 0;
+        self.teams.messages_next = None;
+        self.teams.unseen = 0;
+        self.teams.replying_to = None;
+        self.teams.editing = None;
+        if self.restore_teams_conversation_cache(&id) {
+            self.status = "conversation preview · cached".into();
+        }
+    }
+
+    fn warm_teams_conversation_caches(&mut self, chats_list: &[Chat]) {
+        if self.chat_cache_warmup_started || !self.session.config.teams_cache_warmup {
+            return;
+        }
+        let Some(cache_root) = self.session.config.teams_image_cache_dir.clone() else {
+            return;
+        };
+        self.chat_cache_warmup_started = true;
+        let mut ids: Vec<String> = Vec::new();
+        if let Some(current) = self
+            .teams
+            .chats
+            .get(self.teams.chat_sel)
+            .map(|chat| chat.id.clone())
+            .or_else(|| self.teams.last_chat_id.clone())
+        {
+            ids.push(current);
+        }
+        for chat in chats_list {
+            if !ids.contains(&chat.id) {
+                ids.push(chat.id.clone());
+            }
+        }
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            for chat_id in ids {
+                let root = cache_root.clone();
+                let cached = tokio::task::spawn_blocking({
+                    let chat_id = chat_id.clone();
+                    move || crate::teams_cache::load_conversation(&root, &chat_id)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(messages) = cached.filter(|messages| !messages.is_empty()) {
+                    let _ = tx
+                        .send(AppMessage::ChatCacheWarmed { chat_id, messages })
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(75)).await;
+                    continue;
+                }
+                match chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await {
+                    Ok((messages, _)) => {
+                        let mut oldest_first = messages.clone();
+                        oldest_first.reverse();
+                        let root = cache_root.clone();
+                        let store_id = chat_id.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            crate::teams_cache::store_conversation(&root, &store_id, &oldest_first)
+                        })
+                        .await;
+                        let _ = tx
+                            .send(AppMessage::ChatCacheWarmed { chat_id, messages })
+                            .await;
+                    }
+                    Err(error) => {
+                        tracing::debug!("Teams cache warmup failed for a chat: {error:#}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(75)).await;
+            }
+        });
+    }
+
+    fn open_diagnostics(&mut self) {
+        self.diagnostics_scroll = 0;
+        self.overlay = Some(Overlay::Diagnostics);
+        self.refresh_diagnostics();
+    }
+
+    fn refresh_diagnostics(&mut self) {
+        self.diagnostics.loading = true;
+        let s = self.session.clone();
+        self.spawn(async move {
+            let token = match s.auth.access_token().await {
+                Ok(_) => s
+                    .auth
+                    .token_info()
+                    .await
+                    .ok_or_else(|| "token metadata unavailable".to_string()),
+                Err(error) => Err(m365_core::util::graph_error_summary(&error.to_string())),
+            };
+            let work_plan = m365_core::work_plan::diagnostics(&s.graph, chrono::Utc::now())
+                .await
+                .map_err(|error| m365_core::util::graph_error_summary(&error.to_string()));
+            Ok(AppMessage::DiagnosticsLoaded(
+                crate::diagnostics::DiagnosticsRemote {
+                    generated_at: chrono::Utc::now(),
+                    token,
+                    work_plan,
+                },
+            ))
+        });
+    }
+
+    fn open_contact_diagnostics(&mut self) {
+        if self.screen != Screen::Teams || self.teams.mode != TeamsMode::Chats {
+            self.status = "F7 diagnoses the selected Teams 1:1 chat".into();
+            return;
+        }
+        let Some(chat) = self.teams.chats.get(self.teams.chat_sel) else {
+            self.status = "no Teams chat selected".into();
+            return;
+        };
+        if !chat
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+        {
+            self.status = "F7 is for one-to-one chats".into();
+            return;
+        }
+        let me_id = self.me.as_ref().map(|user| user.id.as_str());
+        let peer = chat
+            .members
+            .iter()
+            .find(|member| me_id.is_none_or(|id| member.user_id.as_deref() != Some(id)));
+        let preview = chat
+            .last_message_preview
+            .as_ref()
+            .and_then(|preview| preview.from.as_ref())
+            .and_then(|from| from.user.as_ref());
+        let member_user_id = peer.and_then(|member| member.user_id.as_deref());
+        let cached_id = self.contact_user_ids.get(&chat.id).map(String::as_str);
+        let member_type = peer
+            .and_then(|member| member.odata_type.as_deref())
+            .and_then(|value| value.rsplit('.').next())
+            .unwrap_or("unknown")
+            .to_string();
+        let personal = member_type.to_ascii_lowercase().contains("microsoftaccount")
+            || member_type.to_ascii_lowercase().contains("skype");
+        let lookup = peer
+            .and_then(|member| member.email.as_deref())
+            .or_else(|| preview.and_then(|user| user.display_name.as_deref()))
+            .map(str::to_string);
+        let probe_id = member_user_id
+            .filter(|id| chats::looks_like_user_guid(id))
+            .or(cached_id.filter(|id| chats::looks_like_user_guid(id)))
+            .map(str::to_string);
+        let mri = member_user_id
+            .filter(|id| crate::diagnostics::is_presence_mri_candidate(Some(id)))
+            .or(preview
+                .and_then(|user| user.id.as_deref())
+                .filter(|id| crate::diagnostics::is_presence_mri_candidate(Some(id))))
+            .map(str::to_string);
+
+        self.contact_diagnostics = crate::diagnostics::ContactDiagnosticsState {
+            loading: true,
+            member_type,
+            account_type: if personal {
+                "personal/skype".into()
+            } else {
+                "work/school".into()
+            },
+            member_guid: member_user_id.is_some_and(chats::looks_like_user_guid),
+            preview_guid: preview
+                .and_then(|user| user.id.as_deref())
+                .is_some_and(chats::looks_like_user_guid),
+            cached_guid: cached_id.is_some_and(chats::looks_like_user_guid),
+            member_id_shape: crate::diagnostics::identifier_shape(
+                peer.and_then(|member| member.id.as_deref()),
+            )
+            .into(),
+            member_user_id_shape: crate::diagnostics::identifier_shape(member_user_id).into(),
+            preview_id_shape: crate::diagnostics::identifier_shape(
+                preview.and_then(|user| user.id.as_deref()),
+            )
+            .into(),
+            cached_id_shape: crate::diagnostics::identifier_shape(cached_id).into(),
+            mri_candidate_source: if mri.is_some() {
+                "member/preview".into()
+            } else {
+                "none".into()
+            },
+            lookup_address_available: lookup.is_some(),
+            probe_source: if probe_id.is_some() {
+                "entra guid".into()
+            } else {
+                "none".into()
+            },
+            tenant_relation: match (
+                chat.tenant_id.as_deref(),
+                peer.and_then(|member| member.tenant_id.as_deref()),
+            ) {
+                (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => "same".into(),
+                (Some(_), Some(_)) => "external".into(),
+                _ => "unknown".into(),
+            },
+            cross_tenant_candidate: chat.tenant_id.as_deref().is_some_and(|chat_tenant| {
+                peer.and_then(|member| member.tenant_id.as_deref())
+                    .is_some_and(|peer_tenant| !chat_tenant.eq_ignore_ascii_case(peer_tenant))
+            }),
+            presence_supported: !personal && probe_id.is_some(),
+            remote: None,
+        };
+        self.contact_diagnostics_mri = mri;
+        self.contact_diagnostics_lookup = lookup;
+        self.contact_diagnostics_probe_id = probe_id;
+        self.contact_diagnostics_personal = personal;
+        self.contact_diagnostics_scroll = 0;
+        self.overlay = Some(Overlay::ContactDiagnostics);
+        self.refresh_contact_diagnostics();
+    }
+
+    fn refresh_contact_diagnostics(&mut self) {
+        self.contact_diagnostics.loading = true;
+        let s = self.session.clone();
+        let presence_read = self.session.config.presence_read;
+        let supported = self.contact_diagnostics.presence_supported;
+        let probe_id = self.contact_diagnostics_probe_id.clone();
+        let lookup = self.contact_diagnostics_lookup.clone();
+        let mri = self.contact_diagnostics_mri.clone();
+        let personal = self.contact_diagnostics_personal;
+        self.spawn(async move {
+            let presence_read_all = match s.auth.token_info().await {
+                Some(info) => Ok(info
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.eq_ignore_ascii_case("Presence.Read.All"))),
+                None => Err("token metadata unavailable".into()),
+            };
+            let mut batch = crate::diagnostics::PresenceProbe::Skipped(
+                "presence read disabled or unsupported".into(),
+            );
+            let mut direct = crate::diagnostics::PresenceProbe::Skipped(
+                "presence read disabled or unsupported".into(),
+            );
+            if presence_read && supported {
+                if let Some(user_id) = probe_id.clone() {
+                    batch = match people::presences(&s.graph, std::slice::from_ref(&user_id)).await {
+                        Ok(items) => items
+                            .into_iter()
+                            .next()
+                            .map(|presence| crate::diagnostics::presence_probe(&presence))
+                            .unwrap_or(crate::diagnostics::PresenceProbe::Omitted),
+                        Err(error) => crate::diagnostics::PresenceProbe::Error(
+                            crate::diagnostics::safe_graph_error(&error),
+                        ),
+                    };
+                    direct = match people::presence(&s.graph, &user_id).await {
+                        Ok(presence) => crate::diagnostics::presence_probe(&presence),
+                        Err(error) => crate::diagnostics::PresenceProbe::Error(
+                            crate::diagnostics::safe_graph_error(&error),
+                        ),
+                    };
+                }
+            }
+            let teams = m365_core::teams_presence::diagnose(
+                &s.auth,
+                lookup.as_deref(),
+                mri.as_deref(),
+                personal,
+            )
+            .await;
+            Ok(AppMessage::ContactDiagnosticsLoaded(
+                crate::diagnostics::ContactDiagnosticsRemote {
+                    generated_at: chrono::Utc::now(),
+                    presence_read_all,
+                    batch,
+                    direct,
+                    teams,
+                },
+            ))
+        });
+    }
+
+    fn export_diagnostics(&mut self, force_log: bool) {
+        self.export_diagnostic_text(crate::diagnostics::text(self), force_log, false);
+    }
+
+    fn export_contact_diagnostics(&mut self, force_log: bool) {
+        self.export_diagnostic_text(crate::diagnostics::contact_text(self), force_log, true);
+    }
+
+    fn export_diagnostic_text(&mut self, text: String, force_log: bool, contact: bool) {
+        if !force_log {
+            if let Some(tool) = crate::clipboard::copy_native(&text) {
+                self.status = format!("diagnostics copied with {tool}");
+                return;
+            }
+        }
+        let saved = if contact {
+            crate::diagnostics::save_contact_log(&text)
+        } else {
+            crate::diagnostics::save_log(&text)
+        };
+        match saved {
+            Ok(path) => self.status = format!("diagnostics written to {}", path.display()),
+            Err(error) => self.status = format!("could not write diagnostics: {error:#}"),
+        }
     }
 
     // -- background task helpers ------------------------------------------
@@ -950,9 +1549,34 @@ impl App {
 
     fn load_calendar(&self) {
         let s = self.session.clone();
-        // Today .. +7 days in UTC.
-        let start = chrono::Utc::now();
-        let end = start + chrono::Duration::days(7);
+        let (start, end) = match self.calendar.view {
+            CalendarView::Agenda => {
+                let start = chrono::Utc::now();
+                let end = start + chrono::Duration::days(self.calendar.days);
+                (start, end)
+            }
+            CalendarView::Month => {
+                let first = calendar_month_first(self.calendar.month_offset);
+                let leading = chrono::Datelike::weekday(&first).num_days_from_monday() as i64;
+                let grid_start = first - chrono::Duration::days(leading + 1);
+                let grid_end = calendar_month_first(self.calendar.month_offset + 4)
+                    + chrono::Duration::days(8);
+
+                let start = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                    grid_start
+                        .and_hms_opt(0, 0, 0)
+                        .expect("valid calendar midnight"),
+                    chrono::Utc,
+                );
+                let end = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                    grid_end
+                        .and_hms_opt(0, 0, 0)
+                        .expect("valid calendar midnight"),
+                    chrono::Utc,
+                );
+                (start, end)
+            }
+        };
         let start = start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let end = end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.spawn(async move {
@@ -1252,14 +1876,63 @@ impl App {
                     self.show_thread(items, truncated);
                 }
             }
-            AppMessage::Calendar(e) => self.outlook.calendar = e,
+            AppMessage::Calendar(e) => {
+                let selected_id = self
+                    .calendar
+                    .events
+                    .get(self.calendar.selected)
+                    .map(|event| event.id.clone());
+                self.calendar.events = e;
+                self.calendar.selected = selected_id
+                    .and_then(|id| self.calendar.events.iter().position(|event| event.id == id))
+                    .unwrap_or(self.calendar.selected)
+                    .min(self.calendar.events.len().saturating_sub(1));
+                if self.calendar.view == CalendarView::Month
+                    && !self
+                        .calendar
+                        .events
+                        .get(self.calendar.selected)
+                        .is_some_and(|event| {
+                            calendar_event_intersects_month(event, self.calendar.month_offset)
+                        })
+                {
+                    self.calendar_month_select_edge(false);
+                }
+            }
+            AppMessage::CalendarReminders(events) => {
+                self.calendar_reminder_events = events;
+                self.check_calendar_reminders();
+            }
+            AppMessage::ChatCacheWarmed { chat_id, messages } => {
+                if self.teams.preview_chat_id.as_deref() == Some(&chat_id)
+                    && self.teams.open_chat_id.is_none()
+                    && self.teams.messages.is_empty()
+                {
+                    self.set_teams_messages(messages, None, ListUpdate::Replace);
+                }
+            }
+            AppMessage::DiagnosticsLoaded(remote) => {
+                self.diagnostics.remote = Some(remote);
+                self.diagnostics.loading = false;
+            }
+            AppMessage::ContactDiagnosticsLoaded(remote) => {
+                self.contact_diagnostics.remote = Some(remote);
+                self.contact_diagnostics.loading = false;
+            }
             AppMessage::Chats(c) => {
                 self.notify_for_chats(&c);
+                self.warm_teams_conversation_caches(&c);
                 self.teams.chats = c;
                 self.teams.chat_sel = self
                     .teams
                     .chat_sel
                     .min(self.teams.chats.len().saturating_sub(1));
+                if self.teams.focus == TeamsFocus::List
+                    && self.teams.mode == TeamsMode::Chats
+                    && self.teams.open_chat_id.is_none()
+                {
+                    self.preview_selected_teams_chat();
+                }
             }
             AppMessage::PeopleSearch { query, result } => {
                 if let Some(Overlay::NewChat {
@@ -1290,7 +1963,9 @@ impl App {
                 mode,
             } => {
                 if self.teams.open_chat_id.as_deref() == Some(&chat_id) {
+                    self.teams.last_chat_id = Some(chat_id.clone());
                     self.set_teams_messages(messages, next, mode);
+                    self.persist_teams_conversation_cache(&chat_id, &self.teams.messages);
                 }
             }
             AppMessage::Teams(t) => self.teams.teams = t,
@@ -1416,6 +2091,19 @@ impl App {
                     .and_then(|g| g.decode(&bytes, max_rows).ok());
                 match decoded {
                     Some(img) => {
+                        if let Some(root) = self.session.config.teams_image_cache_dir.clone() {
+                            let key_for_disk = key.clone();
+                            let bytes_for_disk = bytes.clone();
+                            let max_mb = self.session.config.teams_image_cache_max_mb;
+                            tokio::task::spawn_blocking(move || {
+                                let _ = crate::teams_cache::store_image_bytes(
+                                    &root,
+                                    &key_for_disk,
+                                    &bytes_for_disk,
+                                );
+                                crate::teams_cache::prune_image_cache(&root, max_mb * 1024 * 1024);
+                            });
+                        }
                         self.image_cache.insert(key, img);
                     }
                     None => {
@@ -1444,6 +2132,7 @@ impl App {
                 self.push = state;
             }
             AppMessage::Tick => {
+                self.refresh_calendar_reminders_if_due();
                 self.rss_kb = read_rss_kb();
                 // Clear a message once it has sat unchanged for a while, so the
                 // status bar never shows something from half an hour ago.
@@ -1472,6 +2161,7 @@ impl App {
     /// Refresh the current view from the server. Driven by a periodic timer so
     /// the UI stays live even without the push tunnel.
     fn poll(&mut self) {
+        self.last_poll = Some(std::time::Instant::now());
         self.last_sync = Some(now_hms());
         self.renew_presence_session();
         self.peek_inbox();
@@ -1487,6 +2177,9 @@ impl App {
         }
         if let Some((t, c)) = self.teams.open_channel.clone() {
             self.load_channel_messages(t, c, ListUpdate::Merge);
+        }
+        if self.screen == Screen::Calendar {
+            self.load_calendar();
         }
     }
 
@@ -1662,6 +2355,7 @@ impl App {
                     }
                 }
             },
+            Screen::Calendar => self.load_calendar(),
         }
     }
 
@@ -1675,6 +2369,7 @@ impl App {
                 .get(self.teams.msg_sel)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]),
+            Screen::Calendar => &[],
         }
     }
 
@@ -1828,6 +2523,11 @@ impl App {
                 .messages_rendered
                 .get(self.teams.msg_sel)
                 .map(content::plain),
+            Screen::Calendar => self
+                .calendar
+                .events
+                .get(self.calendar.selected)
+                .and_then(|event| event.subject.clone()),
         };
         match text {
             Some(t) if !t.trim().is_empty() => self.copy_to_clipboard(&t, "message"),
@@ -1843,6 +2543,12 @@ impl App {
                 .map(|lines| lines_to_plain(&lines))
                 .unwrap_or_default(),
             Screen::Teams => lines_to_plain(&crate::ui::conversation_lines(self, false).0),
+            Screen::Calendar => self
+                .calendar
+                .events
+                .get(self.calendar.selected)
+                .map(|event| event.subject.clone().unwrap_or_default())
+                .unwrap_or_default(),
         };
         if text.trim().is_empty() {
             self.status = "nothing to copy".into();
@@ -1864,6 +2570,14 @@ impl App {
     // -- key handling ------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::F(6) {
+            self.open_diagnostics();
+            return;
+        }
+        if key.code == KeyCode::F(7) {
+            self.open_contact_diagnostics();
+            return;
+        }
         // Overlays capture input first.
         if self.overlay.is_some() {
             self.on_key_overlay(key);
@@ -1930,11 +2644,16 @@ impl App {
                 self.yank_all();
                 return;
             }
+            (KeyCode::F(1), _) => {
+                self.switch_screen(Screen::Outlook);
+                return;
+            }
             (KeyCode::F(2), _) => {
-                self.screen = match self.screen {
-                    Screen::Outlook => Screen::Teams,
-                    Screen::Teams => Screen::Outlook,
-                };
+                self.switch_screen(Screen::Teams);
+                return;
+            }
+            (KeyCode::F(3), _) => {
+                self.switch_screen(Screen::Calendar);
                 return;
             }
             (KeyCode::Char('|') | KeyCode::Char('\\'), _) if !typing => {
@@ -1971,7 +2690,9 @@ impl App {
                 return;
             }
             (KeyCode::Char('o'), KeyModifiers::NONE) if !typing => {
-                if self.focused_links().is_empty() {
+                if self.screen == Screen::Calendar {
+                    self.open_selected_calendar_meeting();
+                } else if self.focused_links().is_empty() {
                     self.status = "no links in this message".into();
                 } else {
                     self.overlay = Some(Overlay::Links);
@@ -1984,6 +2705,7 @@ impl App {
         match self.screen {
             Screen::Outlook => self.on_key_outlook(key),
             Screen::Teams => self.on_key_teams(key),
+            Screen::Calendar => self.on_key_calendar(key),
         }
     }
 
@@ -2004,7 +2726,7 @@ impl App {
                     OutlookFocus::Reading => OutlookFocus::Folders,
                 };
             }
-            KeyCode::Char('e') => self.load_calendar_and_show(),
+            KeyCode::Char('e') => self.switch_screen(Screen::Calendar),
             KeyCode::Char('t') => self.toggle_mail_threads(),
             KeyCode::Char('c') => {
                 self.overlay = Some(Overlay::Compose(empty_compose()));
@@ -2077,9 +2799,246 @@ impl App {
         self.status = format!("Folders width: {width}");
     }
 
-    fn load_calendar_and_show(&mut self) {
-        self.load_calendar();
-        self.overlay = Some(Overlay::Calendar);
+    fn on_key_calendar(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_move_event(-1);
+                } else {
+                    self.calendar.selected =
+                        step(self.calendar.selected, -1, self.calendar.events.len());
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_move_event(1);
+                } else {
+                    self.calendar.selected =
+                        step(self.calendar.selected, 1, self.calendar.events.len());
+                }
+            }
+            KeyCode::PageUp => {
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_move_event(-5);
+                } else {
+                    self.calendar.selected =
+                        step(self.calendar.selected, -10, self.calendar.events.len());
+                }
+            }
+            KeyCode::PageDown => {
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_move_event(5);
+                } else {
+                    self.calendar.selected =
+                        step(self.calendar.selected, 10, self.calendar.events.len());
+                }
+            }
+            KeyCode::Home => {
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_select_edge(false);
+                } else {
+                    self.calendar.selected = 0;
+                }
+            }
+            KeyCode::End => {
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_select_edge(true);
+                } else {
+                    self.calendar.selected = self.calendar.events.len().saturating_sub(1);
+                }
+            }
+            KeyCode::Char('a') => self.respond_calendar(calendar::Rsvp::Accept),
+            KeyCode::Char('d') => self.respond_calendar(calendar::Rsvp::Decline),
+            KeyCode::Char('t') => self.respond_calendar(calendar::Rsvp::Tentative),
+            KeyCode::Enter | KeyCode::Char('g') => {
+                if self.calendar.events.is_empty() {
+                    self.status = "no calendar event selected".into();
+                } else {
+                    self.overlay = Some(Overlay::CalendarEvent);
+                }
+            }
+            KeyCode::Char('n') => {
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar.month_offset = 0;
+                    self.calendar_month_select_edge(false);
+                    self.status = "calendar: current month".into();
+                    self.load_calendar();
+                } else {
+                    self.calendar_jump_today();
+                }
+            }
+            KeyCode::Char('v') => {
+                if self.calendar.view == CalendarView::Agenda && !Self::calendar_month_view_available()
+                {
+                    self.status = format!(
+                        "Month view requires at least {}x{} characters",
+                        CALENDAR_MONTH_MIN_WIDTH, CALENDAR_MONTH_MIN_HEIGHT
+                    );
+                    return;
+                }
+
+                self.calendar.view = match self.calendar.view {
+                    CalendarView::Agenda => CalendarView::Month,
+                    CalendarView::Month => CalendarView::Agenda,
+                };
+                self.calendar.month_offset = 0;
+                self.calendar.selected = 0;
+                self.status = match self.calendar.view {
+                    CalendarView::Agenda => "calendar view: agenda".into(),
+                    CalendarView::Month => "calendar view: month".into(),
+                };
+                self.load_calendar();
+            }
+            KeyCode::Left if self.calendar.view == CalendarView::Month => {
+                self.calendar.month_offset -= 1;
+                self.calendar_month_select_edge(false);
+                self.status = "calendar: previous month".into();
+                self.load_calendar();
+            }
+            KeyCode::Right if self.calendar.view == CalendarView::Month => {
+                self.calendar.month_offset += 1;
+                self.calendar_month_select_edge(false);
+                self.status = "calendar: next month".into();
+                self.load_calendar();
+            }
+            KeyCode::Char('r') => self.load_calendar(),
+            KeyCode::Char('w') if self.calendar.view == CalendarView::Agenda => {
+                let next = CALENDAR_RANGES
+                    .iter()
+                    .position(|days| *days == self.calendar.days)
+                    .map(|index| (index + 1) % CALENDAR_RANGES.len())
+                    .unwrap_or(0);
+                self.calendar.days = CALENDAR_RANGES[next];
+                self.calendar.selected = 0;
+                self.status = format!("calendar range: {} days", self.calendar.days);
+                self.load_calendar();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_selected_calendar_meeting(&mut self) {
+        let Some(url) = self
+            .calendar
+            .events
+            .get(self.calendar.selected)
+            .and_then(|event| event.online_meeting.as_ref())
+            .and_then(|meeting| meeting.join_url.as_deref())
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+        else {
+            self.status = "no online meeting link".into();
+            return;
+        };
+
+        let result = match self.session.config.meeting_opener.as_deref() {
+            Some(executable) => crate::opener::open_url_with(&url, executable),
+            None => crate::opener::open_url(&url),
+        };
+
+        match result {
+            Ok(()) => self.status = "opening online meeting".into(),
+            Err(error) => self.status = format!("could not open meeting: {error:#}"),
+        }
+    }
+
+    fn calendar_month_indices(&self) -> Vec<usize> {
+        self.calendar
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                calendar_event_intersects_month(event, self.calendar.month_offset).then_some(index)
+            })
+            .collect()
+    }
+
+    fn calendar_month_move_event(&mut self, delta: i32) {
+        let indices = self.calendar_month_indices();
+        if indices.is_empty() {
+            self.status = "no events in active month".into();
+            return;
+        }
+
+        let next = match indices
+            .iter()
+            .position(|index| *index == self.calendar.selected)
+        {
+            Some(position) => step(position, delta, indices.len()),
+            None if delta < 0 => indices.len().saturating_sub(1),
+            None => 0,
+        };
+        self.calendar.selected = indices[next];
+    }
+
+    fn calendar_month_select_edge(&mut self, last: bool) {
+        let indices = self.calendar_month_indices();
+        if let Some(index) = if last {
+            indices.last()
+        } else {
+            indices.first()
+        } {
+            self.calendar.selected = *index;
+        }
+    }
+
+    fn calendar_jump_today(&mut self) {
+        let today = chrono::Local::now().date_naive();
+        let selected = self.calendar.events.iter().position(|event| {
+            event
+                .start
+                .as_ref()
+                .and_then(calendar_state_local_datetime)
+                .is_some_and(|start| start.date_naive() == today)
+        });
+
+        if let Some(index) = selected {
+            self.calendar.selected = index;
+            self.status = "jumped to today".into();
+        } else {
+            self.calendar.selected = 0;
+            self.status = "no remaining events today".into();
+        }
+    }
+
+    fn respond_calendar(&mut self, rsvp: calendar::Rsvp) {
+        let Some(event) = self.calendar.events.get(self.calendar.selected) else {
+            self.status = "no calendar event selected".into();
+            return;
+        };
+
+        let response = event
+            .response_status
+            .as_ref()
+            .and_then(|status| status.response.as_deref())
+            .unwrap_or("");
+        if event.is_organizer.unwrap_or(false) || response.eq_ignore_ascii_case("organizer") {
+            self.status = "you are the organizer of this event".into();
+            return;
+        }
+        if event.is_cancelled.unwrap_or(false) {
+            self.status = "this event is cancelled".into();
+            return;
+        }
+        if event.response_requested == Some(false) {
+            self.status = "the organizer did not request a response".into();
+            return;
+        }
+
+        let id = event.id.clone();
+        let (progress, done) = match rsvp {
+            calendar::Rsvp::Accept => ("accepting event...", "event accepted"),
+            calendar::Rsvp::Decline => ("declining event...", "event declined"),
+            calendar::Rsvp::Tentative => ("marking event tentative...", "event marked tentative"),
+        };
+        self.status = progress.into();
+
+        let s = self.session.clone();
+        self.spawn(async move {
+            calendar::respond(&s.graph, &id, rsvp, "").await?;
+            Ok(AppMessage::Done(done.into()))
+        });
     }
 
     fn outlook_move(&mut self, delta: i32) {
@@ -2874,6 +3833,7 @@ impl App {
         match (self.teams.mode, self.teams.focus) {
             (TeamsMode::Chats, TeamsFocus::List) => {
                 self.teams.chat_sel = step(self.teams.chat_sel, delta, self.teams.chats.len());
+                self.preview_selected_teams_chat();
             }
             (TeamsMode::Channels, TeamsFocus::List) => {
                 // Navigate channels; if none loaded, navigate teams.
@@ -2920,19 +3880,33 @@ impl App {
             TeamsMode::Chats => {
                 if let Some(c) = self.teams.chats.get(self.teams.chat_sel) {
                     let id = c.id.clone();
+                    let preview_ready = self.teams.preview_chat_id.as_deref() == Some(&id)
+                        && !self.teams.messages.is_empty();
+                    self.teams.preview_chat_id = None;
                     self.teams.open_chat_id = Some(id.clone());
                     self.teams.open_channel = None;
-                    self.teams.messages.clear();
-                    self.teams.messages_rendered.clear();
-                    self.teams.messages_links.clear();
-                    self.teams.messages_images.clear();
-                    self.teams.msg_sel = 0;
-                    self.teams.messages_next = None;
+                    self.teams.last_chat_id = Some(id.clone());
+                    if !preview_ready {
+                        self.teams.messages.clear();
+                        self.teams.messages_rendered.clear();
+                        self.teams.messages_links.clear();
+                        self.teams.messages_images.clear();
+                        self.teams.msg_sel = 0;
+                        self.teams.messages_next = None;
+                        self.restore_teams_conversation_cache(&id);
+                    }
                     self.teams.loading_more = false;
                     self.teams.unseen = 0;
                     self.teams.replying_to = None;
                     self.teams.editing = None;
-                    self.load_chat_messages(id, ListUpdate::Replace);
+                    self.load_chat_messages(
+                        id,
+                        if preview_ready {
+                            ListUpdate::Merge
+                        } else {
+                            ListUpdate::Replace
+                        },
+                    );
                     self.teams.focus = TeamsFocus::Messages;
                 }
             }
@@ -3310,6 +4284,16 @@ impl App {
             {
                 continue;
             }
+            if let Some(root) = self.session.config.teams_image_cache_dir.clone() {
+                if let Some(bytes) = crate::teams_cache::load_image_bytes(&root, &key) {
+                    self.image_loading.insert(key.clone());
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(AppMessage::HostedImage { key, bytes }).await;
+                    });
+                    continue;
+                }
+            }
             self.image_loading.insert(key.clone());
             let s = self.session.clone();
             self.spawn(async move {
@@ -3520,6 +4504,52 @@ impl App {
         }
     }
 
+    fn on_key_diagnostics(&mut self, key: KeyEvent, contact: bool) {
+        let (scroll, max) = if contact {
+            (
+                &mut self.contact_diagnostics_scroll,
+                self.contact_diagnostics_max_scroll.get(),
+            )
+        } else {
+            (&mut self.diagnostics_scroll, self.diagnostics_max_scroll.get())
+        };
+        match key.code {
+            KeyCode::Char('r') => {
+                if contact {
+                    self.refresh_contact_diagnostics();
+                } else {
+                    self.refresh_diagnostics();
+                }
+            }
+            KeyCode::Char('c') => {
+                if contact {
+                    self.export_contact_diagnostics(false);
+                } else {
+                    self.export_diagnostics(false);
+                }
+            }
+            KeyCode::Char('l') => {
+                if contact {
+                    self.export_contact_diagnostics(true);
+                } else {
+                    self.export_diagnostics(true);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll + 1).min(max),
+            KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+            KeyCode::PageDown => *scroll = (*scroll + 10).min(max),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+            KeyCode::Home => *scroll = 0,
+            KeyCode::End => *scroll = max,
+            _ => {}
+        }
+        self.overlay = Some(if contact {
+            Overlay::ContactDiagnostics
+        } else {
+            Overlay::Diagnostics
+        });
+    }
+
     // -- overlay input -----------------------------------------------------
 
     fn on_key_overlay(&mut self, key: KeyEvent) {
@@ -3549,8 +4579,22 @@ impl App {
         // Take the overlay out so we can mutate self freely, then put it back.
         let overlay = self.overlay.take();
         match overlay {
-            Some(Overlay::Help) | Some(Overlay::Calendar) => {
+            Some(Overlay::Help) => {
                 // any key besides Esc closes
+            }
+            Some(Overlay::CalendarEvent) => {
+                if matches!(key.code, KeyCode::Char('o')) {
+                    self.open_selected_calendar_meeting();
+                    self.overlay = Some(Overlay::CalendarEvent);
+                } else {
+                    self.overlay = Some(Overlay::CalendarEvent);
+                }
+            }
+            Some(Overlay::Diagnostics) => {
+                self.on_key_diagnostics(key, false);
+            }
+            Some(Overlay::ContactDiagnostics) => {
+                self.on_key_diagnostics(key, true);
             }
             Some(Overlay::React) => {
                 if let KeyCode::Char(c @ '1'..='7') = key.code {
@@ -4184,13 +5228,9 @@ impl App {
     fn run_command(&mut self, id: &str) {
         self.overlay = None;
         match id {
-            "outlook" => self.screen = Screen::Outlook,
-            "teams" => {
-                self.screen = Screen::Teams;
-                if self.teams.chats.is_empty() {
-                    self.load_chats();
-                }
-            }
+            "outlook" => self.switch_screen(Screen::Outlook),
+            "teams" => self.switch_screen(Screen::Teams),
+            "calendar" => self.switch_screen(Screen::Calendar),
             "compose" => {
                 self.overlay = Some(Overlay::Compose(empty_compose()));
             }
@@ -4202,7 +5242,6 @@ impl App {
             "trash" => self.trash_current_mail(),
             "layout" => self.toggle_pane_layout(),
             "threads" => self.toggle_mail_threads(),
-            "calendar" => self.load_calendar_and_show(),
             "chat-sender" => {
                 if let Some(addr) = self.current_mail().and_then(|m| m.sender_address()) {
                     self.status = format!("opening chat with {addr}…");

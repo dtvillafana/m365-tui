@@ -8,8 +8,8 @@ use ratatui::Frame;
 
 use crate::app::{
     filter_commands, filter_folders, folder_panel_height, mail_folder_label, mail_image_is_local,
-    mail_row_unread, mail_same_thread, mail_thread_size, App, Compose, OutlookFocus, Overlay,
-    PushState, Screen, TeamsFocus, TeamsMode, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY,
+    mail_row_unread, mail_same_thread, mail_thread_size, App, CalendarView, Compose, OutlookFocus,
+    Overlay, PushState, Screen, TeamsFocus, TeamsMode, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY,
     COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO, DEFAULT_FOLDER_PANEL_WIDTH,
 };
 
@@ -48,6 +48,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Outlook => render_outlook(f, chunks[1], app),
         Screen::Teams => render_teams(f, chunks[1], app),
+        Screen::Calendar => crate::calendar_ui::render_calendar(f, chunks[1], app),
     }
     render_status(f, chunks[2], app);
 
@@ -78,6 +79,19 @@ fn render_copy_mode(f: &mut Frame, app: &App) {
     let lines = match app.screen {
         Screen::Outlook => email_lines(app).unwrap_or_default(),
         Screen::Teams => conversation_lines(app, false).0,
+        Screen::Calendar => app
+            .calendar
+            .events
+            .get(app.calendar.selected)
+            .map(|event| {
+                vec![Line::from(
+                    event
+                        .subject
+                        .clone()
+                        .unwrap_or_else(|| "(no subject)".into()),
+                )]
+            })
+            .unwrap_or_default(),
     };
     let (wrapped, _) = crate::wrap::wrap_all(&lines, rows[1].width as usize);
     let max = (wrapped.len() as u16).saturating_sub(rows[1].height);
@@ -105,9 +119,11 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         }
     };
     let tabs = Line::from(vec![
-        tab("Outlook (F2)", app.screen == Screen::Outlook),
+        tab("Outlook (F1)", app.screen == Screen::Outlook),
         Span::raw("  "),
         tab("Teams (F2)", app.screen == Screen::Teams),
+        Span::raw("  "),
+        tab("Calendar (F3)", app.screen == Screen::Calendar),
     ]);
 
     // Right-hand state: presence · push · memory · last sync.
@@ -207,7 +223,11 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::NewChat { .. } => "Type name/username · ↑↓ choose · Enter chat · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
             Overlay::MoveMail { .. } => "j/k/g/G choose · Enter move · Esc cancel",
-            Overlay::Calendar | Overlay::Help => "Esc close",
+            Overlay::Help => "Esc close",
+            Overlay::CalendarEvent => "o join · a/d/t RSVP · Esc close",
+            Overlay::Diagnostics | Overlay::ContactDiagnostics => {
+                "c copy · l log · r refresh · j/k scroll · Esc close"
+            }
         };
     }
     match app.screen {
@@ -227,6 +247,14 @@ fn context_hints(app: &App) -> &'static str {
             }
             TeamsFocus::Composer if app.teams.editing.is_some() => "Enter save · Esc cancel",
             TeamsFocus::Composer => "Enter send · Ctrl+V image · @path Tab · Esc leave",
+        },
+        Screen::Calendar => match app.calendar.view {
+            CalendarView::Agenda => {
+                "j/k event · Enter details · a/d/t RSVP · o join · w range · v month · n today"
+            }
+            CalendarView::Month => {
+                "j/k event · ←/→ month · Enter details · a/d/t RSVP · o join · v agenda · n today"
+            }
         },
     }
 }
@@ -1368,6 +1396,75 @@ fn render_mail_images(f: &mut Frame, app: &mut App, scroll: u16, fullscreen: Opt
     }
 }
 
+fn render_diagnostics_overlay(f: &mut Frame, app: &mut App, contact: bool) {
+    let area = centered(84, 86, f.area());
+    f.render_widget(Clear, area);
+    let title = if contact {
+        "Contact diagnostics — c copy/export · l log · r refresh · j/k scroll · Esc close"
+    } else {
+        "Diagnostics — c copy/export · l log · r refresh · j/k scroll · Esc close"
+    };
+    let block = popup_block(title);
+    let inner = block.inner(area);
+    let text = if contact {
+        crate::diagnostics::contact_text(app)
+    } else {
+        crate::diagnostics::text(app)
+    };
+
+    let lines: Vec<Line<'static>> = text
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                return Line::raw("");
+            }
+            if !line.starts_with(' ') {
+                return Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            let marker = [
+                ('●', Color::Green),
+                ('○', Color::DarkGray),
+                ('!', Color::Yellow),
+                ('×', Color::Red),
+                ('?', Color::DarkGray),
+            ]
+            .into_iter()
+            .find_map(|(symbol, color)| line.find(symbol).map(|index| (symbol, color, index)));
+
+            if let Some((symbol, color, index)) = marker {
+                let end = index + symbol.len_utf8();
+                Line::from(vec![
+                    Span::raw(line[..index].to_string()),
+                    Span::styled(
+                        symbol.to_string(),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(line[end..].to_string()),
+                ])
+            } else {
+                Line::raw(line.to_string())
+            }
+        })
+        .collect();
+
+    let (rows, _) = crate::wrap::wrap_all(&lines, inner.width.max(1) as usize);
+    let max = (rows.len() as u16).saturating_sub(inner.height);
+    let scroll = if contact {
+        app.contact_diagnostics_max_scroll.set(max);
+        app.contact_diagnostics_scroll.min(max)
+    } else {
+        app.diagnostics_max_scroll.set(max);
+        app.diagnostics_scroll.min(max)
+    };
+
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
+}
+
 fn render_overlay(f: &mut Frame, app: &mut App) {
     if let Some(Overlay::ViewImage { keys, sel }) = &app.overlay {
         let keys = keys.clone();
@@ -1392,7 +1489,8 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
             let text = "\
  M365 TUI — keys\n\
  \n\
- Global:  F2 switch app · Ctrl+P palette · p presence · s settings · | panes · ? help · q quit\n\
+ Global:  F1 Outlook · F2 Teams · F3 Calendar · F6 diagnostics · F7 contact diagnostics\n\
+           Ctrl+P palette · p presence · s settings · | panes · ? help · q quit\n\
  \n\
  Links:   o list links in the message · 1-9 open in browser\n\
  Images:  i list images in the open mail · 1-9 fullscreen\n\
@@ -1412,9 +1510,13 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
            t toggles threads/individual messages\n\
           folders pane / finds a folder · reading pane j/k scroll · g/G\n\
  \n\
+ Calendar: F3 full screen · j/k event · Enter details · a accept · d decline · t tentative\n\
+           o join meeting · w agenda range · v month/agenda · n today · r refresh\n\
+ \n\
   Teams:   n new chat (chat list) · t chats/channels · j/k select message · g oldest · G newest · e react · v full image\n\
           i type · r reply · E edit (Up in empty composer = last of yours) · Enter send\n\
           Ctrl+V paste image · @path Tab complete image · Ctrl+X remove last image\n\
+          j/k in chat list shows a cached preview without marking the chat read\n\
  \n\
  Compose: To/Cc/Bcc autocomplete from seen mail · ↑/↓ + Tab/Enter choose\n\
           Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
@@ -1433,40 +1535,24 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
                 area,
             );
         }
-        Overlay::Calendar => {
+        Overlay::CalendarEvent => {
             let area = centered(70, 70, f.area());
             f.render_widget(Clear, area);
-            let items: Vec<ListItem> = app
-                .outlook
+            let body = app
                 .calendar
-                .iter()
-                .map(|e| {
-                    let start = e
-                        .start
-                        .as_ref()
-                        .map(|s| s.date_time.replace('T', " "))
-                        .unwrap_or_default();
-                    let subj = e.subject.clone().unwrap_or_default();
-                    let online = if e.is_online_meeting.unwrap_or(false) {
-                        " 🔗"
-                    } else {
-                        ""
-                    };
-                    ListItem::new(format!("{start}  {subj}{online}"))
-                })
-                .collect();
-            let list = if items.is_empty() {
-                List::new(vec![ListItem::new(
-                    "No events in the next 7 days (or still loading).",
-                )])
-            } else {
-                List::new(items)
-            };
+                .events
+                .get(app.calendar.selected)
+                .map(crate::calendar_ui::calendar_event_detail)
+                .unwrap_or_else(|| vec![Line::from("No event selected.")]);
             f.render_widget(
-                list.block(popup_block("Calendar — next 7 days (Esc to close)")),
+                Paragraph::new(body)
+                    .block(popup_block("Event — o join · Esc close"))
+                    .wrap(Wrap { trim: false }),
                 area,
             );
         }
+        Overlay::Diagnostics => render_diagnostics_overlay(f, app, false),
+        Overlay::ContactDiagnostics => render_diagnostics_overlay(f, app, true),
         Overlay::Search { query } => {
             let area = centered(60, 20, f.area());
             f.render_widget(Clear, area);

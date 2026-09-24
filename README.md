@@ -1,15 +1,16 @@
 # m365-tui
 
-A terminal client for **Outlook and Microsoft Teams**, in one app. Switch
-between the two with `F2`.
+A terminal client for **Outlook, Microsoft Teams, and Calendar**, in one app.
+Switch with `F1`, `F2`, and `F3`.
 
 ![Reading an HTML email in the terminal, then jumping from its sender straight into a Teams chat with them](demo.gif)
 
 - **Outlook** — read mail with proper HTML and inline-image rendering, compose / reply /
-  reply-all / forward, send and save attachments, search, and a 7-day calendar
-  with RSVP.
-- **Teams** — chats and channels, emoji reactions, shared files, and your
-  presence status.
+  reply-all / forward, send and save attachments, search.
+- **Teams** — chats and channels, emoji reactions, shared files, presence status,
+  and optional persistent conversation/image cache.
+- **Calendar** — dedicated `F3` agenda and month views, RSVP, meeting links, and
+  15-/5-minute reminders.
 - **Live** — refreshes every 20 seconds out of the box; add a tunnel for
   instant push notifications.
 
@@ -204,11 +205,12 @@ Press `?` in the app for this list at any time.
 
 | Scope | Keys |
 |---|---|
-| **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `s` settings · `|` or `\` toggle pane layout · `?` help · `q` quit |
+| **Global** | `F1` Outlook · `F2` Teams · `F3` Calendar · `F6` diagnostics · `F7` contact diagnostics · `Ctrl+P` command palette · `p` presence · `s` settings · `|` or `\` toggle pane layout · `?` help · `q` quit |
 | **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · `g`/`G` top/bottom · `Shift+H`/`Shift+L` resize Outlook folders · arrows work the same · `Tab` cycles |
-| **Outlook** | `Enter` open · `t` threads/individual messages · `c` compose · `r` reply · `a` reply-all · `f` forward · `u` read/unread · `m` move folder · `d` trash · `/` search mail · folders pane `/` find folder · `e` calendar |
+| **Outlook** | `Enter` open · `t` threads/individual messages · `c` compose · `r` reply · `a` reply-all · `f` forward · `u` read/unread · `m` move folder · `d` trash · `/` search mail · folders pane `/` find folder · `e` Calendar |
 | **Reading a mail** | `j`/`k` scroll · `g`/`G` or `Home`/`End` · `h` back to the list |
-| **Teams** | `n` find a person/start a chat from the chats list (needs `M365_PEOPLE_SEARCH=1`) · `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` oldest · `G` newest · `e` react · `v` full image · `r` reply · `E` edit · `i` write · `Enter` send · `Ctrl+V` paste image · `@path` `Tab` complete |
+| **Teams** | `n` find a person/start a chat from the chats list (needs `M365_PEOPLE_SEARCH=1`) · `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` preview cached chat or select message · `g` oldest · `G` newest · `e` react · `v` full image · `r` reply · `E` edit · `i` write · `Enter` send · `Ctrl+V` paste image · `@path` `Tab` complete |
+| **Calendar** | `j`/`k` event · `Enter` details · `a`/`d`/`t` RSVP · `o` join · `w` agenda range · `v` month/agenda · `n` today · `r` refresh |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |

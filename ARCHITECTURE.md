@@ -28,6 +28,8 @@ The webhook shares the core only for its event types.
 | `config.rs` | Environment-driven settings, scope selection, Graph endpoint |
 | `models.rs` | Serde structs for the Graph resources actually rendered |
 | `mail.rs` `calendar.rs` `chats.rs` `channels.rs` `people.rs` | Endpoint wrappers |
+| `work_plan.rs` | Microsoft 365 work-hours lookup used by F6 diagnostics |
+| `teams_presence.rs` | Read-only Teams/Skype presence diagnostic path for F7 |
 | `subscriptions.rs` | Change-notification lifecycle |
 | `events.rs` | Redis subscriber → typed UI events |
 | `util.rs` | base64, HTML escaping |
@@ -38,6 +40,9 @@ The webhook shares the core only for its event types.
 |---|---|
 | `app.rs` | All state and the async orchestration; key handling |
 | `ui.rs` | Rendering — a pure function of `&App` |
+| `calendar_ui.rs` | Calendar agenda and month views |
+| `diagnostics.rs` | F6/F7 diagnostics snapshot and safe export |
+| `teams_cache.rs` | Persistent Teams conversation and image cache |
 | `content.rs` | HTML → styled terminal text, link extraction |
 | `editor.rs` | Text buffer with cursor, wrapping, and editing operations |
 | `wrap.rs` | Exact word wrapping, so scrolling can trust the row count |

@@ -56,6 +56,28 @@ pub const TEAMS_READ_SCOPE: &str = "Team.ReadBasic.All";
 /// Opt in with `M365_PEOPLE_SEARCH=1`.
 pub const PEOPLE_SEARCH_SCOPE: &str = "User.ReadBasic.All";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarNotify {
+    All,
+    Internal,
+    External,
+    None,
+}
+
+impl CalendarNotify {
+    pub fn enabled(self) -> bool {
+        self != Self::None
+    }
+
+    pub fn internal(self) -> bool {
+        matches!(self, Self::All | Self::Internal)
+    }
+
+    pub fn external(self) -> bool {
+        matches!(self, Self::All | Self::External)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Entra application (client) ID of the registered public client.
@@ -76,6 +98,21 @@ pub struct Config {
     pub client_state: String,
     /// Desktop notifications for direct messages and `@mentions`.
     pub notifications: bool,
+    /// Calendar reminder delivery mode: all, internal, external, or none.
+    pub calendar_notify: CalendarNotify,
+    /// Show presence indicators for contacts in one-to-one Teams chats.
+    pub presence_read: bool,
+    /// Optional persistent cache for Teams images, conversations, and UI state.
+    /// Unset keeps Teams image caching memory-only.
+    pub teams_image_cache_dir: Option<PathBuf>,
+    /// Maximum persistent Teams image cache size in MiB.
+    pub teams_image_cache_max_mb: u64,
+    /// Automatically prefill persistent Teams conversation caches in the background.
+    /// Enabled by default; set M365_TEAMS_CACHE_WARMUP=0 to disable.
+    pub teams_cache_warmup: bool,
+    /// Optional executable used to open Calendar online-meeting URLs.
+    /// Unset uses the operating system handler (`xdg-open` / `open`).
+    pub meeting_opener: Option<String>,
 }
 
 impl Config {
@@ -84,6 +121,29 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let client_id = env_required("M365_CLIENT_ID")?;
         let tenant_id = std::env::var("M365_TENANT_ID").unwrap_or_else(|_| "organizations".into());
+        let teams_image_cache_dir = std::env::var("M365_TEAMS_IMAGE_CACHE_DIR")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let meeting_opener = std::env::var("M365_MEETING_OPENER")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let teams_cache_warmup = env_flag_default_on("M365_TEAMS_CACHE_WARMUP");
+        let teams_image_cache_max_mb = match std::env::var("M365_TEAMS_IMAGE_CACHE_MAX_MB") {
+            Ok(value) if !value.trim().is_empty() => {
+                let value = value.trim().parse::<u64>().context(
+                    "M365_TEAMS_IMAGE_CACHE_MAX_MB must be a positive integer number of MiB",
+                )?;
+                anyhow::ensure!(
+                    value > 0,
+                    "M365_TEAMS_IMAGE_CACHE_MAX_MB must be greater than zero"
+                );
+                value
+            }
+            _ => 256,
+        };
 
         let scopes = match std::env::var("M365_SCOPES") {
             Ok(s) if !s.trim().is_empty() => s.split_whitespace().map(|s| s.to_string()).collect(),
@@ -128,6 +188,9 @@ impl Config {
             std::env::var("M365_NOTIFY").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         );
+        let calendar_notify =
+            parse_calendar_notify(std::env::var("M365_CALENDAR_NOTIFY").ok().as_deref())?;
+        let presence_read = env_flag("M365_PRESENCE_READ");
 
         Ok(Self {
             client_id,
@@ -138,6 +201,12 @@ impl Config {
             token_cache_path,
             client_state,
             notifications,
+            calendar_notify,
+            presence_read,
+            teams_image_cache_dir,
+            teams_image_cache_max_mb,
+            teams_cache_warmup,
+            meeting_opener,
         })
     }
 
@@ -163,6 +232,11 @@ impl Config {
 
     pub fn can_search_people(&self) -> bool {
         self.has_scope(PEOPLE_SEARCH_SCOPE)
+    }
+
+    /// Whether the requested token can read other users' basic profile/photo.
+    pub fn can_read_profile_photos(&self) -> bool {
+        self.has_scope("ProfilePhoto.Read.All") || self.has_scope(PEOPLE_SEARCH_SCOPE)
     }
 
     fn has_scope(&self, scope: &str) -> bool {
@@ -195,6 +269,32 @@ impl Config {
             .as_ref()
             .map(|b| format!("{b}/lifecycle"))
     }
+}
+
+fn parse_calendar_notify(value: Option<&str>) -> Result<CalendarNotify> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(CalendarNotify::All),
+        Some(value) if value.eq_ignore_ascii_case("all") => Ok(CalendarNotify::All),
+        Some(value) if value.eq_ignore_ascii_case("internal") => Ok(CalendarNotify::Internal),
+        Some(value) if value.eq_ignore_ascii_case("external") => Ok(CalendarNotify::External),
+        Some(value) if value.eq_ignore_ascii_case("none") => Ok(CalendarNotify::None),
+        Some(value) => anyhow::bail!(
+            "M365_CALENDAR_NOTIFY must be one of: all, internal, external, none (got {value:?})"
+        ),
+    }
+}
+
+/// Enabled by default. Only `0`, `false`, `no`, or `off` disable it
+/// (case-insensitive).
+fn env_flag_default_on(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
 }
 
 /// True for `1`, `true`, `yes`, `on` (case-insensitive).
@@ -242,7 +342,39 @@ mod tests {
             token_cache_path: PathBuf::from("/tmp/x.json"),
             client_state: "secret".into(),
             notifications: true,
+            calendar_notify: CalendarNotify::All,
+            presence_read: false,
+            teams_image_cache_dir: None,
+            teams_image_cache_max_mb: 256,
+            teams_cache_warmup: true,
+            meeting_opener: None,
         }
+    }
+
+    #[test]
+    fn parses_calendar_notification_mode() {
+        assert_eq!(parse_calendar_notify(None).unwrap(), CalendarNotify::All);
+        assert_eq!(
+            parse_calendar_notify(Some(" internal ")).unwrap(),
+            CalendarNotify::Internal
+        );
+        assert_eq!(
+            parse_calendar_notify(Some("EXTERNAL")).unwrap(),
+            CalendarNotify::External
+        );
+        assert_eq!(
+            parse_calendar_notify(Some("none")).unwrap(),
+            CalendarNotify::None
+        );
+        assert!(parse_calendar_notify(Some("desktop")).is_err());
+
+        assert!(CalendarNotify::All.internal());
+        assert!(CalendarNotify::All.external());
+        assert!(CalendarNotify::Internal.internal());
+        assert!(!CalendarNotify::Internal.external());
+        assert!(!CalendarNotify::External.internal());
+        assert!(CalendarNotify::External.external());
+        assert!(!CalendarNotify::None.enabled());
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub async fn calendar_view(graph: &GraphClient, start: &str, end: &str) -> Resul
     let path = format!(
         "me/calendarView?startDateTime={start}&endDateTime={end}\
          &$orderby=start/dateTime&$top=100\
-         &$select=id,subject,start,end,organizer,attendees,location,isOnlineMeeting,onlineMeeting,bodyPreview"
+         &$select=id,subject,start,end,organizer,attendees,location,isOnlineMeeting,onlineMeeting,bodyPreview,responseStatus,isOrganizer,isCancelled,isAllDay,responseRequested"
     );
     graph.get_collection(&path).await
 }

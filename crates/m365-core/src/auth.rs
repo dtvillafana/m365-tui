@@ -18,6 +18,14 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
+/// Non-secret metadata about a cached access token.
+#[derive(Debug, Clone)]
+pub struct TokenInfo {
+    pub expires_at: DateTime<Utc>,
+    pub scopes: Vec<String>,
+    pub valid: bool,
+}
+
 /// Prompt shown to the user to complete the device-code login.
 #[derive(Debug, Clone)]
 pub struct DeviceCodePrompt {
@@ -96,6 +104,179 @@ impl Authenticator {
         self.persist(&refreshed);
         *guard = Some(refreshed);
         Ok(token)
+    }
+
+    /// Return non-secret metadata about the currently cached token.
+    ///
+    /// The access token and refresh token are intentionally never exposed.
+    pub async fn token_info(&self) -> Option<TokenInfo> {
+        let guard = self.state.lock().await;
+        let current = guard.as_ref()?;
+        let mut scopes: Vec<String> = current
+            .scope
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        scopes.sort_by_key(|scope| scope.to_ascii_lowercase());
+        scopes.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+        Some(TokenInfo {
+            expires_at: current.expires_at,
+            scopes,
+            valid: current.is_valid(),
+        })
+    }
+
+    /// Acquire a short-lived token for another resource using the existing
+    /// refresh token. The secondary token and any rotated refresh token are
+    /// deliberately not persisted: diagnostics must not replace the primary
+    /// Microsoft Graph cache.
+    pub(crate) async fn resource_access_token(&self, scope: &str) -> Result<String> {
+        let refresh = {
+            let guard = self.state.lock().await;
+            guard
+                .as_ref()
+                .and_then(|token| token.refresh_token.clone())
+                .ok_or_else(|| anyhow!("resource token unavailable: no refresh token"))?
+        };
+
+        let resp = self
+            .http
+            .post(&self.token_endpoint)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", self.client_id.as_str()),
+                ("refresh_token", refresh.as_str()),
+                ("scope", scope),
+            ])
+            .send()
+            .await
+            .map_err(|_| anyhow!("resource token request failed: transport error"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err: TokenError = resp.json().await.unwrap_or(TokenError {
+                error: "unknown".into(),
+                error_description: None,
+            });
+            let aadsts = err
+                .error_description
+                .as_deref()
+                .and_then(aadsts_code)
+                .map(|code| format!(" · {code}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "resource token request failed ({status}): {}{aadsts}",
+                safe_oauth_code(&err.error)
+            );
+        }
+
+        let token: TokenResponse = resp
+            .json()
+            .await
+            .map_err(|_| anyhow!("resource token response could not be parsed"))?;
+        if token.access_token.is_empty() {
+            anyhow::bail!("resource token response contained no access token");
+        }
+        Ok(token.access_token)
+    }
+
+    /// Run a one-off interactive device-code flow for another resource.
+    ///
+    /// This is intentionally isolated from the primary Graph login:
+    /// - the requested resource scope is supplied explicitly;
+    /// - no access token or refresh token from this flow is persisted;
+    /// - `self.state` and the Graph token cache file are never modified.
+    pub(crate) async fn resource_consent_probe<F>(&self, scope: &str, on_prompt: F) -> Result<()>
+    where
+        F: FnOnce(DeviceCodePrompt),
+    {
+        let response = self
+            .http
+            .post(&self.devicecode_endpoint)
+            .form(&[("client_id", self.client_id.as_str()), ("scope", scope)])
+            .send()
+            .await
+            .map_err(|_| anyhow!("resource consent device-code request failed: transport error"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let err: TokenError = response.json().await.unwrap_or(TokenError {
+                error: "unknown".into(),
+                error_description: None,
+            });
+            anyhow::bail!(
+                "resource consent device-code request failed ({status}): {}",
+                safe_token_error(&err)
+            );
+        }
+
+        let dc: DeviceCodeResponse = response
+            .json()
+            .await
+            .map_err(|_| anyhow!("resource consent device-code response could not be parsed"))?;
+
+        on_prompt(DeviceCodePrompt {
+            verification_uri: dc.verification_uri.clone(),
+            user_code: dc.user_code.clone(),
+            message: dc.message.clone(),
+            expires_in: dc.expires_in,
+        });
+
+        let mut interval = Duration::from_secs(dc.interval.max(1));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(dc.expires_in);
+
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("resource consent device code expired");
+            }
+            tokio::time::sleep(interval).await;
+
+            let response = self
+                .http
+                .post(&self.token_endpoint)
+                .form(&[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("client_id", self.client_id.as_str()),
+                    ("device_code", dc.device_code.as_str()),
+                ])
+                .send()
+                .await
+                .map_err(|_| anyhow!("resource consent token request failed: transport error"))?;
+
+            let status = response.status();
+            if status.is_success() {
+                let token: TokenResponse = response
+                    .json()
+                    .await
+                    .map_err(|_| anyhow!("resource consent token response could not be parsed"))?;
+                if token.access_token.is_empty() {
+                    anyhow::bail!("resource consent completed but no access token was issued");
+                }
+                return Ok(());
+            }
+
+            let err: TokenError = response.json().await.unwrap_or(TokenError {
+                error: "unknown".into(),
+                error_description: None,
+            });
+
+            match err.error.as_str() {
+                "authorization_pending" => continue,
+                "slow_down" => {
+                    interval += Duration::from_secs(5);
+                    continue;
+                }
+                "authorization_declined" | "access_denied" => {
+                    anyhow::bail!("resource consent was declined")
+                }
+                "expired_token" => anyhow::bail!("resource consent device code expired"),
+                _ => anyhow::bail!(
+                    "resource consent token request failed ({status}): {}",
+                    safe_token_error(&err)
+                ),
+            }
+        }
     }
 
     /// Run the interactive device-code flow. `on_prompt` is invoked once with
@@ -274,6 +455,45 @@ impl TokenResponse {
             expires_at: Utc::now() + chrono::Duration::seconds(self.expires_in),
             scope: self.scope,
         }
+    }
+}
+
+fn safe_token_error(err: &TokenError) -> String {
+    let code = safe_oauth_code(&err.error);
+    let aadsts = err
+        .error_description
+        .as_deref()
+        .and_then(aadsts_code)
+        .map(|value| format!(" · {value}"))
+        .unwrap_or_default();
+    format!("{code}{aadsts}")
+}
+
+fn safe_oauth_code(value: &str) -> &str {
+    if !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        value
+    } else {
+        "oauth_error"
+    }
+}
+
+fn aadsts_code(value: &str) -> Option<String> {
+    let start = value.find("AADSTS")?;
+    let rest = &value[start + 6..];
+    let digits: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .take(8)
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(format!("AADSTS{digits}"))
     }
 }
 

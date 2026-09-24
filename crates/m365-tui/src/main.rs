@@ -13,8 +13,10 @@
 //! prompt for asking what the flags are.
 
 mod app;
+mod calendar_ui;
 mod clipboard;
 mod content;
+mod diagnostics;
 mod editor;
 mod files;
 mod images;
@@ -22,6 +24,7 @@ mod navigation;
 mod notify;
 mod opener;
 mod settings;
+mod teams_cache;
 mod termimg;
 mod ui;
 mod wrap;

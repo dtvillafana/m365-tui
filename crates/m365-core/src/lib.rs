@@ -17,7 +17,9 @@ pub mod mail;
 pub mod models;
 pub mod people;
 pub mod subscriptions;
+pub mod teams_presence;
 pub mod util;
+pub mod work_plan;
 
 use std::sync::Arc;
 

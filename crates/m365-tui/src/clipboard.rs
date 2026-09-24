@@ -33,11 +33,30 @@ pub enum ImagePasteError {
 
 /// Copy `text` to the clipboard. Returns the mechanism used, for the status line.
 pub fn copy(text: &str) -> Result<&'static str> {
-    if let Some(tool) = via_helpers(text, COPY_HELPERS) {
+    if let Some(tool) = copy_native(text) {
         return Ok(tool);
     }
     via_osc52(text)?;
     Ok("OSC 52")
+}
+
+/// Try only native clipboard helpers.
+///
+/// Diagnostics use this so a machine without a clipboard program gets a real
+/// log file instead of an OSC 52 sequence that might be silently ignored.
+pub fn copy_native(text: &str) -> Option<&'static str> {
+    via_helpers(text, COPY_HELPERS)
+}
+
+/// Return the first native helper visible on PATH without executing it.
+pub fn native_backend() -> Option<&'static str> {
+    let path = std::env::var_os("PATH")?;
+    COPY_HELPERS.iter().find_map(|&(name, bin, _)| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(bin))
+            .any(|candidate| candidate.is_file())
+            .then_some(name)
+    })
 }
 
 type CopyHelper<'a> = (&'static str, &'a str, &'a [&'a str]);

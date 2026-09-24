@@ -142,6 +142,14 @@ pub async fn photo(graph: &GraphClient, user_id: &str) -> Result<Vec<u8>> {
         .await
 }
 
+/// Presence for one user id.
+///
+/// Used as a fallback for federated contacts when the batch endpoint omits
+/// a cross-tenant user even though direct presence lookup is allowed.
+pub async fn presence(graph: &GraphClient, user_id: &str) -> Result<Presence> {
+    graph.get_json(&format!("users/{user_id}/presence")).await
+}
+
 /// Presence for a set of user ids (Teams status dots).
 pub async fn presences(graph: &GraphClient, user_ids: &[String]) -> Result<Vec<Presence>> {
     if user_ids.is_empty() {
