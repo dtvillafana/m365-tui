@@ -44,6 +44,10 @@ pub enum AppMessage {
     },
     Calendar(Vec<CalEvent>),
     Chats(Vec<Chat>),
+    PeopleSearch {
+        query: String,
+        result: Result<Vec<User>, String>,
+    },
     ChatMessages {
         chat_id: String,
         messages: Vec<ChatMessage>,
@@ -158,6 +162,12 @@ pub enum Overlay {
     FolderSearch {
         query: String,
         sel: usize,
+    },
+    NewChat {
+        query: String,
+        results: Vec<User>,
+        sel: usize,
+        loading: bool,
     },
     Compose(Compose),
     Calendar,
@@ -642,6 +652,7 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("threads", "Toggle mail threads/individual messages"),
     ("calendar", "Open calendar (today)"),
     ("chat-sender", "Teams: chat with selected email's sender"),
+    ("new-chat", "Teams: find a person and start a chat"),
     ("refresh", "Refresh current view"),
     ("help", "Show help"),
     ("settings", "Open settings"),
@@ -956,6 +967,46 @@ impl App {
         self.spawn(async move { Ok(AppMessage::Chats(chats::list_chats(&s.graph, 40).await?)) });
     }
 
+    fn search_chat_people(&self, query: String) {
+        if query.trim().is_empty() {
+            return;
+        }
+        let s = self.session.clone();
+        self.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let result = people::search_users(&s.graph, &query)
+                .await
+                .map_err(|e| m365_core::util::graph_error_summary(&e.to_string()));
+            Ok(AppMessage::PeopleSearch { query, result })
+        });
+    }
+
+    fn open_chat_with_user(&mut self, user_id: String) {
+        let Some(my_id) = self.me.as_ref().map(|me| me.id.clone()) else {
+            self.status = "still loading your account; try again shortly".into();
+            return;
+        };
+        self.status = "opening chat…".into();
+        let s = self.session.clone();
+        self.spawn(async move {
+            let chat = chats::create_one_on_one(&s.graph, &my_id, &user_id).await?;
+            Ok(AppMessage::OpenChat(Some(chat.id)))
+        });
+    }
+
+    fn show_new_chat(&mut self) {
+        if !self.session.config.can_search_people() {
+            self.status = "directory search needs User.ReadBasic.All — grant it, set M365_PEOPLE_SEARCH=1 and sign in again".into();
+            return;
+        }
+        self.overlay = Some(Overlay::NewChat {
+            query: String::new(),
+            results: Vec::new(),
+            sel: 0,
+            loading: false,
+        });
+    }
+
     fn load_chat_messages(&self, chat_id: String, mode: ListUpdate) {
         let s = self.session.clone();
         self.spawn(async move {
@@ -1210,6 +1261,28 @@ impl App {
                     .chat_sel
                     .min(self.teams.chats.len().saturating_sub(1));
             }
+            AppMessage::PeopleSearch { query, result } => {
+                if let Some(Overlay::NewChat {
+                    query: current,
+                    results,
+                    sel,
+                    loading,
+                }) = &mut self.overlay
+                {
+                    if *current == query {
+                        *loading = false;
+                        match result {
+                            Ok(users) => {
+                                *results = users;
+                                *sel = 0;
+                            }
+                            Err(error) => {
+                                self.status = format!("directory search: {error}");
+                            }
+                        }
+                    }
+                }
+            }
             AppMessage::ChatMessages {
                 chat_id,
                 messages,
@@ -1266,9 +1339,19 @@ impl App {
                 self.status = format!("error: {}", m365_core::util::graph_error_summary(&e));
             }
             AppMessage::OpenChat(Some(id)) => {
+                self.overlay = None;
                 self.screen = Screen::Teams;
                 self.teams.mode = TeamsMode::Chats;
                 self.teams.open_chat_id = Some(id.clone());
+                self.teams.open_channel = None;
+                self.teams.messages.clear();
+                self.teams.messages_rendered.clear();
+                self.teams.messages_links.clear();
+                self.teams.messages_images.clear();
+                self.teams.msg_sel = 0;
+                self.teams.messages_next = None;
+                self.teams.replying_to = None;
+                self.teams.editing = None;
                 self.teams.focus = TeamsFocus::Messages;
                 self.load_chat_messages(id, ListUpdate::Replace);
                 self.load_chats();
@@ -2646,6 +2729,11 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char('n')
+                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List =>
+            {
+                self.show_new_chat()
+            }
             // Back out to the conversation list from the messages pane.
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                 self.teams.focus = TeamsFocus::List;
@@ -3603,6 +3691,43 @@ impl App {
                     _ => self.overlay = Some(Overlay::FolderSearch { query, sel }),
                 }
             }
+            Some(Overlay::NewChat {
+                mut query,
+                mut results,
+                mut sel,
+                mut loading,
+            }) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        if let Some(user) = results.get(sel) {
+                            self.open_chat_with_user(user.id.clone());
+                        }
+                    }
+                    KeyCode::Up => sel = sel.saturating_sub(1),
+                    KeyCode::Down => sel = (sel + 1).min(results.len().saturating_sub(1)),
+                    KeyCode::Backspace => {
+                        query.pop();
+                        results.clear();
+                        sel = 0;
+                        loading = !query.trim().is_empty();
+                        self.search_chat_people(query.clone());
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.push(c);
+                        results.clear();
+                        sel = 0;
+                        loading = true;
+                        self.search_chat_people(query.clone());
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::NewChat {
+                    query,
+                    results,
+                    sel,
+                    loading,
+                });
+            }
             Some(Overlay::Palette { mut query, mut sel }) => {
                 let matches = filter_commands(&query);
                 match key.code {
@@ -4085,6 +4210,11 @@ impl App {
                 } else {
                     self.status = "select an email first".into();
                 }
+            }
+            "new-chat" => {
+                self.screen = Screen::Teams;
+                self.teams.mode = TeamsMode::Chats;
+                self.show_new_chat();
             }
             "refresh" => self.refresh_current(),
             "help" => self.overlay = Some(Overlay::Help),

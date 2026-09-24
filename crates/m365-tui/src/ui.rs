@@ -204,6 +204,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Settings { .. } => "Space/Enter toggle · Esc close",
             Overlay::Search { .. } => "Enter search · Esc cancel",
             Overlay::FolderSearch { .. } => "↑↓ choose · Enter open · Esc cancel",
+            Overlay::NewChat { .. } => "Type name/username · ↑↓ choose · Enter chat · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
             Overlay::MoveMail { .. } => "j/k/g/G choose · Enter move · Esc cancel",
             Overlay::Calendar | Overlay::Help => "Esc close",
@@ -220,7 +221,7 @@ fn context_hints(app: &App) -> &'static str {
             }
         },
         Screen::Teams => match app.teams.focus {
-            TeamsFocus::List => "j/k move · g/G · l open · t chats/channels",
+            TeamsFocus::List => "j/k move · g/G · l open · n new chat · t chats/channels",
             TeamsFocus::Messages => {
                 "j/k select · g/G · h back · r reply · E edit · e react · v image"
             }
@@ -1411,7 +1412,7 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
            t toggles threads/individual messages\n\
           folders pane / finds a folder · reading pane j/k scroll · g/G\n\
  \n\
- Teams:   t chats/channels · j/k select message · g oldest · G newest · e react · v full image\n\
+  Teams:   n new chat (chat list) · t chats/channels · j/k select message · g oldest · G newest · e react · v full image\n\
           i type · r reply · E edit (Up in empty composer = last of yours) · Enter send\n\
           Ctrl+V paste image · @path Tab complete image · Ctrl+X remove last image\n\
  \n\
@@ -1505,6 +1506,59 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
                 ),
                 rows[1],
                 &mut st,
+            );
+        }
+        Overlay::NewChat {
+            query,
+            results,
+            sel,
+            loading,
+        } => {
+            let area = centered(60, 60, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("New Teams chat — find a person");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(0)])
+                .split(inner);
+            f.render_widget(Paragraph::new(format!("> {query}▏")), rows[0]);
+            let items: Vec<ListItem> = if results.is_empty() {
+                vec![ListItem::new(if query.is_empty() {
+                    "Type a name or username to search the directory"
+                } else if *loading {
+                    "Searching…"
+                } else {
+                    "No matching users"
+                })]
+            } else {
+                results
+                    .iter()
+                    .map(|user| {
+                        let name = user.display_name.as_deref().unwrap_or("(no name)");
+                        let username = user
+                            .user_principal_name
+                            .as_deref()
+                            .or(user.mail.as_deref())
+                            .unwrap_or("");
+                        ListItem::new(format!("{name}  <{username}>"))
+                    })
+                    .collect()
+            };
+            let mut state = ListState::default();
+            if !results.is_empty() {
+                state.select(Some(*sel));
+            }
+            f.render_stateful_widget(
+                List::new(items).highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                rows[1],
+                &mut state,
             );
         }
         Overlay::Palette { query, sel } => {

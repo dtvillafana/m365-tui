@@ -90,6 +90,34 @@ pub async fn relevant_people(graph: &GraphClient, search: Option<&str>) -> Resul
     graph.get_collection(&path).await
 }
 
+/// Search directory users by display name or the beginning of their username
+/// (UPN). Requires delegated User.ReadBasic.All.
+pub async fn search_users(graph: &GraphClient, query: &str) -> Result<Vec<User>> {
+    let Some(path) = user_search_path(query) else {
+        return Ok(Vec::new());
+    };
+    graph.get_page(&path).await
+}
+
+fn user_search_path(query: &str) -> Option<String> {
+    let escaped = query.trim().replace('\'', "''");
+    if escaped.is_empty() {
+        return None;
+    }
+    let mut url = reqwest::Url::parse("https://graph.microsoft.com/v1.0/users").ok()?;
+    url.query_pairs_mut()
+        .append_pair("$select", "id,displayName,mail,userPrincipalName")
+        .append_pair("$top", "25")
+        .append_pair(
+            "$filter",
+            &format!(
+                "startswith(displayName,'{escaped}') or startswith(userPrincipalName,'{escaped}')"
+            ),
+        );
+    // Pass only the relative path so M365_GRAPH_BASE still works for mocks.
+    Some(format!("users?{}", url.query().unwrap_or_default()))
+}
+
 /// Resolve a user id from an email address (used to open a chat with an email
 /// sender). Returns `None` if the address is not a known directory user.
 pub async fn user_id_for_email(graph: &GraphClient, email: &str) -> Result<Option<String>> {
@@ -128,4 +156,22 @@ pub async fn presences(graph: &GraphClient, user_ids: &[String]) -> Result<Vec<P
         .post_json("communications/getPresencesByUserId", &payload)
         .await?;
     Ok(w.value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_search_path;
+
+    #[test]
+    fn directory_search_encodes_and_escapes_username() {
+        assert!(user_search_path("  ").is_none());
+        let path = user_search_path(" O'Brien+test ").unwrap();
+        let url = reqwest::Url::parse(&format!("https://graph.microsoft.com/v1.0/{path}")).unwrap();
+        let filter = url
+            .query_pairs()
+            .find(|(key, _)| key == "$filter")
+            .unwrap()
+            .1;
+        assert_eq!(filter, "startswith(displayName,'O''Brien+test') or startswith(userPrincipalName,'O''Brien+test')");
+    }
 }

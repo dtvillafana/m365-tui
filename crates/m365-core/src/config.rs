@@ -52,6 +52,10 @@ pub const PRESENCE_WRITE_SCOPE: &str = "Presence.ReadWrite";
 /// Chats work without it. Opt in with `M365_TEAMS_CHANNELS=1`.
 pub const TEAMS_READ_SCOPE: &str = "Team.ReadBasic.All";
 
+/// Directory search for starting chats with people outside the recent chat list.
+/// Opt in with `M365_PEOPLE_SEARCH=1`.
+pub const PEOPLE_SEARCH_SCOPE: &str = "User.ReadBasic.All";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Entra application (client) ID of the registered public client.
@@ -93,6 +97,9 @@ impl Config {
                 }
                 if env_flag("M365_TEAMS_CHANNELS") {
                     s.push(TEAMS_READ_SCOPE.to_string());
+                }
+                if env_flag("M365_PEOPLE_SEARCH") {
+                    s.push(PEOPLE_SEARCH_SCOPE.to_string());
                 }
                 s
             }
@@ -152,6 +159,10 @@ impl Config {
     /// Whether the token we request can enumerate teams and channels.
     pub fn can_read_teams(&self) -> bool {
         self.has_scope(TEAMS_READ_SCOPE)
+    }
+
+    pub fn can_search_people(&self) -> bool {
+        self.has_scope(PEOPLE_SEARCH_SCOPE)
     }
 
     fn has_scope(&self, scope: &str) -> bool {

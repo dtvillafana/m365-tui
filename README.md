@@ -108,7 +108,8 @@ Then two settings on that app:
    | Permission | Enables | Flag |
    |---|---|---|
    | `Team.ReadBasic.All` | Teams **channels** (chats work without it) | `M365_TEAMS_CHANNELS=1` |
-   | `Presence.ReadWrite` | Setting your own status | `M365_PRESENCE_WRITE=1` |
+    | `Presence.ReadWrite` | Setting your own status | `M365_PRESENCE_WRITE=1` |
+    | `User.ReadBasic.All` | Finding people outside your recent Teams chats by name or username | `M365_PEOPLE_SEARCH=1` |
 
 7. Click **Grant admin consent**.
 
@@ -207,7 +208,7 @@ Press `?` in the app for this list at any time.
 | **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · `g`/`G` top/bottom · `Shift+H`/`Shift+L` resize Outlook folders · arrows work the same · `Tab` cycles |
 | **Outlook** | `Enter` open · `t` threads/individual messages · `c` compose · `r` reply · `a` reply-all · `f` forward · `u` read/unread · `m` move folder · `d` trash · `/` search mail · folders pane `/` find folder · `e` calendar |
 | **Reading a mail** | `j`/`k` scroll · `g`/`G` or `Home`/`End` · `h` back to the list |
-| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` oldest · `G` newest · `e` react · `v` full image · `r` reply · `E` edit · `i` write · `Enter` send · `Ctrl+V` paste image · `@path` `Tab` complete |
+| **Teams** | `n` find a person/start a chat from the chats list (needs `M365_PEOPLE_SEARCH=1`) · `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` oldest · `G` newest · `e` react · `v` full image · `r` reply · `E` edit · `i` write · `Enter` send · `Ctrl+V` paste image · `@path` `Tab` complete |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
@@ -233,6 +234,15 @@ changing with whatever has focus. The bottom-left carries the most recent
 message, which clears itself after a few seconds.
 
 ## Things worth knowing
+
+**Starting a new Teams chat.** In the Teams chats list, press `n`, type the
+start of a person's name or username (user principal name), choose a directory
+result with ↑/↓ and press Enter. This opens an existing 1:1 chat or creates one;
+you can then write to them as usual. Directory search needs delegated
+`User.ReadBasic.All` in your app registration and `M365_PEOPLE_SEARCH=1` in
+`.env`. After adding the permission, grant consent and sign in again (remove
+`~/.config/m365-tui/token-cache.json` if the old token is reused). If you set
+`M365_SCOPES` explicitly, add `User.ReadBasic.All` to that list instead.
 
 **Sending attachments.** In the Outlook compose window, `Tab` to the `Attach:`
 field, type a file path (`~` works), press `Tab` to complete it, and press
