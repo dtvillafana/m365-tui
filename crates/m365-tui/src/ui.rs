@@ -241,7 +241,9 @@ fn context_hints(app: &App) -> &'static str {
             }
         },
         Screen::Teams => match app.teams.focus {
-            TeamsFocus::List => "j/k move · g/G · l open · n new chat · t chats/channels",
+            TeamsFocus::List => {
+                "j/k move · Enter open/drawer · x archive · X stay · n new · t channels"
+            }
             TeamsFocus::Messages => {
                 "j/k select · g/G · h back · r reply · E edit · e react · v image"
             }
@@ -294,7 +296,7 @@ fn outlook_constraints(app: &App) -> [Constraint; 3] {
 fn teams_list_constraint(app: &App) -> Constraint {
     if app.panes_vertical {
         let n = match app.teams.mode {
-            TeamsMode::Chats => app.teams.chats.len(),
+            TeamsMode::Chats => app.teams_chat_row_count(),
             TeamsMode::Channels if app.teams.channels.is_empty() => app.teams.teams.len(),
             TeamsMode::Channels => app.teams.channels.len(),
         };
@@ -639,15 +641,19 @@ fn conversation_flow(app: &App, selectable: bool) -> (Vec<FlowItem>, Vec<usize>)
     for (i, m) in app.teams.messages.iter().enumerate() {
         let when = local_time(m.created_date_time.as_deref());
         let mut day_changed = false;
-        if let Some(when) = when {
-            let day = when.date_naive();
-            if last_day != Some(day) {
-                if last_day.is_some() {
-                    flow.push(FlowItem::Line(Line::from("")));
+        // A deleted message can still render its tombstone, but it must not
+        // create or keep a day separator by itself.
+        if message_has_day_context(m) {
+            if let Some(when) = when {
+                let day = when.date_naive();
+                if last_day != Some(day) {
+                    if last_day.is_some() {
+                        flow.push(FlowItem::Line(Line::from("")));
+                    }
+                    flow.push(FlowItem::Line(day_separator(&day_label(day))));
+                    last_day = Some(day);
+                    day_changed = true;
                 }
-                flow.push(FlowItem::Line(day_separator(&day_label(day))));
-                last_day = Some(day);
-                day_changed = true;
             }
         }
         // Record the start *after* any separator, so scrolling to a message
@@ -977,13 +983,98 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     // Left list: chats or channels
     let (title, items, sel): (&str, Vec<ListItem>, usize) = match app.teams.mode {
         TeamsMode::Chats => {
-            let items = app
+            let mut rows: Vec<Option<&m365_core::models::Chat>> = app
                 .teams
                 .chats
                 .iter()
-                .map(|c| ListItem::new(truncate(&c.label(me_id), 30)))
+                .filter(|chat| !app.teams_chat_is_archived(chat))
+                .map(Some)
                 .collect();
-            ("Chats (t→channels)", items, app.teams.chat_sel)
+            rows.push(None);
+            if app.teams.archive_expanded {
+                rows.extend(
+                    app.teams
+                        .chats
+                        .iter()
+                        .filter(|chat| app.teams_chat_is_archived(chat))
+                        .map(Some),
+                );
+            }
+            let items = rows
+                .into_iter()
+                .map(|row| match row {
+                    None => {
+                        let arrow = if app.teams.archive_expanded {
+                            "▾"
+                        } else {
+                            "▸"
+                        };
+                        ListItem::new(Span::styled(
+                            truncate(
+                                &format!("{arrow} Archive [{}]", app.teams_archive_count()),
+                                30,
+                            ),
+                            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                        ))
+                    }
+                    Some(chat) => {
+                        let stay = if app.teams_chat_is_stay_archived(&chat.id) {
+                            "S "
+                        } else {
+                            ""
+                        };
+                        let (marker, marker_color) =
+                            contact_presence_marker(app.teams_peer_presence(chat));
+                        let show_marker = chat
+                            .chat_type
+                            .as_deref()
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+                            && app.session.config.presence_read
+                            && app.teams_peer_presence(chat).is_some();
+                        let prefix = if show_marker {
+                            format!("{stay}{marker} ")
+                        } else {
+                            stay.to_string()
+                        };
+                        let label = truncate(
+                            &chat.label(me_id),
+                            30usize.saturating_sub(prefix.chars().count()),
+                        );
+                        let tier = if stay.is_empty() {
+                            match app.teams_chat_poll_tier(&chat.id) {
+                                crate::teams_chat::ChatPollTier::Hot => Style::default()
+                                    .fg(Color::LightCyan)
+                                    .add_modifier(Modifier::BOLD),
+                                crate::teams_chat::ChatPollTier::Warm => {
+                                    Style::default().fg(ACCENT)
+                                }
+                                crate::teams_chat::ChatPollTier::Cool => {
+                                    Style::default().fg(ACCENT).add_modifier(Modifier::DIM)
+                                }
+                                crate::teams_chat::ChatPollTier::Normal => Style::default(),
+                            }
+                        } else {
+                            Style::default().fg(DIM)
+                        };
+                        let mut spans = Vec::new();
+                        if show_marker {
+                            if !stay.is_empty() {
+                                spans
+                                    .push(Span::styled(stay.to_string(), Style::default().fg(DIM)));
+                            }
+                            spans.push(Span::styled(
+                                format!("{marker} "),
+                                Style::default().fg(marker_color),
+                            ));
+                        } else if !prefix.is_empty() {
+                            spans.push(Span::styled(prefix, Style::default().fg(DIM)));
+                        }
+                        spans.push(Span::styled(label, tier));
+                        ListItem::new(Line::from(spans))
+                    }
+                })
+                .collect();
+            ("Chats (x archive)", items, app.teams.chat_sel)
         }
         TeamsMode::Channels => {
             if app.teams.channels.is_empty() {
@@ -1021,10 +1112,13 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     // One extra row while a reply or edit is in progress, for the banner.
     let reply_row = u16::from(app.teams.replying_to.is_some() || app.teams.editing.is_some());
     let preview_h = composer_preview_height(app, composer_width as u16);
+    let out_of_office = visible_chat_out_of_office(app);
+    let oof_row = u16::from(out_of_office.is_some());
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
+            Constraint::Length(oof_row),
             Constraint::Length(composer_rows + reply_row + preview_h + 2),
         ])
         .split(cols[1]);
@@ -1076,6 +1170,9 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
 
+    // Always clear the pinned date row first. When the last live message for a
+    // day disappears, sticky_day_label() intentionally returns None.
+    f.render_widget(Clear, pane[0]);
     if let Some(label) = sticky_day_label(app, &msg_rows, scroll) {
         f.render_widget(Paragraph::new(day_separator(&label)), pane[0]);
     }
@@ -1089,9 +1186,25 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         "Message"
     };
+    if let Some(message) = out_of_office.as_deref() {
+        let value = if message.is_empty() {
+            "Out of office".to_string()
+        } else {
+            format!("OOO: {message}")
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                truncate(&value, right[1].width.max(1) as usize),
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            right[1],
+        );
+    }
     let composer_block = panel_block(title, composing);
-    let mut composer_inner = composer_block.inner(right[1]);
-    f.render_widget(composer_block, right[1]);
+    let mut composer_inner = composer_block.inner(right[2]);
+    f.render_widget(composer_block, right[2]);
 
     // Show what's being replied to or edited, so Enter isn't a surprise.
     if app.teams.editing.is_some() {
@@ -1513,7 +1626,7 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
  Calendar: F3 full screen · j/k event · Enter details · a accept · d decline · t tentative\n\
            o join meeting · w agenda range · v month/agenda · n today · r refresh\n\
  \n\
-  Teams:   n new chat (chat list) · t chats/channels · j/k select message · g oldest · G newest · e react · v full image\n\
+  Teams:   n new chat (chat list) · t chats/channels · x archive/restore · X Stay archived · j/k select · g/G · e react · v image\n\
           i type · r reply · E edit (Up in empty composer = last of yours) · Enter send\n\
           Ctrl+V paste image · @path Tab complete image · Ctrl+X remove last image\n\
           j/k in chat list shows a cached preview without marking the chat read\n\
@@ -2126,21 +2239,127 @@ fn day_label(day: chrono::NaiveDate) -> String {
     }
 }
 
+/// Whether a Teams message is allowed to establish a Today/Yesterday/date
+/// context. Deleted messages can still render their tombstone row, but a day
+/// containing no live messages must not leave an orphan separator.
+fn message_has_day_context(message: &m365_core::models::ChatMessage) -> bool {
+    message.deleted_date_time.is_none()
+}
+
+fn presence_is_out_of_office(presence: &m365_core::models::Presence) -> bool {
+    presence
+        .out_of_office_settings
+        .as_ref()
+        .and_then(|settings| settings.is_out_of_office)
+        .unwrap_or(false)
+        || presence
+            .activity
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("outOfOffice"))
+        || presence
+            .availability
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("outOfOffice"))
+}
+
+fn compact_presence_message(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let looks_like_html = raw.contains('<');
+    let text = if looks_like_html {
+        let rendered = crate::content::render_body(Some("html"), raw);
+        crate::content::plain(&rendered.text)
+    } else {
+        raw.to_string()
+    };
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn presence_out_of_office_message(presence: &m365_core::models::Presence) -> Option<String> {
+    if !presence_is_out_of_office(presence) {
+        return None;
+    }
+    Some(
+        presence
+            .out_of_office_settings
+            .as_ref()
+            .and_then(|settings| settings.message.as_deref())
+            .map(compact_presence_message)
+            .unwrap_or_default(),
+    )
+}
+
+fn visible_chat_out_of_office(app: &App) -> Option<String> {
+    let chat_id = app
+        .teams
+        .open_chat_id
+        .as_deref()
+        .or(app.teams.preview_chat_id.as_deref())?;
+    let chat = app.teams.chats.iter().find(|chat| chat.id == chat_id)?;
+    if !chat
+        .chat_type
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+    {
+        return None;
+    }
+    presence_out_of_office_message(app.teams_peer_presence(chat)?)
+}
+
+fn contact_presence_marker(
+    presence: Option<&m365_core::models::Presence>,
+) -> (&'static str, Color) {
+    let out_of_office = presence.is_some_and(presence_is_out_of_office);
+    let availability = presence
+        .and_then(|presence| presence.availability.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let activity = presence
+        .and_then(|presence| presence.activity.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if out_of_office {
+        ("◒", Color::LightMagenta)
+    } else if activity == "presenting" || availability == "donotdisturb" {
+        ("×", Color::Red)
+    } else if activity == "inacall" || activity == "inameeting" || availability.starts_with("busy")
+    {
+        ("●", Color::Red)
+    } else if availability == "away" || availability == "berightback" {
+        ("◐", Color::Yellow)
+    } else if availability.starts_with("available") {
+        ("●", Color::LightGreen)
+    } else {
+        ("○", Color::DarkGray)
+    }
+}
+
 /// Day label for the message currently at the top of the visible area — the
-/// content of the pinned header. `starts` is ascending, so the topmost visible
-/// message is the last one starting at or above the scroll offset.
+/// content of the pinned header. Deleted messages must not keep a stale marker.
 fn sticky_day_label(app: &App, starts: &[usize], scroll: u16) -> Option<String> {
-    let idx = topmost_message_index(starts, scroll);
+    let idx = topmost_visible_message_index(starts, scroll, |idx| {
+        app.teams
+            .messages
+            .get(idx)
+            .is_some_and(message_has_day_context)
+    })?;
     let when = local_time(app.teams.messages.get(idx)?.created_date_time.as_deref())?;
     Some(day_label(when.date_naive()))
 }
 
-/// Index of the message occupying the top of the visible area.
-fn topmost_message_index(starts: &[usize], scroll: u16) -> usize {
+/// Index of the rendered message occupying the top of the visible area.
+fn topmost_visible_message_index(
+    starts: &[usize],
+    scroll: u16,
+    mut visible: impl FnMut(usize) -> bool,
+) -> Option<usize> {
     starts
         .iter()
-        .rposition(|&s| s <= scroll as usize)
-        .unwrap_or(0)
+        .enumerate()
+        .rev()
+        .find_map(|(idx, &start)| (start <= scroll as usize && visible(idx)).then_some(idx))
 }
 
 fn day_separator(label: &str) -> Line<'static> {
@@ -2266,19 +2485,67 @@ mod tests {
     }
 
     #[test]
-    fn sticky_header_tracks_topmost_message() {
-        use super::topmost_message_index;
-        // Three messages beginning at lines 0, 5 and 12.
+    fn sticky_header_tracks_topmost_visible_message() {
+        use super::topmost_visible_message_index;
         let starts = [0usize, 5, 12];
-        assert_eq!(topmost_message_index(&starts, 0), 0);
-        assert_eq!(topmost_message_index(&starts, 4), 0); // still inside msg 0
-        assert_eq!(topmost_message_index(&starts, 5), 1); // exactly at msg 1
-        assert_eq!(topmost_message_index(&starts, 11), 1);
-        assert_eq!(topmost_message_index(&starts, 12), 2);
-        assert_eq!(topmost_message_index(&starts, 99), 2); // clamped past the end
-                                                           // A separator above the first message must not select a negative index.
-        assert_eq!(topmost_message_index(&[3, 9], 0), 0);
-        assert_eq!(topmost_message_index(&[], 7), 0);
+        assert_eq!(topmost_visible_message_index(&starts, 0, |_| true), Some(0));
+        assert_eq!(topmost_visible_message_index(&starts, 4, |_| true), Some(0));
+        assert_eq!(topmost_visible_message_index(&starts, 5, |_| true), Some(1));
+        assert_eq!(
+            topmost_visible_message_index(&starts, 12, |_| true),
+            Some(2)
+        );
+        assert_eq!(
+            topmost_visible_message_index(&starts, 99, |_| true),
+            Some(2)
+        );
+        let starts = [0usize, 0, 7];
+        let visible = [false, true, true];
+        assert_eq!(
+            topmost_visible_message_index(&starts, 0, |idx| visible[idx]),
+            Some(1)
+        );
+        assert_eq!(topmost_visible_message_index(&[], 7, |_| true), None);
+    }
+
+    #[test]
+    fn deleted_message_does_not_anchor_day_marker() {
+        let live: m365_core::models::ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "live",
+            "createdDateTime": "2026-09-29T10:00:00Z",
+            "body": { "contentType": "text", "content": "hello" }
+        }))
+        .unwrap();
+        let deleted: m365_core::models::ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "deleted",
+            "createdDateTime": "2026-09-29T10:00:00Z",
+            "deletedDateTime": "2026-09-30T07:00:00Z",
+            "body": { "contentType": "text", "content": "" }
+        }))
+        .unwrap();
+        assert!(super::message_has_day_context(&live));
+        assert!(!super::message_has_day_context(&deleted));
+    }
+
+    #[test]
+    fn contact_presence_marker_keeps_ooo_when_contact_is_offline() {
+        let presence: m365_core::models::Presence = serde_json::from_value(serde_json::json!({
+            "availability": "Offline",
+            "activity": "Offline",
+            "outOfOfficeSettings": {
+                "isOutOfOffice": true,
+                "message": "Back tomorrow"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            super::contact_presence_marker(Some(&presence)),
+            ("◒", ratatui::style::Color::LightMagenta)
+        );
+        assert_eq!(
+            super::presence_out_of_office_message(&presence).as_deref(),
+            Some("Back tomorrow")
+        );
     }
 
     #[test]

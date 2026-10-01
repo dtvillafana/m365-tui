@@ -49,6 +49,35 @@ pub async fn list_messages(
     graph.get_page_with_next(&path).await
 }
 
+/// Hide or unhide a chat for the signed-in user.
+///
+/// This is the server-side Teams archive state surfaced by
+/// `chat.viewpoint.isHidden` in the list-chats response.
+pub async fn set_hidden(
+    graph: &GraphClient,
+    chat_id: &str,
+    user_id: &str,
+    tenant_id: &str,
+    hidden: bool,
+) -> Result<()> {
+    let action = if hidden {
+        "hideForUser"
+    } else {
+        "unhideForUser"
+    };
+    graph
+        .post_action(
+            &format!("chats/{chat_id}/{action}"),
+            &json!({
+                "user": {
+                    "id": user_id,
+                    "tenantId": tenant_id
+                }
+            }),
+        )
+        .await
+}
+
 /// Fetch the next (older) page from an `@odata.nextLink`.
 pub async fn list_messages_more(
     graph: &GraphClient,

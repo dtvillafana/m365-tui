@@ -115,6 +115,31 @@ pub enum AppMessage {
     Tick,
     /// Periodic tick: refresh the current view from the server.
     Poll,
+    /// One-second scheduler tick for accelerated Teams chats. Performs no I/O.
+    HotPollTick,
+    /// A background hot-chat poll was superseded before it reached Graph.
+    HotChatPollSkipped {
+        chat_id: String,
+    },
+    /// Result of an accelerated Teams message GET.
+    HotChatPollFinished {
+        chat_id: String,
+        messages: Vec<ChatMessage>,
+        next: Option<String>,
+        error: Option<String>,
+    },
+    /// Server-side hide/unhide finished.
+    ChatVisibilityChanged {
+        chat_id: String,
+        hidden: bool,
+    },
+    /// Stay archived maintenance hide finished.
+    StayArchivedRehideFinished {
+        chat_id: String,
+        error: Option<String>,
+    },
+    /// Presence for one-to-one chat peers, including out-of-office settings.
+    ContactPresences(Vec<Presence>),
     /// Debounced mail body/thread fetch: only run if this generation is still current.
     OpenMailDue {
         generation: u64,
@@ -543,7 +568,16 @@ enum ReadingKey {
 pub struct TeamsState {
     pub mode: TeamsMode,
     pub chats: Vec<Chat>,
+    /// Row in the chat list, including the Archive drawer. Not an index into `chats`.
     pub chat_sel: usize,
+    /// Whether archived chats are listed under the Archive drawer.
+    pub archive_expanded: bool,
+    /// Chats that stay in the local Archive drawer even if Teams unhides them.
+    pub stay_archived: std::collections::HashSet<String>,
+    /// Automatic hideForUser calls currently queued for Stay archived.
+    stay_archived_rehide_in_flight: std::collections::HashSet<String>,
+    /// Presence for one-to-one peers, keyed by directory user id.
+    pub contact_presences: std::collections::HashMap<String, Presence>,
     pub teams: Vec<Team>,
     pub team_sel: usize,
     pub channels: Vec<m365_core::models::Channel>,
@@ -590,6 +624,10 @@ impl Default for TeamsState {
             mode: TeamsMode::Chats,
             chats: Vec::new(),
             chat_sel: 0,
+            archive_expanded: false,
+            stay_archived: std::collections::HashSet::new(),
+            stay_archived_rehide_in_flight: std::collections::HashSet::new(),
+            contact_presences: std::collections::HashMap::new(),
             teams: Vec::new(),
             team_sel: 0,
             channels: Vec::new(),
@@ -696,6 +734,10 @@ pub struct App {
     last_poll: Option<std::time::Instant>,
     chat_cache_warmup_started: bool,
     contact_user_ids: std::collections::HashMap<String, String>,
+    /// Activity/rate state for accelerated Teams chats.
+    teams_hot_chat_state: std::collections::HashMap<String, crate::teams_chat::TeamsHotChatState>,
+    /// Shared rate/concurrency limiter for optional Teams message GETs.
+    teams_background_limiter: crate::teams_chat::TeamsBackgroundLimiter,
 }
 
 /// Palette command identifiers.
@@ -811,13 +853,23 @@ fn calendar_event_intersects_month(event: &CalEvent, month_offset: i32) -> bool 
 
 impl App {
     pub fn new(session: Session, tx: mpsc::Sender<AppMessage>) -> Self {
+        let cache_dir = session.config.teams_image_cache_dir.as_deref();
+        let teams = TeamsState {
+            stay_archived: crate::teams_chat::load_stay_archived(cache_dir),
+            archive_expanded: crate::teams_chat::load_archive_expanded(cache_dir),
+            ..TeamsState::default()
+        };
+        let teams_background_limiter = crate::teams_chat::TeamsBackgroundLimiter::new(
+            session.config.teams_poll_budget_rps,
+            session.graph.throttle_generation(),
+        );
         Self {
             session,
             tx,
             screen: Screen::Outlook,
             outlook: OutlookState::default(),
             outlook_focus: OutlookFocus::Messages,
-            teams: TeamsState::default(),
+            teams,
             calendar: CalendarState::default(),
             overlay: None,
             status: "loading…".into(),
@@ -864,6 +916,8 @@ impl App {
             last_poll: None,
             chat_cache_warmup_started: false,
             contact_user_ids: std::collections::HashMap::new(),
+            teams_hot_chat_state: std::collections::HashMap::new(),
+            teams_background_limiter,
         }
     }
 
@@ -983,8 +1037,7 @@ impl App {
             if self.session.config.calendar_notify.internal() {
                 internal.push(text.clone());
             }
-            if self.session.config.calendar_notify.external() && self.session.config.notifications
-            {
+            if self.session.config.calendar_notify.external() && self.session.config.notifications {
                 crate::notify::send("Calendar", &text);
             }
         }
@@ -1018,15 +1071,21 @@ impl App {
         let messages = messages.to_vec();
         let chat_id = chat_id.to_string();
         tokio::task::spawn_blocking(move || {
-            if let Err(error) = crate::teams_cache::store_conversation(&root, &chat_id, &messages)
-            {
+            if let Err(error) = crate::teams_cache::store_conversation(&root, &chat_id, &messages) {
                 tracing::debug!("could not persist Teams conversation cache: {error}");
             }
         });
     }
 
     fn preview_selected_teams_chat(&mut self) {
-        let Some(chat) = self.teams.chats.get(self.teams.chat_sel) else {
+        let Some(chat) = self.teams_selected_chat() else {
+            self.teams.preview_chat_id = None;
+            if self.teams.open_chat_id.is_none() {
+                self.teams.messages.clear();
+                self.teams.messages_rendered.clear();
+                self.teams.messages_links.clear();
+                self.teams.messages_images.clear();
+            }
             return;
         };
         let id = chat.id.clone();
@@ -1057,9 +1116,7 @@ impl App {
         self.chat_cache_warmup_started = true;
         let mut ids: Vec<String> = Vec::new();
         if let Some(current) = self
-            .teams
-            .chats
-            .get(self.teams.chat_sel)
+            .teams_selected_chat()
             .map(|chat| chat.id.clone())
             .or_else(|| self.teams.last_chat_id.clone())
         {
@@ -1149,7 +1206,7 @@ impl App {
             self.status = "F7 diagnoses the selected Teams 1:1 chat".into();
             return;
         }
-        let Some(chat) = self.teams.chats.get(self.teams.chat_sel) else {
+        let Some(chat) = self.teams_selected_chat() else {
             self.status = "no Teams chat selected".into();
             return;
         };
@@ -1178,7 +1235,9 @@ impl App {
             .and_then(|value| value.rsplit('.').next())
             .unwrap_or("unknown")
             .to_string();
-        let personal = member_type.to_ascii_lowercase().contains("microsoftaccount")
+        let personal = member_type
+            .to_ascii_lowercase()
+            .contains("microsoftaccount")
             || member_type.to_ascii_lowercase().contains("skype");
         let lookup = peer
             .and_then(|member| member.email.as_deref())
@@ -1278,7 +1337,8 @@ impl App {
             );
             if presence_read && supported {
                 if let Some(user_id) = probe_id.clone() {
-                    batch = match people::presences(&s.graph, std::slice::from_ref(&user_id)).await {
+                    batch = match people::presences(&s.graph, std::slice::from_ref(&user_id)).await
+                    {
                         Ok(items) => items
                             .into_iter()
                             .next()
@@ -1920,20 +1980,87 @@ impl App {
                 self.contact_diagnostics.loading = false;
             }
             AppMessage::Chats(c) => {
+                let selected_chat_id = self.teams_selected_chat().map(|chat| chat.id.clone());
+                let archive_selected =
+                    !self.teams.chats.is_empty() && self.teams.chat_sel == self.teams_archive_row();
+                self.sync_teams_hot_activity_from_chats(&c);
+                self.remember_contact_ids(&c);
                 self.notify_for_chats(&c);
                 self.warm_teams_conversation_caches(&c);
                 self.teams.chats = c;
-                self.teams.chat_sel = self
-                    .teams
-                    .chat_sel
-                    .min(self.teams.chats.len().saturating_sub(1));
+                self.load_contact_presences();
+                self.teams.chat_sel = selected_chat_id
+                    .as_deref()
+                    .and_then(|id| self.teams_chat_row_for_id(id))
+                    .or_else(|| archive_selected.then(|| self.teams_archive_row()))
+                    .unwrap_or(self.teams.chat_sel)
+                    .min(self.teams_chat_row_count().saturating_sub(1));
                 if self.teams.focus == TeamsFocus::List
                     && self.teams.mode == TeamsMode::Chats
                     && self.teams.open_chat_id.is_none()
                 {
                     self.preview_selected_teams_chat();
                 }
+                // Teams unhides a chat when a new message arrives. Keep Stay
+                // archived chats in the drawer by restoring the server hide.
+                self.rehide_stay_archived_chats();
             }
+            AppMessage::ChatVisibilityChanged { chat_id, hidden } => {
+                let previous_row = self.teams.chat_sel;
+                if let Some(chat) = self.teams.chats.iter_mut().find(|chat| chat.id == chat_id) {
+                    chat.viewpoint
+                        .get_or_insert_with(Default::default)
+                        .is_hidden = Some(hidden);
+                }
+                self.status = if hidden {
+                    "Teams chat archived".into()
+                } else {
+                    "Teams chat restored".into()
+                };
+                self.teams.chat_sel = self
+                    .teams_chat_row_for_id(&chat_id)
+                    .unwrap_or(previous_row.min(self.teams_chat_row_count().saturating_sub(1)));
+                if self.screen == Screen::Teams
+                    && self.teams.mode == TeamsMode::Chats
+                    && self.teams.focus == TeamsFocus::List
+                {
+                    self.preview_selected_teams_chat();
+                }
+                self.load_chats();
+            }
+            AppMessage::StayArchivedRehideFinished { chat_id, error } => {
+                self.teams.stay_archived_rehide_in_flight.remove(&chat_id);
+                if let Some(error) = error {
+                    tracing::warn!("Stay archived re-hide failed for {chat_id}: {error}");
+                    self.status = "Stay archived re-hide failed; will retry".into();
+                } else if let Some(chat) =
+                    self.teams.chats.iter_mut().find(|chat| chat.id == chat_id)
+                {
+                    chat.viewpoint
+                        .get_or_insert_with(Default::default)
+                        .is_hidden = Some(true);
+                }
+            }
+            AppMessage::ContactPresences(items) => {
+                for presence in items {
+                    if let Some(id) = presence.id.clone() {
+                        self.teams.contact_presences.insert(id, presence);
+                    }
+                }
+            }
+            AppMessage::HotPollTick => self.poll_hot_chats_if_due(),
+            AppMessage::HotChatPollSkipped { chat_id } => {
+                if let Some(state) = self.teams_hot_chat_state.get_mut(&chat_id) {
+                    state.hot_pending = false;
+                    state.last_poll_started = Some(std::time::Instant::now());
+                }
+            }
+            AppMessage::HotChatPollFinished {
+                chat_id,
+                messages,
+                next,
+                error,
+            } => self.apply_hot_chat_poll(chat_id, messages, next, error),
             AppMessage::PeopleSearch { query, result } => {
                 if let Some(Overlay::NewChat {
                     query: current,
@@ -1962,7 +2089,10 @@ impl App {
                 next,
                 mode,
             } => {
-                if self.teams.open_chat_id.as_deref() == Some(&chat_id) {
+                self.observe_teams_chat_page(&chat_id, &messages);
+                if self.teams.open_chat_id.as_deref() == Some(&chat_id)
+                    || self.teams.preview_chat_id.as_deref() == Some(&chat_id)
+                {
                     self.teams.last_chat_id = Some(chat_id.clone());
                     self.set_teams_messages(messages, next, mode);
                     self.persist_teams_conversation_cache(&chat_id, &self.teams.messages);
@@ -2171,9 +2301,12 @@ impl App {
             self.load_messages(f.id.clone(), ListUpdate::Merge);
         }
         // Teams: refresh chat list + whichever conversation is open.
+        // Accelerated chats are already covered by the hot scheduler.
         self.load_chats();
         if let Some(id) = self.teams.open_chat_id.clone() {
-            self.load_chat_messages(id, ListUpdate::Merge);
+            if self.teams_chat_poll_tier(&id) == crate::teams_chat::ChatPollTier::Normal {
+                self.load_chat_messages(id, ListUpdate::Merge);
+            }
         }
         if let Some((t, c)) = self.teams.open_channel.clone() {
             self.load_channel_messages(t, c, ListUpdate::Merge);
@@ -2868,7 +3001,8 @@ impl App {
                 }
             }
             KeyCode::Char('v') => {
-                if self.calendar.view == CalendarView::Agenda && !Self::calendar_month_view_available()
+                if self.calendar.view == CalendarView::Agenda
+                    && !Self::calendar_month_view_available()
                 {
                     self.status = format!(
                         "Month view requires at least {}x{} characters",
@@ -3693,6 +3827,16 @@ impl App {
             {
                 self.show_new_chat()
             }
+            KeyCode::Char('x')
+                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List =>
+            {
+                self.toggle_selected_teams_chat_hidden();
+            }
+            KeyCode::Char('X')
+                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List =>
+            {
+                self.toggle_selected_teams_chat_stay_archived();
+            }
             // Back out to the conversation list from the messages pane.
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                 self.teams.focus = TeamsFocus::List;
@@ -3796,6 +3940,613 @@ impl App {
         }
     }
 
+    pub fn teams_archive_count(&self) -> usize {
+        crate::teams_chat::teams_archived_chat_count(&self.teams.chats, &self.teams.stay_archived)
+    }
+
+    pub fn teams_archive_row(&self) -> usize {
+        crate::teams_chat::teams_active_chat_count(&self.teams.chats, &self.teams.stay_archived)
+    }
+
+    pub fn teams_chat_row_count(&self) -> usize {
+        crate::teams_chat::teams_chat_row_count(
+            &self.teams.chats,
+            &self.teams.stay_archived,
+            self.teams.archive_expanded,
+        )
+        .max(1)
+    }
+
+    pub fn teams_chat_at_row(&self, row: usize) -> Option<&Chat> {
+        crate::teams_chat::teams_chat_index_for_row(
+            &self.teams.chats,
+            &self.teams.stay_archived,
+            self.teams.archive_expanded,
+            row,
+        )
+        .and_then(|index| self.teams.chats.get(index))
+    }
+
+    pub fn teams_chat_is_archived(&self, chat: &Chat) -> bool {
+        crate::teams_chat::teams_chat_is_archived(chat, &self.teams.stay_archived)
+    }
+
+    pub fn teams_chat_is_stay_archived(&self, chat_id: &str) -> bool {
+        self.teams.stay_archived.contains(chat_id)
+    }
+
+    pub fn teams_peer_presence(&self, chat: &Chat) -> Option<&Presence> {
+        let me_id = self.me.as_ref().map(|me| me.id.as_str());
+        let user_id = self
+            .contact_user_ids
+            .get(&chat.id)
+            .map(String::as_str)
+            .or_else(|| chat.peer_user_id(me_id))?;
+        self.teams.contact_presences.get(user_id)
+    }
+
+    fn teams_selected_chat(&self) -> Option<&Chat> {
+        self.teams_chat_at_row(self.teams.chat_sel)
+    }
+
+    fn teams_chat_row_for_id(&self, chat_id: &str) -> Option<usize> {
+        crate::teams_chat::teams_chat_row_for_id(
+            &self.teams.chats,
+            &self.teams.stay_archived,
+            self.teams.archive_expanded,
+            chat_id,
+        )
+    }
+
+    fn configured_tenant_id(&self) -> Option<&str> {
+        let value = self.session.config.tenant_id.trim();
+        if value.is_empty()
+            || value.eq_ignore_ascii_case("common")
+            || value.eq_ignore_ascii_case("organizations")
+            || value.eq_ignore_ascii_case("consumers")
+        {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    fn selected_chat_tenant_id(&self, chat: &Chat) -> Option<String> {
+        let me_id = self.me.as_ref().map(|me| me.id.as_str());
+        self.configured_tenant_id()
+            .map(str::to_string)
+            .or_else(|| {
+                me_id.and_then(|id| {
+                    chat.members
+                        .iter()
+                        .find(|member| member.user_id.as_deref() == Some(id))
+                        .and_then(|member| member.tenant_id.clone())
+                })
+            })
+            .or_else(|| {
+                chat.tenant_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+    }
+
+    fn persist_archive_expanded(&self) {
+        let Some(cache_dir) = self.session.config.teams_image_cache_dir.as_deref() else {
+            return;
+        };
+        if let Err(error) =
+            crate::teams_chat::store_archive_expanded(cache_dir, self.teams.archive_expanded)
+        {
+            tracing::warn!("could not persist Teams archive drawer state: {error}");
+        }
+    }
+
+    fn persist_stay_archived(&self) -> Option<String> {
+        let cache_dir = self.session.config.teams_image_cache_dir.as_deref()?;
+        crate::teams_chat::store_stay_archived(cache_dir, &self.teams.stay_archived)
+            .err()
+            .map(|error| error.to_string())
+    }
+
+    fn toggle_selected_teams_chat_hidden(&mut self) {
+        let Some(chat) = self.teams_selected_chat() else {
+            self.status = "Archive is a drawer; select a chat to archive or restore".into();
+            return;
+        };
+        let chat_id = chat.id.clone();
+        let server_hidden = crate::teams_chat::teams_chat_is_hidden(chat);
+        if server_hidden && self.teams.stay_archived.contains(&chat_id) {
+            self.status = "Stay archived is enabled; press X to disable it before restoring".into();
+            return;
+        }
+        let hidden = !server_hidden;
+        let Some(user_id) = self.me.as_ref().map(|me| me.id.clone()) else {
+            self.status = "still loading your profile".into();
+            return;
+        };
+        let Some(tenant_id) = self.selected_chat_tenant_id(chat) else {
+            self.status = "could not determine tenant id for Teams archive action".into();
+            return;
+        };
+        self.status = if hidden {
+            "archiving Teams chat…".into()
+        } else {
+            "restoring Teams chat…".into()
+        };
+        let s = self.session.clone();
+        self.spawn(async move {
+            chats::set_hidden(&s.graph, &chat_id, &user_id, &tenant_id, hidden).await?;
+            Ok(AppMessage::ChatVisibilityChanged { chat_id, hidden })
+        });
+    }
+
+    fn toggle_selected_teams_chat_stay_archived(&mut self) {
+        let Some(chat) = self.teams_selected_chat() else {
+            self.status = "Archive is a drawer; select an archived chat first".into();
+            return;
+        };
+        let chat_id = chat.id.clone();
+        let server_hidden = crate::teams_chat::teams_chat_is_hidden(chat);
+        let was_enabled = self.teams.stay_archived.contains(&chat_id);
+        if !was_enabled && !server_hidden {
+            self.status = "archive the chat with x before enabling Stay archived".into();
+            return;
+        }
+        let previous_row = self.teams.chat_sel;
+        let enabled = if was_enabled {
+            self.teams.stay_archived.remove(&chat_id);
+            false
+        } else {
+            self.teams.stay_archived.insert(chat_id.clone());
+            self.teams.archive_expanded = true;
+            true
+        };
+        let persistence_error = self.persist_stay_archived();
+        self.teams.chat_sel = self
+            .teams_chat_row_for_id(&chat_id)
+            .unwrap_or(previous_row.min(self.teams_chat_row_count().saturating_sub(1)));
+        let persistent = self.session.config.teams_image_cache_dir.is_some();
+        self.status = if enabled {
+            if persistent {
+                "Stay archived enabled".into()
+            } else {
+                "Stay archived enabled for this run".into()
+            }
+        } else if server_hidden {
+            "Stay archived disabled; chat remains archived until restored with x".into()
+        } else {
+            "Stay archived disabled".into()
+        };
+        if let Some(error) = persistence_error {
+            self.status = format!("{}; persistence failed: {error}", self.status);
+        }
+        if self.screen == Screen::Teams
+            && self.teams.mode == TeamsMode::Chats
+            && self.teams.focus == TeamsFocus::List
+        {
+            self.preview_selected_teams_chat();
+        }
+    }
+
+    fn rehide_stay_archived_chats(&mut self) {
+        let Some(user_id) = self.me.as_ref().map(|me| me.id.clone()) else {
+            return;
+        };
+        let candidates = crate::teams_chat::teams_stay_archived_rehide_candidates(
+            &self.teams.chats,
+            &self.teams.stay_archived,
+            &self.teams.stay_archived_rehide_in_flight,
+        );
+        let jobs: Vec<(String, String)> = candidates
+            .into_iter()
+            .filter_map(|chat_id| {
+                let chat = self.teams.chats.iter().find(|chat| chat.id == chat_id)?;
+                self.selected_chat_tenant_id(chat)
+                    .map(|tenant_id| (chat_id, tenant_id))
+            })
+            .collect();
+        for (chat_id, tenant_id) in jobs {
+            if !self
+                .teams
+                .stay_archived_rehide_in_flight
+                .insert(chat_id.clone())
+            {
+                continue;
+            }
+            let s = self.session.clone();
+            let tx = self.tx.clone();
+            let limiter = self.teams_background_limiter.clone();
+            let task_chat_id = chat_id.clone();
+            let task_user_id = user_id.clone();
+            tokio::spawn(async move {
+                let permit = limiter.acquire(&s.graph, &task_chat_id).await;
+                let result =
+                    chats::set_hidden(&s.graph, &task_chat_id, &task_user_id, &tenant_id, true)
+                        .await;
+                drop(permit);
+                let error = result.err().map(|error| format!("{error:#}"));
+                let _ = tx
+                    .send(AppMessage::StayArchivedRehideFinished {
+                        chat_id: task_chat_id,
+                        error,
+                    })
+                    .await;
+            });
+        }
+    }
+
+    fn remember_contact_ids(&mut self, chats: &[Chat]) {
+        let me_id = self.me.as_ref().map(|me| me.id.as_str());
+        for chat in chats {
+            if let Some(peer) = chat.peer_user_id(me_id) {
+                if chats::looks_like_user_guid(peer) {
+                    self.contact_user_ids
+                        .insert(chat.id.clone(), peer.to_string());
+                }
+            }
+        }
+    }
+
+    fn load_contact_presences(&self) {
+        if !self.session.config.presence_read {
+            return;
+        }
+        let mut user_ids: Vec<String> = self
+            .teams
+            .chats
+            .iter()
+            .filter(|chat| {
+                chat.chat_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+            })
+            .filter_map(|chat| chat.peer_user_id(self.me.as_ref().map(|me| me.id.as_str())))
+            .map(str::to_string)
+            .chain(self.contact_user_ids.values().cloned())
+            .filter(|id| chats::looks_like_user_guid(id))
+            .collect();
+        user_ids.sort();
+        user_ids.dedup();
+        if user_ids.is_empty() {
+            return;
+        }
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match people::presences(&s.graph, &user_ids).await {
+                Ok(items) if !items.is_empty() => {
+                    let _ = tx.send(AppMessage::ContactPresences(items)).await;
+                }
+                Ok(_) => {}
+                Err(error) => tracing::debug!("contact presence refresh failed: {error:#}"),
+            }
+        });
+    }
+
+    fn graph_message_time(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(value?)
+            .ok()
+            .map(|value| value.with_timezone(&chrono::Utc))
+    }
+
+    fn sync_teams_hot_activity_from_chats(&mut self, chats: &[Chat]) {
+        let now = std::time::Instant::now();
+        let present: std::collections::HashSet<&str> =
+            chats.iter().map(|chat| chat.id.as_str()).collect();
+        for chat in chats {
+            let Some(preview) = chat.last_message_preview.as_ref() else {
+                continue;
+            };
+            let Some(message_id) = preview.id.as_deref() else {
+                continue;
+            };
+            let message_at = Self::graph_message_time(preview.created_date_time.as_deref());
+            match self.teams_hot_chat_state.get_mut(&chat.id) {
+                Some(state)
+                    if crate::teams_chat::state_message_is_newer(state, message_id, message_at) =>
+                {
+                    state.latest_message_id = Some(message_id.to_string());
+                    state.latest_message_at = message_at;
+                    state.last_activity = now;
+                    state.last_poll_started = Some(now);
+                }
+                Some(_) => {}
+                None => {
+                    self.teams_hot_chat_state.insert(
+                        chat.id.clone(),
+                        crate::teams_chat::TeamsHotChatState {
+                            last_activity: crate::teams_chat::activity_instant_from_graph_time(
+                                message_at, now,
+                            ),
+                            last_poll_started: Some(now),
+                            latest_message_id: Some(message_id.to_string()),
+                            latest_message_at: message_at,
+                            hot_pending: false,
+                        },
+                    );
+                }
+            }
+        }
+        self.teams_hot_chat_state
+            .retain(|id, state| present.contains(id.as_str()) || state.hot_pending);
+    }
+
+    fn observe_teams_chat_page(&mut self, chat_id: &str, messages: &[ChatMessage]) -> bool {
+        let Some(newest) = messages.iter().max_by_key(|message| sort_key(message)) else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let message_at = Self::graph_message_time(newest.created_date_time.as_deref());
+        match self.teams_hot_chat_state.get_mut(chat_id) {
+            Some(state)
+                if crate::teams_chat::state_message_is_newer(state, &newest.id, message_at) =>
+            {
+                state.latest_message_id = Some(newest.id.clone());
+                state.latest_message_at = message_at;
+                state.last_activity = now;
+                state.last_poll_started = Some(now);
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.teams_hot_chat_state.insert(
+                    chat_id.to_string(),
+                    crate::teams_chat::TeamsHotChatState {
+                        last_activity: crate::teams_chat::activity_instant_from_graph_time(
+                            message_at, now,
+                        ),
+                        last_poll_started: Some(now),
+                        latest_message_id: Some(newest.id.clone()),
+                        latest_message_at: message_at,
+                        hot_pending: false,
+                    },
+                );
+                false
+            }
+        }
+    }
+
+    fn mark_teams_chat_active(&mut self, chat_id: &str) {
+        let now = std::time::Instant::now();
+        if let Some(state) = self.teams_hot_chat_state.get_mut(chat_id) {
+            state.last_activity = now;
+            state.last_poll_started = Some(now);
+            return;
+        }
+        self.teams_hot_chat_state.insert(
+            chat_id.to_string(),
+            crate::teams_chat::TeamsHotChatState {
+                last_activity: now,
+                last_poll_started: Some(now),
+                latest_message_id: None,
+                latest_message_at: None,
+                hot_pending: false,
+            },
+        );
+    }
+
+    fn teams_chat_poll_tier_at(
+        &self,
+        chat_id: &str,
+        now: std::time::Instant,
+    ) -> crate::teams_chat::ChatPollTier {
+        let Some(state) = self.teams_hot_chat_state.get(chat_id) else {
+            return crate::teams_chat::ChatPollTier::Normal;
+        };
+        let tier =
+            crate::teams_chat::chat_poll_tier_from_age(now.duration_since(state.last_activity));
+        if tier == crate::teams_chat::ChatPollTier::Normal {
+            return tier;
+        }
+        let ahead = self
+            .teams_hot_chat_state
+            .iter()
+            .filter(|(other_id, other)| {
+                crate::teams_chat::chat_poll_tier_from_age(now.duration_since(other.last_activity))
+                    != crate::teams_chat::ChatPollTier::Normal
+                    && (other.last_activity > state.last_activity
+                        || (other.last_activity == state.last_activity
+                            && other_id.as_str() < chat_id))
+            })
+            .count();
+        if ahead < self.session.config.teams_hot_chats {
+            tier
+        } else {
+            crate::teams_chat::ChatPollTier::Normal
+        }
+    }
+
+    pub fn teams_chat_poll_tier(&self, chat_id: &str) -> crate::teams_chat::ChatPollTier {
+        self.teams_chat_poll_tier_at(chat_id, std::time::Instant::now())
+    }
+
+    pub fn teams_poll_diagnostics(&self) -> crate::teams_chat::TeamsPollDiagnostics {
+        let now = std::time::Instant::now();
+        let mut out = crate::teams_chat::TeamsPollDiagnostics::default();
+        for chat in &self.teams.chats {
+            match self.teams_chat_poll_tier_at(&chat.id, now) {
+                crate::teams_chat::ChatPollTier::Hot => out.hot += 1,
+                crate::teams_chat::ChatPollTier::Warm => out.warm += 1,
+                crate::teams_chat::ChatPollTier::Cool => out.cool += 1,
+                crate::teams_chat::ChatPollTier::Normal => out.normal += 1,
+            }
+        }
+        for state in self.teams_hot_chat_state.values() {
+            if state.hot_pending {
+                out.hot_pending += 1;
+            }
+        }
+        let (runtime_budget_rps, reserved_chats) =
+            self.teams_background_limiter.diagnostics_snapshot();
+        out.runtime_budget_rps = runtime_budget_rps;
+        out.reserved_chats = reserved_chats;
+        out
+    }
+
+    fn poll_hot_chats_if_due(&mut self) {
+        let now = std::time::Instant::now();
+        let mut due: Vec<(std::time::Instant, String)> = self
+            .teams_hot_chat_state
+            .iter()
+            .filter_map(|(chat_id, state)| {
+                if state.hot_pending {
+                    return None;
+                }
+                let tier = self.teams_chat_poll_tier_at(chat_id, now);
+                let interval = tier.interval()?;
+                let due_at = state
+                    .last_poll_started
+                    .map(|started| started + interval)
+                    .unwrap_or(now);
+                (now >= due_at).then(|| (due_at, chat_id.clone()))
+            })
+            .collect();
+        due.sort_by_key(|(due_at, _)| *due_at);
+        for (_, chat_id) in due {
+            if let Some(state) = self.teams_hot_chat_state.get_mut(&chat_id) {
+                state.hot_pending = true;
+                state.last_poll_started = Some(now);
+            }
+            self.spawn_hot_chat_poll(chat_id, now);
+        }
+    }
+
+    fn spawn_hot_chat_poll(&self, chat_id: String, scheduled_at: std::time::Instant) {
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+        let limiter = self.teams_background_limiter.clone();
+        tokio::spawn(async move {
+            let Some(_permit) = limiter.acquire_hot(&s.graph, &chat_id, scheduled_at).await else {
+                let _ = tx.send(AppMessage::HotChatPollSkipped { chat_id }).await;
+                return;
+            };
+            let result = chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await;
+            let message = match result {
+                Ok((messages, next)) => AppMessage::HotChatPollFinished {
+                    chat_id,
+                    messages,
+                    next,
+                    error: None,
+                },
+                Err(error) => AppMessage::HotChatPollFinished {
+                    chat_id,
+                    messages: Vec::new(),
+                    next: None,
+                    error: Some(format!("{error:#}")),
+                },
+            };
+            let _ = tx.send(message).await;
+        });
+    }
+
+    fn notify_for_hot_chat_message(&mut self, chat_id: &str, message: &ChatMessage) {
+        if self.chat_seen.is_none() || !self.session.config.notifications {
+            return;
+        }
+        if let Some(seen) = self.chat_seen.as_mut() {
+            seen.insert(chat_id.to_string(), message.id.clone());
+        }
+        let my_id = self.me.as_ref().map(|me| me.id.clone());
+        let my_name = self.me.as_ref().and_then(|me| me.display_name.clone());
+        let from_id = message
+            .from
+            .as_ref()
+            .and_then(|from| from.user.as_ref())
+            .and_then(|user| user.id.as_deref());
+        if from_id.is_some() && from_id == my_id.as_deref() {
+            return;
+        }
+        if message.deleted_date_time.is_some() || !self.notified.insert(message.id.clone()) {
+            return;
+        }
+        let Some(chat) = self.teams.chats.iter().find(|chat| chat.id == chat_id) else {
+            return;
+        };
+        let body = message
+            .body
+            .as_ref()
+            .and_then(|body| body.content.clone())
+            .unwrap_or_default();
+        let mentioned = crate::notify::mentions_me(
+            &message.mentions,
+            &body,
+            my_id.as_deref(),
+            my_name.as_deref(),
+        );
+        if !crate::notify::should_notify(chat.chat_type.as_deref(), mentioned) {
+            return;
+        }
+        let who = message
+            .from
+            .as_ref()
+            .and_then(|from| from.user.as_ref())
+            .and_then(|user| user.display_name.clone())
+            .unwrap_or_else(|| chat.label(my_id.as_deref()));
+        let title = if mentioned {
+            format!("{who} mentioned you")
+        } else {
+            who
+        };
+        crate::notify::send(
+            &title,
+            &content::plain(&content::render_body(None, &body).text),
+        );
+        if self.notified.len() > 1000 {
+            self.notified.clear();
+        }
+    }
+
+    fn apply_hot_chat_poll(
+        &mut self,
+        chat_id: String,
+        messages: Vec<ChatMessage>,
+        next: Option<String>,
+        error: Option<String>,
+    ) {
+        if let Some(state) = self.teams_hot_chat_state.get_mut(&chat_id) {
+            state.hot_pending = false;
+            state.last_poll_started = Some(std::time::Instant::now());
+        }
+        if let Some(error) = error {
+            tracing::debug!("Teams hot poll failed for {chat_id}: {error}");
+            return;
+        }
+        let previous_message_id = self
+            .teams_hot_chat_state
+            .get(&chat_id)
+            .and_then(|state| state.latest_message_id.clone());
+        let changed = self.observe_teams_chat_page(&chat_id, &messages);
+        for message in crate::teams_chat::hot_poll_new_messages(
+            &messages,
+            previous_message_id.as_deref(),
+            changed,
+        ) {
+            self.notify_for_hot_chat_message(&chat_id, message);
+        }
+        let previewing = self.teams.open_chat_id.is_none()
+            && self.teams.preview_chat_id.as_deref() == Some(&chat_id);
+        let open = self.teams.open_chat_id.as_deref() == Some(&chat_id);
+        if open || previewing {
+            if changed || self.teams.messages.is_empty() {
+                self.set_teams_messages(messages, next, ListUpdate::Merge);
+                self.persist_teams_conversation_cache(&chat_id, &self.teams.messages);
+            }
+        } else if changed {
+            if let Some(root) = self.session.config.teams_image_cache_dir.clone() {
+                let chat_id = chat_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) =
+                        crate::teams_cache::merge_newest_page(&root, &chat_id, &messages)
+                    {
+                        tracing::debug!("could not merge Teams hot-poll cache: {error}");
+                    }
+                });
+            }
+        }
+    }
+
     fn teams_move(&mut self, delta: i32) {
         // In the conversation pane, j/k move the selected message (skipping
         // deleted ones); the selection drives both scroll and reactions.
@@ -3832,7 +4583,7 @@ impl App {
         }
         match (self.teams.mode, self.teams.focus) {
             (TeamsMode::Chats, TeamsFocus::List) => {
-                self.teams.chat_sel = step(self.teams.chat_sel, delta, self.teams.chats.len());
+                self.teams.chat_sel = step(self.teams.chat_sel, delta, self.teams_chat_row_count());
                 self.preview_selected_teams_chat();
             }
             (TeamsMode::Channels, TeamsFocus::List) => {
@@ -3852,10 +4603,11 @@ impl App {
         match self.teams.mode {
             TeamsMode::Chats => {
                 self.teams.chat_sel = if to_end {
-                    self.teams.chats.len().saturating_sub(1)
+                    self.teams_chat_row_count().saturating_sub(1)
                 } else {
                     0
                 };
+                self.preview_selected_teams_chat();
             }
             TeamsMode::Channels => {
                 if self.teams.channels.is_empty() {
@@ -3878,8 +4630,23 @@ impl App {
     fn teams_enter(&mut self) {
         match self.teams.mode {
             TeamsMode::Chats => {
-                if let Some(c) = self.teams.chats.get(self.teams.chat_sel) {
+                if self.teams.chat_sel == self.teams_archive_row() {
+                    self.teams.archive_expanded = !self.teams.archive_expanded;
+                    self.teams.preview_chat_id = None;
+                    self.teams.open_chat_id = None;
+                    self.teams.messages.clear();
+                    self.teams.messages_rendered.clear();
+                    self.teams.messages_links.clear();
+                    self.teams.messages_images.clear();
+                    self.status = if self.teams.archive_expanded {
+                        format!("Archive opened ({} chat(s))", self.teams_archive_count())
+                    } else {
+                        "Archive closed".into()
+                    };
+                    self.persist_archive_expanded();
+                } else if let Some(c) = self.teams_selected_chat() {
                     let id = c.id.clone();
+                    self.mark_teams_chat_active(&id);
                     let preview_ready = self.teams.preview_chat_id.as_deref() == Some(&id)
                         && !self.teams.messages.is_empty();
                     self.teams.preview_chat_id = None;
@@ -3965,6 +4732,9 @@ impl App {
         self.teams.images.clear();
         self.teams.composer_previews.clear();
         self.teams.sending = true;
+        if let Some(id) = self.teams.open_chat_id.clone() {
+            self.mark_teams_chat_active(&id);
+        }
         let editing = self.teams.editing.clone();
         let replying_to = self.teams.replying_to.take();
         self.status = match n_images {
@@ -4511,7 +5281,10 @@ impl App {
                 self.contact_diagnostics_max_scroll.get(),
             )
         } else {
-            (&mut self.diagnostics_scroll, self.diagnostics_max_scroll.get())
+            (
+                &mut self.diagnostics_scroll,
+                self.diagnostics_max_scroll.get(),
+            )
         };
         match key.code {
             KeyCode::Char('r') => {

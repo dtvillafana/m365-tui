@@ -25,6 +25,7 @@ mod notify;
 mod opener;
 mod settings;
 mod teams_cache;
+mod teams_chat;
 mod termimg;
 mod ui;
 mod wrap;
@@ -341,6 +342,25 @@ async fn run_tui(session: Session) -> Result<()> {
             loop {
                 ticker.tick().await;
                 if poll_tx.send(AppMessage::Poll).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Accelerated Teams polling has its own one-second local scheduler. The
+    // event itself performs no I/O; App decides which chats are due and all
+    // resulting GETs pass through the shared conservative Teams limiter.
+    {
+        let hot_poll_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(Duration::from_secs(teams_chat::HOT_POLL_TICK_SECONDS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if hot_poll_tx.send(AppMessage::HotPollTick).await.is_err() {
                     break;
                 }
             }

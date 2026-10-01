@@ -20,7 +20,11 @@ fn fnv1a64(data: &[u8]) -> u64 {
 }
 
 pub fn conversation_key(chat_id: &str) -> String {
-    format!("{:016x}{:016x}", fnv1a64(chat_id.as_bytes()), fnv1a64(b"chat"))
+    format!(
+        "{:016x}{:016x}",
+        fnv1a64(chat_id.as_bytes()),
+        fnv1a64(b"chat")
+    )
 }
 
 pub fn conversation_path(root: &Path, chat_id: &str) -> PathBuf {
@@ -33,7 +37,8 @@ pub fn image_disk_key(key: &str) -> String {
 }
 
 pub fn image_path(root: &Path, key: &str) -> PathBuf {
-    root.join("images").join(format!("{}.bin", image_disk_key(key)))
+    root.join("images")
+        .join(format!("{}.bin", image_disk_key(key)))
 }
 
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
@@ -46,14 +51,11 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         create_private_dir(parent)?;
     }
-    let tmp = path.with_extension(format!(
-        "tmp-{}",
-        std::process::id()
-    ));
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     #[cfg(unix)]
     {
@@ -84,7 +86,11 @@ pub fn load_conversation(root: &Path, chat_id: &str) -> Option<Vec<ChatMessage>>
     Some(messages)
 }
 
-pub fn store_conversation(root: &Path, chat_id: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+pub fn store_conversation(
+    root: &Path,
+    chat_id: &str,
+    messages: &[ChatMessage],
+) -> std::io::Result<()> {
     let mut newest_first: Vec<&ChatMessage> = messages.iter().collect();
     newest_first.reverse();
     newest_first.truncate(MAX_MESSAGES);
@@ -98,6 +104,32 @@ pub fn store_conversation(root: &Path, chat_id: &str, messages: &[ChatMessage]) 
         return Ok(());
     }
     write_private_file(&conversation_path(root, chat_id), &bytes)
+}
+
+/// Merge a newest-first Graph page into the on-disk conversation without
+/// dropping older history the user already paged through.
+pub fn merge_newest_page(
+    root: &Path,
+    chat_id: &str,
+    newest_first: &[ChatMessage],
+) -> std::io::Result<()> {
+    if newest_first.is_empty() {
+        return Ok(());
+    }
+    let mut merged = newest_first.to_vec();
+    if let Some(cached) = load_conversation(root, chat_id) {
+        let mut known: std::collections::HashSet<String> =
+            merged.iter().map(|message| message.id.clone()).collect();
+        for message in cached {
+            if known.insert(message.id.clone()) {
+                merged.push(message);
+            }
+        }
+    }
+    merged.truncate(MAX_MESSAGES);
+    // `store_conversation` expects oldest-first and reverses for storage.
+    merged.reverse();
+    store_conversation(root, chat_id, &merged)
 }
 
 pub fn load_image_bytes(root: &Path, key: &str) -> Option<Vec<u8>> {

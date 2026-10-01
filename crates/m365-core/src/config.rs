@@ -7,6 +7,19 @@ use anyhow::{Context, Result};
 /// Microsoft Graph base URL (v1.0 endpoint).
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
+/// Number of recently-active Teams chats accelerated by default.
+pub const TEAMS_HOT_CHATS_DEFAULT: usize = 6;
+/// Hard safety ceiling for accelerated Teams chats.
+pub const TEAMS_HOT_CHATS_MAX: usize = 16;
+/// Default request budget for optional/background Teams message GETs.
+pub const TEAMS_POLL_BUDGET_DEFAULT_RPS: f64 = 6.0;
+/// Runtime/configuration floor used after Graph throttling.
+pub const TEAMS_POLL_BUDGET_MIN_RPS: f64 = 0.5;
+/// Hard safety ceiling: 40% of the documented 20 rps per-app/per-tenant chat-message GET limit.
+pub const TEAMS_POLL_BUDGET_MAX_RPS: f64 = 8.0;
+/// Reject combinations that would make an accelerated chat slower than this.
+pub const TEAMS_POLL_MAX_EFFECTIVE_INTERVAL_SECS: f64 = 5.0;
+
 /// The Graph endpoint to talk to, overridable with `M365_GRAPH_BASE`.
 ///
 /// Pointing this at a local mock lets the app run on fabricated data — useful
@@ -103,8 +116,14 @@ pub struct Config {
     /// Show presence indicators for contacts in one-to-one Teams chats.
     pub presence_read: bool,
     /// Optional persistent cache for Teams images, conversations, and UI state.
+    /// `M365_CACHE_DIR` wins; `M365_TEAMS_IMAGE_CACHE_DIR` is the deprecated alias.
     /// Unset keeps Teams image caching memory-only.
     pub teams_image_cache_dir: Option<PathBuf>,
+    /// Maximum number of recently-active chats kept in accelerated polling.
+    /// Default 6, hard maximum 16.
+    pub teams_hot_chats: usize,
+    /// Shared rate budget for optional/background Teams message GETs.
+    pub teams_poll_budget_rps: f64,
     /// Maximum persistent Teams image cache size in MiB.
     pub teams_image_cache_max_mb: u64,
     /// Automatically prefill persistent Teams conversation caches in the background.
@@ -121,11 +140,22 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let client_id = env_required("M365_CLIENT_ID")?;
         let tenant_id = std::env::var("M365_TENANT_ID").unwrap_or_else(|_| "organizations".into());
-        let teams_image_cache_dir = std::env::var("M365_TEAMS_IMAGE_CACHE_DIR")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
+        let teams_image_cache_dir = resolve_cache_dir();
+        let teams_hot_chats = match std::env::var("M365_TEAMS_HOT_CHATS") {
+            Ok(value) if !value.trim().is_empty() => value
+                .trim()
+                .parse::<usize>()
+                .context("M365_TEAMS_HOT_CHATS must be an integer")?,
+            _ => TEAMS_HOT_CHATS_DEFAULT,
+        };
+        let teams_poll_budget_rps = match std::env::var("M365_TEAMS_POLL_BUDGET_RPS") {
+            Ok(value) if !value.trim().is_empty() => value
+                .trim()
+                .parse::<f64>()
+                .context("M365_TEAMS_POLL_BUDGET_RPS must be a number")?,
+            _ => TEAMS_POLL_BUDGET_DEFAULT_RPS,
+        };
+        validate_teams_polling(teams_hot_chats, teams_poll_budget_rps)?;
         let meeting_opener = std::env::var("M365_MEETING_OPENER")
             .ok()
             .map(|value| value.trim().to_string())
@@ -204,6 +234,8 @@ impl Config {
             calendar_notify,
             presence_read,
             teams_image_cache_dir,
+            teams_hot_chats,
+            teams_poll_budget_rps,
             teams_image_cache_max_mb,
             teams_cache_warmup,
             meeting_opener,
@@ -319,6 +351,59 @@ fn env_required(key: &str) -> Result<String> {
         })
 }
 
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `M365_CACHE_DIR` is the cache root. The older image-cache variable remains
+/// accepted so existing setups keep working.
+fn resolve_cache_dir() -> Option<PathBuf> {
+    let cache_dir = env_path("M365_CACHE_DIR");
+    let legacy = env_path("M365_TEAMS_IMAGE_CACHE_DIR");
+    match (cache_dir, legacy) {
+        (Some(cache_dir), Some(legacy)) if cache_dir != legacy => {
+            tracing::warn!(
+                "both M365_CACHE_DIR and deprecated M365_TEAMS_IMAGE_CACHE_DIR are set; using M365_CACHE_DIR={cache_dir:?} and ignoring {legacy:?}"
+            );
+            Some(cache_dir)
+        }
+        (Some(cache_dir), Some(_)) => {
+            tracing::warn!(
+                "M365_TEAMS_IMAGE_CACHE_DIR is deprecated and duplicates M365_CACHE_DIR; remove the old variable"
+            );
+            Some(cache_dir)
+        }
+        (Some(cache_dir), None) => Some(cache_dir),
+        (None, Some(legacy)) => {
+            tracing::warn!("M365_TEAMS_IMAGE_CACHE_DIR is deprecated; set M365_CACHE_DIR instead");
+            Some(legacy)
+        }
+        (None, None) => None,
+    }
+}
+
+fn validate_teams_polling(hot_chats: usize, budget_rps: f64) -> Result<()> {
+    anyhow::ensure!(
+        (1..=TEAMS_HOT_CHATS_MAX).contains(&hot_chats),
+        "M365_TEAMS_HOT_CHATS must be between 1 and {TEAMS_HOT_CHATS_MAX} (got {hot_chats})"
+    );
+    anyhow::ensure!(
+        budget_rps.is_finite()
+            && (TEAMS_POLL_BUDGET_MIN_RPS..=TEAMS_POLL_BUDGET_MAX_RPS).contains(&budget_rps),
+        "M365_TEAMS_POLL_BUDGET_RPS must be between {TEAMS_POLL_BUDGET_MIN_RPS} and {TEAMS_POLL_BUDGET_MAX_RPS} (got {budget_rps})"
+    );
+    let effective = hot_chats as f64 / budget_rps;
+    anyhow::ensure!(
+        effective <= TEAMS_POLL_MAX_EFFECTIVE_INTERVAL_SECS,
+        "M365_TEAMS_HOT_CHATS={hot_chats} with M365_TEAMS_POLL_BUDGET_RPS={budget_rps} implies about {effective:.2}s per accelerated chat at full load; maximum allowed is {TEAMS_POLL_MAX_EFFECTIVE_INTERVAL_SECS:.0}s"
+    );
+    Ok(())
+}
+
 fn default_cache_dir() -> Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("dev", "rootHytx", "m365-tui")
         .context("could not determine a config directory for this platform")?;
@@ -345,6 +430,8 @@ mod tests {
             calendar_notify: CalendarNotify::All,
             presence_read: false,
             teams_image_cache_dir: None,
+            teams_hot_chats: TEAMS_HOT_CHATS_DEFAULT,
+            teams_poll_budget_rps: TEAMS_POLL_BUDGET_DEFAULT_RPS,
             teams_image_cache_max_mb: 256,
             teams_cache_warmup: true,
             meeting_opener: None,
@@ -408,6 +495,19 @@ mod tests {
         std::env::set_var("M365_GRAPH_BASE", "  ");
         assert_eq!(graph_base(), GRAPH_BASE);
         std::env::remove_var("M365_GRAPH_BASE");
+    }
+
+    #[test]
+    fn validates_teams_polling_limits_and_combinations() {
+        assert!(validate_teams_polling(6, 6.0).is_ok());
+        assert!(validate_teams_polling(16, 6.0).is_ok());
+        assert!(validate_teams_polling(16, 3.2).is_ok());
+        assert!(validate_teams_polling(0, 6.0).is_err());
+        assert!(validate_teams_polling(17, 6.0).is_err());
+        assert!(validate_teams_polling(6, 0.4).is_err());
+        assert!(validate_teams_polling(6, 8.1).is_err());
+        assert!(validate_teams_polling(16, 3.0).is_err());
+        assert!(validate_teams_polling(6, f64::NAN).is_err());
     }
 
     #[test]

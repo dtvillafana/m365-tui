@@ -2,6 +2,7 @@
 //! 5xx backoff, one-shot 401 retry, `@odata.nextLink` pagination, and a delta
 //! helper.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,11 @@ pub struct GraphClient {
     http: reqwest::Client,
     auth: Arc<Authenticator>,
     base: String,
+    /// Monotonic counter incremented whenever Graph returns HTTP 429.
+    ///
+    /// Consumers use this as a pressure signal only; Graph's own Retry-After
+    /// handling remains authoritative for the request that was throttled.
+    throttle_generation: Arc<AtomicU64>,
 }
 
 /// A page of a delta query: the changed items plus the token used to fetch the
@@ -39,7 +45,13 @@ impl GraphClient {
                 .expect("building reqwest client"),
             auth,
             base: crate::config::graph_base(),
+            throttle_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Monotonic observation counter for Graph HTTP 429 responses.
+    pub fn throttle_generation(&self) -> u64 {
+        self.throttle_generation.load(Ordering::Relaxed)
     }
 
     fn url(&self, path: &str) -> String {
@@ -81,6 +93,10 @@ impl GraphClient {
                 // access_token() will refresh on its own next loop iteration if
                 // the cached token is (now) considered expired; nudge by retry.
                 continue;
+            }
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                self.throttle_generation.fetch_add(1, Ordering::Relaxed);
             }
 
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {

@@ -237,6 +237,20 @@ message, which clears itself after a few seconds.
 
 ## Things worth knowing
 
+**Teams chat list.** `x` archives or restores the selected chat on the server
+(Teams hide/unhide). Archived chats sit in an Archive drawer at the bottom of
+the list; Enter on that row opens or closes it. `X` marks an archived chat Stay
+archived, so a new message does not pop it back into the active list — the app
+re-hides it. Stay archived state is stored in `M365_CACHE_DIR` (or the
+deprecated `M365_TEAMS_IMAGE_CACHE_DIR`).
+
+Recently active chats poll faster than the 20 second refresh: hot within 2
+minutes, warm within 5, cool within 15. Those chats are tinted in the list, and
+new messages in them can notify before the next full poll. One-to-one chats
+show an out-of-office line above the composer when presence includes an OOO
+message, including when the contact is otherwise offline. Presence dots need
+`M365_PRESENCE_READ=1`.
+
 **Starting a new Teams chat.** In the Teams chats list, press `n`, type the
 start of a person's name or username (user principal name), choose a directory
 result with ↑/↓ and press Enter. This opens an existing 1:1 chat or creates one;

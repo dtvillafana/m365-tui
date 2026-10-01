@@ -224,18 +224,20 @@ fn safe_graph_error_text(raw: &str) -> String {
     .into_iter()
     .find(|candidate| raw.contains(candidate));
 
-    let code = ["\"code\":\"", "\"code\": \""].into_iter().find_map(|needle| {
-        let start = raw.find(needle)? + needle.len();
-        let rest = &raw[start..];
-        let end = rest.find('"')?;
-        let value = &rest[..end];
-        (!value.is_empty()
-            && value.len() <= 80
-            && value
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
-        .then_some(value)
-    });
+    let code = ["\"code\":\"", "\"code\": \""]
+        .into_iter()
+        .find_map(|needle| {
+            let start = raw.find(needle)? + needle.len();
+            let rest = &raw[start..];
+            let end = rest.find('"')?;
+            let value = &rest[..end];
+            (!value.is_empty()
+                && value.len() <= 80
+                && value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+            .then_some(value)
+        });
 
     match (status, code) {
         (Some(status), Some(code)) => format!("{status} · {code}"),
@@ -251,8 +253,16 @@ pub fn safe_graph_error(error: &anyhow::Error) -> String {
 
 pub fn presence_probe(presence: &m365_core::models::Presence) -> PresenceProbe {
     PresenceProbe::Success {
-        availability: presence.availability.as_deref().unwrap_or("unknown").to_string(),
-        activity: presence.activity.as_deref().unwrap_or("unknown").to_string(),
+        availability: presence
+            .availability
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string(),
+        activity: presence
+            .activity
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string(),
     }
 }
 
@@ -395,7 +405,11 @@ pub fn contact_text(app: &App) -> String {
     out.push(String::new());
 
     out.push("Presence capability".into());
-    match state.remote.as_ref().map(|remote| &remote.presence_read_all) {
+    match state
+        .remote
+        .as_ref()
+        .map(|remote| &remote.presence_read_all)
+    {
         Some(Ok(true)) => out.push(row("Presence.Read.All", "● granted")),
         Some(Ok(false)) => out.push(row("Presence.Read.All", "! missing from token")),
         Some(Err(error)) => out.push(row("Presence.Read.All", format!("× {error}"))),
@@ -463,7 +477,11 @@ pub fn contact_text(app: &App) -> String {
             ));
         }
         None => {
-            let value = if state.loading { "? loading" } else { "? not loaded" };
+            let value = if state.loading {
+                "? loading"
+            } else {
+                "? not loaded"
+            };
             out.push(row("Skype resource token", value));
             out.push(row("Teams authz / Skype token", value));
             out.push(row("Middle Tier MRI lookup", value));
@@ -480,7 +498,11 @@ pub fn contact_text(app: &App) -> String {
             out.push(row("Direct Graph presence", probe_value(&remote.direct)));
         }
         None => {
-            let value = if state.loading { "? loading" } else { "? not loaded" };
+            let value = if state.loading {
+                "? loading"
+            } else {
+                "? not loaded"
+            };
             out.push(row("Batch Graph presence", value));
             out.push(row("Direct Graph presence", value));
         }
@@ -562,7 +584,11 @@ pub fn text(app: &App) -> String {
         Some(Ok(token)) => {
             out.push(row(
                 "Token",
-                if token.valid { "● valid" } else { "! expired" },
+                if token.valid {
+                    "● valid"
+                } else {
+                    "! expired"
+                },
             ));
             out.push(row(
                 "Token expires",
@@ -573,10 +599,7 @@ pub fn text(app: &App) -> String {
                     .to_string(),
             ));
         }
-        Some(Err(error)) => out.push(row(
-            "Token",
-            format!("× {}", compact_error(error)),
-        )),
+        Some(Err(error)) => out.push(row("Token", format!("× {}", compact_error(error)))),
         None => out.push(row(
             "Token",
             if app.diagnostics.loading {
@@ -621,10 +644,7 @@ pub fn text(app: &App) -> String {
                 }
             }
         }
-        Some(Err(error)) => out.push(row(
-            "Work plan",
-            format!("× {}", compact_error(error)),
-        )),
+        Some(Err(error)) => out.push(row("Work plan", format!("× {}", compact_error(error)))),
         None => out.push(row(
             "Work plan",
             if app.diagnostics.loading {
@@ -655,11 +675,7 @@ pub fn text(app: &App) -> String {
     ));
     out.push(row(
         "Teams channels",
-        yes_no(
-            app.session.config.can_read_teams(),
-            "enabled",
-            "disabled",
-        ),
+        yes_no(app.session.config.can_read_teams(), "enabled", "disabled"),
     ));
     out.push(row(
         "People search",
@@ -680,6 +696,18 @@ pub fn text(app: &App) -> String {
     out.push(row(
         "Cache warmup",
         yes_no(app.session.config.teams_cache_warmup, "enabled", "disabled"),
+    ));
+    let teams_poll = app.teams_poll_diagnostics();
+    out.push(row(
+        "Teams hot poll",
+        format!(
+            "hot {} · warm {} · cool {} · pending {} · {:.1} rps",
+            teams_poll.hot,
+            teams_poll.warm,
+            teams_poll.cool,
+            teams_poll.hot_pending,
+            teams_poll.runtime_budget_rps
+        ),
     ));
     out.push(String::new());
 
@@ -739,10 +767,7 @@ pub fn text(app: &App) -> String {
 fn save_log_named(stem: &str, text: &str) -> anyhow::Result<PathBuf> {
     use anyhow::Context;
 
-    let name = format!(
-        "{stem}-{}.log",
-        Local::now().format("%Y%m%d-%H%M%S")
-    );
+    let name = format!("{stem}-{}.log", Local::now().format("%Y%m%d-%H%M%S"));
     let path = std::env::temp_dir().join(name);
 
     #[cfg(unix)]
@@ -764,8 +789,7 @@ fn save_log_named(stem: &str, text: &str) -> anyhow::Result<PathBuf> {
 
     #[cfg(not(unix))]
     {
-        std::fs::write(&path, text)
-            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     }
 
     Ok(path)
@@ -822,7 +846,10 @@ mod tests {
             identifier_shape(Some("8:teamsvisitor:opaque")),
             "MRI visitor (8:teamsvisitor:)"
         );
-        assert_eq!(identifier_shape(Some("something-secret")), "opaque non-GUID");
+        assert_eq!(
+            identifier_shape(Some("something-secret")),
+            "opaque non-GUID"
+        );
         assert_eq!(identifier_shape(None), "missing");
     }
 

@@ -219,6 +219,18 @@ pub struct Chat {
     pub members: Vec<ConversationMember>,
     #[serde(default)]
     pub last_message_preview: Option<LastMessagePreview>,
+    /// Signed-in user's view of this chat, including the server archive flag.
+    #[serde(default)]
+    pub viewpoint: Option<ChatViewpoint>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatViewpoint {
+    #[serde(default)]
+    pub is_hidden: Option<bool>,
+    #[serde(default)]
+    pub last_message_read_date_time: Option<String>,
 }
 
 impl Chat {
@@ -242,6 +254,21 @@ impl Chat {
         } else {
             names.join(", ")
         }
+    }
+
+    /// Directory user id of the other participant in a one-to-one chat.
+    pub fn peer_user_id<'a>(&'a self, me_id: Option<&str>) -> Option<&'a str> {
+        if !self
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+        {
+            return None;
+        }
+        self.members
+            .iter()
+            .filter_map(|member| member.user_id.as_deref())
+            .find(|id| me_id != Some(*id))
     }
 }
 
@@ -585,6 +612,15 @@ pub struct ScoredEmailAddress {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OutOfOfficeSettings {
+    #[serde(default)]
+    pub is_out_of_office: Option<bool>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Presence {
     #[serde(default)]
     pub id: Option<String>,
@@ -592,6 +628,8 @@ pub struct Presence {
     pub availability: Option<String>,
     #[serde(default)]
     pub activity: Option<String>,
+    #[serde(default)]
+    pub out_of_office_settings: Option<OutOfOfficeSettings>,
 }
 
 /// A mail attachment. Listing deliberately omits `contentBytes` — those are
