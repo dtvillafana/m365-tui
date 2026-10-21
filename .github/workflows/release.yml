@@ -1,18 +1,76 @@
 name: release
 
-# Build and publish a GitHub Release whenever a version tag is pushed.
-#   git tag v1.2.0 && git push origin v1.2.0
+# Build and publish a versioned GitHub Release when explicitly dispatched.
+# CI dispatches this workflow only after all required checks succeed on main
+# and an existing vX.Y.Z tag points at the exact tested commit.
 on:
-  push:
-    tags:
-      - "v*.*"
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Commit SHA to build and publish
+        required: true
+        type: string
+      release_tag:
+        description: Existing version tag to publish, for example v1.6.1
+        required: true
+        type: string
 
 permissions:
-  contents: write # needed to create the release and upload assets
+  contents: write
 
 jobs:
+  meta:
+    name: Release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      name: ${{ steps.meta.outputs.name }}
+      commit: ${{ steps.meta.outputs.commit }}
+
+    steps:
+      - name: Checkout CI-tested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+
+      - name: Validate release metadata
+        id: meta
+        shell: bash
+        env:
+          REQUESTED_SHA: ${{ inputs.commit_sha }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          commit="$REQUESTED_SHA"
+          tag="$REQUESTED_TAG"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+
+          if [ "$tag" != "v${version}" ]; then
+            echo "::error::Tag $tag does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+
+          if [ "$(git rev-parse HEAD)" != "$commit" ]; then
+            echo "::error::Checked-out commit does not match requested commit $commit"
+            exit 1
+          fi
+
+          git fetch --quiet --force origin "refs/tags/${tag}:refs/tags/${tag}"
+          tag_commit="$(git rev-list -n 1 "$tag")"
+          if [ "$tag_commit" != "$commit" ]; then
+            echo "::error::Tag $tag points to $tag_commit, expected $commit"
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "name=m365-tui ${version}" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.arch }}
+    needs: meta
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -23,16 +81,17 @@ jobs:
             runner: ubuntu-latest
           - arch: aarch64
             target: aarch64-unknown-linux-musl
-            # Native ARM runner rather than a cross toolchain: musl-tools then
-            # provides a matching musl-gcc and nothing has to be cross-linked.
             runner: ubuntu-24.04-arm
+
     env:
       TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@v4
 
-      # Static musl build so the binaries run anywhere (incl. NixOS) with no
-      # glibc dependency. reqwest uses rustls, so no OpenSSL is needed.
+    steps:
+      - name: Checkout CI-tested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.meta.outputs.commit }}
+
       - name: Install Rust (musl target)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,12 +108,8 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target "$TARGET" -p m365-tui -p webhook
 
-      # The realtime bundle wraps this binary in Alpine, which can only run it if
-      # it's genuinely static. A dynamically-linked build would pass CI here and
-      # then fail inside the container with an unhelpful "not found". Note a Rust
-      # musl release is "static-pie linked", not "statically linked", so this
-      # tests for the absence of the dynamic marker rather than a static one.
       - name: Verify the binaries are static
+        shell: bash
         run: |
           set -euo pipefail
           for bin in m365 m365-webhook; do
@@ -62,24 +117,20 @@ jobs:
             echo "$bin: $desc"
             case "$desc" in
               *"dynamically linked"*)
-                echo "::error::$bin is dynamically linked"; exit 1 ;;
+                echo "::error::$bin is dynamically linked"
+                exit 1
+                ;;
             esac
           done
 
-      # ONE asset per architecture. An earlier version published the app and the
-      # optional push stack separately, which meant the releases page offered two
-      # similarly-named tarballs with no way to tell which one was the program —
-      # and the wrong guess produced a download containing no `m365` at all.
-      # Everything ships together instead; the push stack is a subdirectory you
-      # only enter if you want it.
       - name: Package
+        shell: bash
         run: |
           set -euo pipefail
-          # The extracted directory carries the version, but the asset name is
-          # kept stable so /releases/latest/download/<asset> always resolves —
-          # that's what the README's install one-liner relies on.
-          dir="m365-tui-${GITHUB_REF_NAME}"
+
+          dir="m365-tui-${{ needs.meta.outputs.tag }}"
           asset="m365-tui-${{ matrix.arch }}-linux-musl.tar.gz"
+
           mkdir -p "dist/$dir/realtime"
 
           cp "target/$TARGET/release/m365" "dist/$dir/"
@@ -88,17 +139,20 @@ jobs:
 
           cp deploy/docker-compose.yml deploy/Dockerfile deploy/.env.example \
              deploy/README.md deploy/up.sh deploy/down.sh "dist/$dir/realtime/"
-          # A second copy of the webhook, so `docker build` inside realtime/ has a
-          # self-contained context and its Dockerfile stays a plain COPY.
+
           cp "target/$TARGET/release/m365-webhook" "dist/$dir/realtime/"
-          chmod +x "dist/$dir/realtime/up.sh" "dist/$dir/realtime/down.sh" \
+
+          chmod +x "dist/$dir/m365" \
+                   "dist/$dir/m365-webhook" \
+                   "dist/$dir/realtime/up.sh" \
+                   "dist/$dir/realtime/down.sh" \
                    "dist/$dir/realtime/m365-webhook"
 
           tar -C dist -czf "$asset" "$dir"
           sha256sum "$asset" > "$asset.sha256"
 
       - name: Upload for the publish job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: assets-${{ matrix.arch }}
           path: |
@@ -108,19 +162,25 @@ jobs:
 
   publish:
     name: Publish release
-    needs: build
+    needs:
+      - meta
+      - build
     runs-on: ubuntu-latest
+
     steps:
       - name: Collect every architecture's assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: assets-*
           merge-multiple: true
           path: dist
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ needs.meta.outputs.commit }}
+          name: ${{ needs.meta.outputs.name }}
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256

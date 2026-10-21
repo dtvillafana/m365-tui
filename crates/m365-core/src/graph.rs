@@ -49,11 +49,6 @@ impl GraphClient {
         }
     }
 
-    /// Monotonic observation counter for Graph HTTP 429 responses.
-    pub fn throttle_generation(&self) -> u64 {
-        self.throttle_generation.load(Ordering::Relaxed)
-    }
-
     fn url(&self, path: &str) -> String {
         if path.starts_with("http") {
             path.to_string()
@@ -80,8 +75,16 @@ impl GraphClient {
                 .request(method.clone(), url)
                 .bearer_auth(&token)
                 .header(reqwest::header::ACCEPT, "application/json");
+            if method == reqwest::Method::GET {
+                // `systemEventMessage` is an evolvable Graph enum member.
+                // Without this preference Graph may surface it as
+                // `unknownFutureValue`.
+                req = req.header("Prefer", "include-unknown-enum-members");
+            }
             if let Some(b) = body {
                 req = req.json(b);
+            } else if method == reqwest::Method::POST {
+                req = req.header(reqwest::header::CONTENT_LENGTH, "0");
             }
 
             let resp = req.send().await.context("sending Graph request")?;
@@ -120,6 +123,14 @@ impl GraphClient {
 
             return Ok(resp.bytes().await.context("reading Graph body")?.to_vec());
         }
+    }
+
+    /// Monotonic observation counter for Graph HTTP 429 responses.
+    ///
+    /// This deliberately exposes no quota guess: Graph has multiple overlapping
+    /// limits. It is only a conservative signal for optional background work.
+    pub fn throttle_generation(&self) -> u64 {
+        self.throttle_generation.load(Ordering::Relaxed)
     }
 
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -185,6 +196,13 @@ impl GraphClient {
     pub async fn post_action(&self, path: &str, body: &Value) -> Result<()> {
         let url = self.url(path);
         self.send(reqwest::Method::POST, &url, Some(body)).await?;
+        Ok(())
+    }
+
+    /// POST action whose Graph contract explicitly requires no request body.
+    pub async fn post_empty_action(&self, path: &str) -> Result<()> {
+        let url = self.url(path);
+        self.send(reqwest::Method::POST, &url, None).await?;
         Ok(())
     }
 

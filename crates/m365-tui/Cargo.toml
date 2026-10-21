@@ -11,6 +11,11 @@ name = "m365"
 path = "src/main.rs"
 
 [dependencies]
+# Keep image decoding deliberately narrow: only formats rendered in mail previews.
+image = { version = "0.25.6", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+# 8.x matches this project's ratatui 0.29 API. Disable image-defaults so Cargo
+# does not pull support for unrelated image formats.
+
 m365-core = { path = "../m365-core" }
 tokio.workspace = true
 anyhow.workspace = true
@@ -18,16 +23,15 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 ratatui = "0.29"
-ratatui-image = { version = "8.1.1", default-features = false, features = ["crossterm", "image-defaults"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+ratatui-image = { version = "8.1.1", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
 futures-util.workspace = true
 html5ever = "0.38"
 markup5ever_rcdom = "0.38"
 directories.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 reqwest.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", default-features = false, features = ["screensaver"] }

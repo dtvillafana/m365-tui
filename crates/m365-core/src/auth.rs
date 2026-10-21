@@ -131,6 +131,9 @@ impl Authenticator {
     /// refresh token. The secondary token and any rotated refresh token are
     /// deliberately not persisted: diagnostics must not replace the primary
     /// Microsoft Graph cache.
+    ///
+    /// Errors are reduced to HTTP/OAuth/AADSTS codes so a caller can safely put
+    /// them into a diagnostics report without leaking token-response details.
     pub(crate) async fn resource_access_token(&self, scope: &str) -> Result<String> {
         let refresh = {
             let guard = self.state.lock().await;
@@ -187,6 +190,10 @@ impl Authenticator {
     /// - the requested resource scope is supplied explicitly;
     /// - no access token or refresh token from this flow is persisted;
     /// - `self.state` and the Graph token cache file are never modified.
+    ///
+    /// The caller uses this only to establish/test server-side consent, then
+    /// verifies whether the already-cached Graph refresh token can redeem the
+    /// resource silently.
     pub(crate) async fn resource_consent_probe<F>(&self, scope: &str, on_prompt: F) -> Result<()>
     where
         F: FnOnce(DeviceCodePrompt),
@@ -246,6 +253,7 @@ impl Authenticator {
 
             let status = response.status();
             if status.is_success() {
+                // Parse to prove a token was issued, then deliberately discard it.
                 let token: TokenResponse = response
                     .json()
                     .await

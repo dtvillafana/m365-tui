@@ -19,7 +19,10 @@ fn truncate(s: &str, max: usize) -> String {
     if max <= 1 {
         return "…".to_string();
     }
-    format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    format!(
+        "{}…",
+        s.chars().take(max.saturating_sub(1)).collect::<String>()
+    )
 }
 
 // Calendar

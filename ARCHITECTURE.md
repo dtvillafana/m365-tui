@@ -28,8 +28,8 @@ The webhook shares the core only for its event types.
 | `config.rs` | Environment-driven settings, scope selection, Graph endpoint |
 | `models.rs` | Serde structs for the Graph resources actually rendered |
 | `mail.rs` `calendar.rs` `chats.rs` `channels.rs` `people.rs` | Endpoint wrappers |
-| `work_plan.rs` | Microsoft 365 work-hours lookup used by F6 diagnostics |
-| `teams_presence.rs` | Read-only Teams/Skype presence diagnostic path for F7 |
+| `ntfy.rs` | HTTP publisher for optional remote ntfy notifications |
+| `work_plan.rs` | Current Microsoft 365 Work Plan occurrence lookup |
 | `subscriptions.rs` | Change-notification lifecycle |
 | `events.rs` | Redis subscriber → typed UI events |
 | `util.rs` | base64, HTML escaping |
@@ -40,13 +40,11 @@ The webhook shares the core only for its event types.
 |---|---|
 | `app.rs` | All state and the async orchestration; key handling |
 | `ui.rs` | Rendering — a pure function of `&App` |
-| `calendar_ui.rs` | Calendar agenda and month views |
-| `diagnostics.rs` | F6/F7 diagnostics snapshot and safe export |
-| `teams_cache.rs` | Persistent Teams conversation and image cache |
 | `content.rs` | HTML → styled terminal text, link extraction |
 | `editor.rs` | Text buffer with cursor, wrapping, and editing operations |
 | `wrap.rs` | Exact word wrapping, so scrolling can trust the row count |
 | `clipboard.rs` `opener.rs` `files.rs` `notify.rs` | System integration |
+| `diagnostics.rs` | F6 diagnostics snapshot, permission/work-plan reporting and safe export |
 | `navigation.rs` | Cross-links between the Outlook and Teams sides |
 
 ## Authentication
@@ -65,7 +63,7 @@ therefore opt-in rather than added to the defaults:
 | Scope | Flag | Without it |
 |---|---|---|
 | `Team.ReadBasic.All` | `M365_TEAMS_CHANNELS` | Channels are unavailable; chats work |
-| `Presence.ReadWrite` | `M365_PRESENCE_WRITE` | The status picker is read-only |
+| `Presence.ReadWrite` | `M365_PRESENCE_WRITE` | Own presence and status-message controls are read-only |
 
 Capabilities behind an opt-in scope check `Config::can_*` before calling, so the
 UI explains what's missing instead of surfacing a Graph 403.
@@ -100,6 +98,137 @@ to authenticate before it would tell them what the flags were.
 
 The distinction between `get_page` and `get_collection` matters: an inbox view
 uses `get_page`, because `get_collection` would walk the entire mailbox.
+
+## Notification delivery
+
+Notification events are collected in the TUI and fan out independently to the
+local desktop notifier and, when configured, to ntfy. `M365_NOTIFY` therefore
+controls only desktop delivery; `M365_NTFY` controls the remote path.
+
+ntfy forwarding is gated as late as possible before publishing. Presence-aware
+modes use the current Graph availability, while `alwayswd` and `awaywd` query
+`me/settings/workHoursAndLocations/occurrencesView` with a one-second UTC window
+around the current instant. `timeOff` overrides working occurrences.
+
+A temporary F4 snooze suppresses only the ntfy branch. The persisted value is an
+absolute Unix expiry timestamp stored beside the configured token cache. Writing
+only when the snooze changes means there is no periodic state churn, while a
+crash or restart still preserves the original deadline. The loader also accepts
+the short-lived older XDG state location and migrates it on first use.
+
+Mail, Teams, and Calendar ntfy payloads carry distinct emoji-compatible tags
+(`email`, `speech_balloon`, and `calendar`) while keeping a single configured
+topic.
+
+### Teams automation peers
+
+Teams Workflows **Post as User** creates an identity ambiguity that cannot be
+solved from `ChatMessage.from` alone. For those messages Graph commonly returns
+the signed-in user in `from.user` while `from.application` is absent.
+
+The normal own-message filter therefore remains intact globally.
+`M365_TEAMS_AUTOMATION_PEERS` provides an explicit per-one-to-one-chat
+exception. The configuration contains **peer IDs**, not sender IDs.
+
+For a configured automation chat, m365-tui may reinterpret a self-authored
+Graph message as incoming automation. The exception is deliberately scoped to
+that peer and is never applied globally.
+
+Messages sent from the current m365-tui process are tracked using the
+`ChatMessage.id` returned by the Graph POST. Those IDs remain classified as
+local outgoing messages even when the destination chat is an automation peer.
+
+The mechanism cannot identify messages manually sent from another Teams client
+using the same account. Graph does not provide enough provenance to reliably
+distinguish those messages from Workflows **Post as User**.
+
+Real application/bot messages represented by `from.application` continue
+through the separate application-sender path.
+
+## Diagnostics
+
+`F6` opens a read-only diagnostics overlay. Network-backed details are
+refreshed asynchronously and returned through the normal `AppMessage` channel,
+so opening or refreshing diagnostics never blocks terminal input.
+
+The snapshot deliberately separates requested Graph scopes from the scopes
+actually returned with the cached access token. Token metadata exposes only
+expiry, scope names, and validity; bearer and refresh-token bytes never leave
+`auth.rs`.
+
+Work-day diagnostics read the modern Microsoft 365
+`workHoursAndLocations/recurrences` resource and the same `occurrencesView`
+state used by ntfy `alwayswd` / `awaywd`. `Calendars.ReadWrite`, already a
+default scope, is sufficient for those delegated calls.
+
+The diagnostics UI and export use the same plain-text snapshot. `c` tries a
+native clipboard helper first and writes a private timestamped temporary log if
+none is usable; `l` always writes the log. This avoids making successful support
+export depend on terminal OSC 52 support.
+
+`F7` adds a contextual diagnostics snapshot for the selected Teams one-to-one
+contact. It normally reports identity classification rather than raw identity
+material, but the selected peer ID is intentionally rendered and copyable
+because it is configuration data required by `M365_TEAMS_AUTOMATION_PEERS`.
+Other private diagnostic identifiers remain hidden.
+
+`i` copies that peer ID and writes the ID plus complete `.env` and `export`
+forms to the runtime log. `a` starts the automation-peer configuration flow.
+When startup loaded a concrete `.env` file, the user must explicitly confirm
+with `y` before m365-tui updates `M365_TEAMS_AUTOMATION_PEERS` in that same
+file. The peer is also activated in runtime state immediately.
+
+When `M365_TEAMS_AUTOMATION_PEERS` came from the process environment, or when no
+`.env` file was loaded, F7 does not try to persist the change. It still logs the
+copyable configuration forms.
+
+F7 continues to report safe ID-shape labels, same/external/unknown tenant
+relation, contact-name source availability, fresh expanded-chat, `/members` and
+recent-message probes, batch/direct Graph presence and the read-only Teams
+diagnostic chain without exporting names, email addresses, tokens, MRIs, tenant
+IDs or raw service responses.
+
+For one-to-one contacts whose roster omits `displayName`, the application can
+learn the display name from message sender identity. Name learning scans the
+loaded peer-message page for the first non-empty sender `displayName` instead of
+stopping at the first peer message; identity, tenant, and presence resolution
+remain separate and continue to use their existing identifiers.
+
+F7 can retain a raw user-MRI candidate and lookup address privately in `App` for
+the read-only Teams diagnostic chain. That chain attempts a Skype-resource token
+from the existing refresh token, exchanges it through Teams `authz` for a Skype
+token, uses `externalsearchv3?includeTFLUsers=true` only when an MRI is not already
+available, and finally reads UPS presence. Names, email addresses, raw IDs,
+access/refresh/Skype tokens, MRIs, tenant IDs, and raw service responses are
+intentionally excluded from the rendered/exported snapshot.
+
+## Persistent local state
+
+`M365_CACHE_DIR` is the common root for persistent Teams/UI state. The historical
+`M365_TEAMS_IMAGE_CACHE_DIR` remains a deprecated fallback so existing
+configurations keep working. Resolution is deliberately simple:
+
+1. `M365_CACHE_DIR`
+2. `M365_TEAMS_IMAGE_CACHE_DIR`
+3. no persistent Teams/UI state when neither is set
+
+When both are present, the new variable wins. Compatibility warnings are kept
+out of the alternate-screen TUI and are printed only after it exits. m365-tui
+does not normally rewrite configuration files, move cache data, or invent an
+implicit `~/.cache/m365-tui` root. The one interactive exception is the
+explicit F7 automation-peer action: when startup loaded a concrete `.env` file,
+the user may press `a` and then confirm with `y` to update
+`M365_TEAMS_AUTOMATION_PEERS` in that same file. No `.env` file is created when
+one was not loaded, and process-environment configuration is never overwritten.
+
+The authentication token cache is separate. `M365_TOKEN_CACHE` retains its own
+existing default and is not redirected by `M365_CACHE_DIR`.
+
+The common root currently holds decoded Teams images, cached chat
+conversations, UI state, and `stay-archived.json`. UI state includes the
+selected screen/calendar view, last Teams chat, and the Archive drawer's
+expanded/collapsed state. Without a configured common root these features either
+fall back to process-local state or remain disabled as appropriate.
 
 ## The UI loop
 
@@ -192,39 +321,6 @@ the line that would otherwise carry it.
 Sending falls back to a plain `<blockquote>` if a tenant rejects the reference
 attachment, so a reply is never lost to a failed post.
 
-### Edits
-
-A message is updated in place (`PATCH …/messages/{id}`). Graph treats omitted
-fields as cleared, so the quote attachment on a chat reply has to go back with
-the new body — otherwise the edit would silently un-thread it. Existing `<img>`
-tags are kept for the same reason.
-
-Only the sender can edit. `E` on a selected message of yours opens the composer
-on its text; `Up` in an empty composer edits the last one, the way other chat
-clients do. Channel edits need `ChannelMessage.ReadWrite`, which is not in the
-default scope set (see [Authentication](#authentication)); chat edits work with
-`Chat.ReadWrite`.
-
-### Inline images
-
-Graph has no “attach this file to a chat message” upload. Images are sent as
-`hostedContents`: the body is HTML with
-`<img alt="…" src="../hostedContents/{id}/$value">` and a matching
-`hostedContents` entry holding base64 bytes and a `@microsoft.graph.temporaryId`.
-
-The composer collects them in two ways: `Ctrl+V` reads `image/*` bytes from
-`wl-paste`, then `xclip` if that helper is missing, errors, or has no image
-(crossterm's bracketed paste is lossy UTF-8, so it cannot carry PNG/JPEG
-bytes; a `data:image/…;base64,` URI still works), and `@path` tokens that look
-like filesystem paths (`@~/…`, `@./…`, `@/…`, or anything containing `/`).
-`Tab` completes those tokens; spaces in the path are backslash-escaped.
-Non-images are rejected. Arbitrary files would need a OneDrive/SharePoint
-upload and `Files.ReadWrite`, which this path does not request.
-
-Incoming `<img>` tags are fetched from Graph (`…/hostedContents/{id}/$value`)
-and drawn with Kitty, Sixel, or iTerm2 via `ratatui-image`. Half-block /
-ASCII fallbacks are not used.
-
 ## Rendering message bodies
 
 Mail and Teams bodies arrive as HTML. `content.rs` parses it with `html5ever`
@@ -246,8 +342,99 @@ cheap layout runs per frame.
 
 Two independent mechanisms, so the app is never dependent on the tunnel:
 
-1. **Polling** — a 20-second timer refreshes the current view. Always on.
+1. **Polling** — a 20-second application timer refreshes the current view.
+   Recently active Teams chats additionally use the adaptive message scheduler
+   described below. The status bar reports normal poll progress, overdue time,
+   and `STALE`; if a scheduled application poll is still outstanding,
+   application-level polling backs off up to five minutes rather than stacking
+   additional request waves.
 2. **Push** — Graph change notifications, when a tunnel is configured.
+
+### Adaptive Teams polling
+
+Recently active chats are assigned from message activity to four tiers:
+
+| Tier | Activity age | Target message interval |
+|---|---:|---:|
+| HOT | `<= 120s` | 2s |
+| WARM | `<= 300s` | 5s |
+| COOL | `<= 900s` | 10s |
+| NORMAL | `> 900s` | no accelerated task |
+
+HOT, WARM and COOL share a single most-recently-active top-N set controlled by
+`M365_TEAMS_HOT_CHATS` (default 6, maximum 16). A chat outside that top-N is
+treated as NORMAL even when its activity age would otherwise qualify for an
+accelerated tier. Startup state is seeded from `lastMessagePreview` timestamps;
+later newer chat-list previews, newer fetched messages, and locally sent
+messages advance `last_activity`.
+
+The adaptive scheduler ticks locally once per second, but a chat is queued only
+when its tier interval is due. It never starts another background task while the
+same chat already has hot or foreground work in flight, and it does not try to
+catch up missed intervals after a slow request.
+
+Background Teams message GETs share a token budget configured by
+`M365_TEAMS_POLL_BUDGET_RPS` (default 6 rps, accepted range 0.5-8 rps). The
+same limiter is used by accelerated polling, unread counting, and cold-cache
+warm-up. Configuration is rejected when `hot_chats / budget_rps` would exceed
+5 seconds at full load. At runtime there are at most two concurrent background
+Teams GETs, and background message GETs for one chat are spaced by at least two
+seconds.
+
+Foreground conversation work is intentionally favoured. Opening/refreshing a
+chat uses a per-chat foreground reservation and does not wait for the background
+token budget; its minimum same-chat spacing is one second. Manual `F5` also
+refreshes an accelerated open chat as foreground work. If such a request
+supersedes an already queued hot poll, the stale background task is discarded
+before issuing a duplicate GET.
+
+Adaptive polling is opportunistic. While the normal application poll is waiting
+for its health response or is in application-level backoff, no new hot work is
+scheduled. Graph-level throttling is handled centrally through `Retry-After`.
+A newly observed 429 generation additionally halves the Teams runtime background
+budget, never below 0.5 rps; while no newer throttle is observed it recovers by
+0.5 rps every 30 seconds until it reaches the configured budget.
+
+A successful hot poll updates the tracked newest message and, when useful, the
+visible conversation or preview. Persistent conversation cache updates merge the
+newest page with older cached history before truncation, so accelerated polling
+cannot replace previously loaded history with only the newest page.
+
+Notification delivery uses the same policy and message-id deduplication as the
+normal Teams path. With a known baseline, all newly arrived messages from the
+fetched page are processed oldest-to-newest. If the previous message is no
+longer present in the page (or no baseline exists), only the newest message is
+processed, avoiding accidental replay of an entire page of history. Messages
+sent by the signed-in user, deleted messages and system events do not create
+hot-poll notifications.
+
+F6 exposes the configured chat limit, configured and runtime request budgets,
+current HOT/WARM/COOL/NORMAL counts, pending hot tasks, foreground work and
+currently reserved background chats.
+
+### Teams Archive and Stay archived
+
+Archive uses the server-side Teams hidden state exposed through
+`viewpoint.isHidden`. The `x` action calls `hideForUser` or `unhideForUser`, and
+the chat list renders hidden chats below a dedicated Archive drawer.
+
+Stay archived is intentionally a hybrid local/server feature. A chat belongs in
+the local Archive view when either Graph reports it hidden or its chat id is in
+the local Stay archived set. `X` can enable that set only for an already hidden
+chat; disabling it does not itself unhide the chat.
+
+Teams may clear the server hidden state when a new message arrives. Normal
+message handling therefore runs first: unread state, notifications, cache
+updates and HOT/WARM/COOL activity are processed normally. Only afterwards does
+the app queue a low-priority `hideForUser` maintenance request for a Stay
+archived chat that Graph currently reports visible.
+
+The re-hide uses the shared Teams background limiter. Failure does not replay
+message processing; the hide is retried on a later chat refresh.
+
+When the common persistent root is configured, the Stay archived set is stored
+in `stay-archived.json`. Without it, Stay archived remains available but is
+process-local.
 
 ### Why a tunnel is needed at all
 
@@ -356,10 +543,6 @@ files, so a message with attachments takes a different route:
 
 Messages without attachments still use the simpler one-shot path.
 
-Composer text is sent as HTML in every case: Graph treats `sendMail` bodies and
-reply/forward comments as HTML, so a raw `\n` would collapse. `html_escape`
-turns newlines into `<br>` (and escapes `<>&`) before the body leaves.
-
 `send_message` takes its attachments **by value** so each file's buffer can be
 moved into `Bytes` once and then sliced per chunk without copying.
 
@@ -371,9 +554,8 @@ filesystem I/O, which it otherwise avoids.
 
 ## Navigation
 
-Panes are laid out left to right by default — folders, messages, reading; chat
-list, conversation — so movement follows that geometry, the way a file manager
-does. `|` (or `\`) stacks the same panes top to bottom instead:
+Panes are laid out left to right — folders, messages, reading; chat list,
+conversation — so movement follows that geometry, the way a file manager does:
 
 | Key | Effect |
 |---|---|
@@ -416,7 +598,6 @@ subprocess, each with a fallback so a missing tool degrades rather than fails:
 | `opener.rs` | `xdg-open`, `open` | Error reported in the status bar |
 | `clipboard.rs` | `wl-copy`, `xclip`, `xsel` | OSC 52 escape sequence |
 | `notify.rs` | `notify-send` | Terminal bell |
-| compose `Ctrl+X e` | `$VISUAL`, `$EDITOR` | `vi` |
 
 Only the push path needs services, and those are containers rather than host
 installs: Redis, the webhook itself, and `cloudflared`. So its one real
@@ -485,6 +666,22 @@ Two places take data from anyone who can send you a message:
   outranks the app's session, and the session vocabulary is narrower than the
   preference one (`Busy` must be `InACall`, `DoNotDisturb` must be
   `Presenting`).
+- **Application-session presence is serialized.** Local presence management
+  tracks a desired target separately from the last Graph-confirmed target and
+  permits only one `setPresence`/`clearPresence` write at a time. State changes
+  that arrive while a write is in flight are reconciled after that write
+  completes. Failed writes retain the confirmed state and retry after a short
+  backoff; lease renewal uses the same serialized path.
+- **Idle and lock Away are temporary automatic overrides.** Automatic mode saves
+  the pre-idle application-session state before publishing Away and restores it
+  after confirmed activity. Lock uses the same principle. A zero idle timeout
+  disables inactivity-driven Away but intentionally does not disable lock
+  detection.
+- **Teams status messages are independent of presence-session state.** They use
+  Graph `setStatusMessage` with plain-text content and the same delegated
+  `Presence.ReadWrite` permission. m365-tui does not supply an expiry time, so
+  the message remains until changed or cleared.
+- **No call media.** Joining Teams audio/video is not a terminal capability.
 
 ## Releases
 
@@ -523,3 +720,15 @@ Compose config validation on every push and pull request.
 Asset filenames are deliberately **not** versioned, so that
 `/releases/latest/download/<asset>` always resolves and the README can offer a
 copy-paste install. The version lives in the directory inside each archive.
+
+
+## Non-Entra presence investigation
+
+The optional Teams/Skype presence diagnostic code is intentionally retained,
+even though the current tenant/app registration cannot complete it. It is
+isolated from the normal Graph authentication path and exists so personal
+Microsoft-account presence can be resumed if the required Microsoft Teams
+Services permission becomes available.
+
+The current findings and security requirements are documented in
+[`docs/non-entra-presence.md`](docs/non-entra-presence.md).

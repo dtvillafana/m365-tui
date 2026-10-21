@@ -508,7 +508,11 @@ pub fn prepare_mail(text: &str) -> Result<PreparedMail, String> {
 
 /// Build the outgoing Teams body from composer text and staged clipboard
 /// images. `Ok(None)` means there is nothing to send.
-pub fn prepare_message(text: &str, staged: &[InlineImage]) -> Result<Option<Prepared>, String> {
+pub fn prepare_message(
+    text: &str,
+    staged: &[InlineImage],
+    markdown: bool,
+) -> Result<Option<Prepared>, String> {
     let chars: Vec<char> = text.chars().collect();
     let tokens = path_tokens(&chars);
     if tokens.is_empty() && staged.is_empty() {
@@ -516,7 +520,15 @@ pub fn prepare_message(text: &str, staged: &[InlineImage]) -> Result<Option<Prep
         if trimmed.is_empty() {
             return Ok(None);
         }
-        return Ok(Some(Prepared::Text(trimmed.to_string())));
+        let body = m365_core::teams_format::outgoing_body(trimmed, markdown);
+        return Ok(Some(if body.content_type == "html" {
+            Prepared::Html {
+                html: body.content,
+                images: Vec::new(),
+            }
+        } else {
+            Prepared::Text(body.content)
+        }));
     }
 
     let mut html = String::new();
@@ -524,9 +536,12 @@ pub fn prepare_message(text: &str, staged: &[InlineImage]) -> Result<Option<Prep
     let mut i = 0;
     for token in &tokens {
         if token.start > i {
-            html.push_str(&html_escape(
-                &chars[i..token.start].iter().collect::<String>(),
-            ));
+            let text: String = chars[i..token.start].iter().collect();
+            html.push_str(&if markdown {
+                m365_core::teams_format::outgoing_body(&text, true).html_fragment()
+            } else {
+                html_escape(&text)
+            });
         }
         let path = expand_tilde(&token.unescaped);
         let img = InlineImage::from_path(&path)?;
@@ -540,7 +555,12 @@ pub fn prepare_message(text: &str, staged: &[InlineImage]) -> Result<Option<Prep
         i = token.end;
     }
     if i < chars.len() {
-        html.push_str(&html_escape(&chars[i..].iter().collect::<String>()));
+        let text: String = chars[i..].iter().collect();
+        html.push_str(&if markdown {
+            m365_core::teams_format::outgoing_body(&text, true).html_fragment()
+        } else {
+            html_escape(&text)
+        });
     }
     for img in staged {
         images.push(img.clone().into_hosted());
@@ -592,6 +612,20 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_and_staged_images_share_a_safe_body() {
+        let img = InlineImage::from_bytes("clipboard.png".into(), TINY_PNG.to_vec()).unwrap();
+        let Some(Prepared::Html { html, images }) =
+            prepare_message("**hello** <script>", &[img], true).unwrap()
+        else {
+            panic!("expected HTML");
+        };
+        assert!(html.contains("<strong>hello</strong>"));
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("../hostedContents/1/$value"));
+        assert_eq!(images.len(), 1);
+    }
 
     /// 1×1 PNG, valid enough for magic-byte detection and round-trips.
     const TINY_PNG: &[u8] = &[
@@ -679,11 +713,11 @@ mod tests {
 
     #[test]
     fn prepare_plain_text_skips_html() {
-        match prepare_message("hello", &[]).unwrap() {
+        match prepare_message("hello", &[], false).unwrap() {
             Some(Prepared::Text(t)) => assert_eq!(t, "hello"),
             _ => panic!("expected plain text"),
         }
-        assert!(prepare_message("   ", &[]).unwrap().is_none());
+        assert!(prepare_message("   ", &[], false).unwrap().is_none());
     }
 
     #[test]
@@ -694,7 +728,7 @@ mod tests {
         let file = dir.join("shot.png");
         fs::write(&file, TINY_PNG).unwrap();
         let text = format!("see @{}/shot.png please", dir.display());
-        match prepare_message(&text, &[]).unwrap() {
+        match prepare_message(&text, &[], false).unwrap() {
             Some(Prepared::Html { html, images }) => {
                 assert_eq!(images.len(), 1);
                 assert_eq!(images[0].name, "shot.png");
@@ -730,7 +764,7 @@ mod tests {
         let file = dir.join("doc.pdf");
         fs::write(&file, b"%PDF").unwrap();
         let text = format!("@{}/doc.pdf", dir.display());
-        let err = prepare_message(&text, &[]).unwrap_err();
+        let err = prepare_message(&text, &[], false).unwrap_err();
         assert!(err.contains("not an image"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -738,7 +772,7 @@ mod tests {
     #[test]
     fn prepare_appends_staged_and_allows_image_only() {
         let img = InlineImage::from_bytes("clipboard.png".into(), TINY_PNG.to_vec()).unwrap();
-        match prepare_message("", &[img]).unwrap() {
+        match prepare_message("", &[img], false).unwrap() {
             Some(Prepared::Html { html, images }) => {
                 assert_eq!(images.len(), 1);
                 assert!(html.contains("../hostedContents/1/$value"));

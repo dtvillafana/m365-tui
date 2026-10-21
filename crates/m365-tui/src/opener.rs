@@ -18,7 +18,7 @@ pub fn open_url_with(url: &str, executable: &str) -> Result<()> {
     validate_url(url)?;
     let executable = executable.trim();
     if executable.is_empty() {
-        anyhow::bail!("meeting opener is empty");
+        anyhow::bail!("web-link opener is empty");
     }
 
     Command::new(executable)
@@ -64,5 +64,11 @@ mod tests {
         assert!(open_url("; rm -rf /").is_err());
         assert!(open_url_with("file:///etc/passwd", "/bin/true").is_err());
         assert!(open_url_with("javascript:alert(1)", "/bin/true").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_custom_web_link_opener() {
+        let error = open_url_with("https://example.invalid/", "   ").unwrap_err();
+        assert!(error.to_string().contains("web-link opener is empty"));
     }
 }

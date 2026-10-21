@@ -7,6 +7,21 @@ use std::process::{Command, Stdio};
 
 use m365_core::models::ChatMessageMention;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationPriority {
+    Normal,
+    High,
+}
+
+impl NotificationPriority {
+    pub fn ntfy_priority(self) -> Option<u8> {
+        match self {
+            Self::Normal => None,
+            Self::High => Some(4),
+        }
+    }
+}
+
 /// Should this message raise a notification?
 ///
 /// `chat_type` is the Graph value (`oneOnOne`, `group`, `meeting`); channels
@@ -76,15 +91,15 @@ fn body_mentions_name(body_html: &str, my_name: &str) -> bool {
 }
 
 /// Raise a desktop notification, falling back to the terminal bell.
-pub fn send(title: &str, body: &str) {
+pub fn send(title: &str, body: &str, priority: NotificationPriority) {
     let body = summarise(body);
-    let spawned = Command::new("notify-send")
-        .args([
-            "--app-name=m365-tui",
-            "--icon=mail-message-new",
-            title,
-            &body,
-        ])
+    let mut command = Command::new("notify-send");
+    command.args(["--app-name=m365-tui", "--icon=mail-message-new"]);
+    if priority == NotificationPriority::High {
+        command.arg("--urgency=critical");
+    }
+    let spawned = command
+        .args([title, &body])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -163,6 +178,12 @@ mod tests {
             None,
             Some("Alex Rivera")
         ));
+    }
+
+    #[test]
+    fn maps_notification_priority_to_ntfy_priority() {
+        assert_eq!(NotificationPriority::Normal.ntfy_priority(), None);
+        assert_eq!(NotificationPriority::High.ntfy_priority(), Some(4));
     }
 
     #[test]

@@ -1,4 +1,6 @@
 //! All rendering. Pure function of `&App` — no state mutation here.
+use crate::diagnostics;
+use ratatui_image::{Resize, StatefulImage};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -8,9 +10,10 @@ use ratatui::Frame;
 
 use crate::app::{
     filter_commands, filter_folders, folder_panel_height, mail_folder_label, mail_image_is_local,
-    mail_row_unread, mail_same_thread, mail_thread_size, App, CalendarView, Compose, OutlookFocus,
-    Overlay, PushState, Screen, TeamsFocus, TeamsMode, COMPOSE_ATTACH, COMPOSE_BCC, COMPOSE_BODY,
-    COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO, DEFAULT_FOLDER_PANEL_WIDTH,
+    mail_row_unread, mail_same_thread, mail_thread_size, App, CalendarView, ChatPollTier, Compose,
+    OutlookFocus, Overlay, Screen, TeamsFocus, TeamsMode, COMPOSE_ATTACH, COMPOSE_BCC,
+    COMPOSE_BODY, COMPOSE_CC, COMPOSE_SUBJECT, COMPOSE_TO, DEFAULT_FOLDER_PANEL_WIDTH,
+    NTFY_SNOOZE_HOURS, POLL_SECONDS, POLL_STALE_SECONDS,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -105,56 +108,80 @@ fn render_copy_mode(f: &mut Frame, app: &App) {
 /// Top row: which app is active on the left, live state on the right.
 /// No key hints live here — those belong in the bottom bar.
 fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
-    let tab = |name: &str, active: bool| {
-        if active {
-            Span::styled(
-                format!(" {name} "),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            )
+    let tab = |name: &str, active: bool, unread: bool| {
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else if unread {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Span::styled(format!(" {name} "), Style::default().fg(DIM))
-        }
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD)
+        };
+        Span::styled(format!(" {name} "), style)
+    };
+    let outlook_unread = app
+        .outlook
+        .folders
+        .iter()
+        .any(|folder| folder.unread_item_count.unwrap_or(0) > 0);
+    let outlook_tab = if outlook_unread {
+        "Outlook (F1) *"
+    } else {
+        "Outlook (F1)  "
+    };
+    let teams_has_unread = app
+        .teams
+        .chat_unread_counts
+        .values()
+        .any(|count| *count > 0);
+    let teams_tab = if app.teams_unread {
+        "Teams (F2) *"
+    } else if teams_has_unread {
+        "Teams (F2) •"
+    } else {
+        "Teams (F2)  "
     };
     let tabs = Line::from(vec![
-        tab("Outlook (F1)", app.screen == Screen::Outlook),
+        tab(outlook_tab, app.screen == Screen::Outlook, outlook_unread),
         Span::raw("  "),
-        tab("Teams (F2)", app.screen == Screen::Teams),
+        tab(
+            teams_tab,
+            app.screen == Screen::Teams,
+            app.teams_unread || teams_has_unread,
+        ),
         Span::raw("  "),
-        tab("Calendar (F3)", app.screen == Screen::Calendar),
+        tab("Calendar (F3)  ", app.screen == Screen::Calendar, false),
     ]);
 
-    // Right-hand state: presence · push · memory · last sync.
+    // Right-hand state: presence · poll health · ntfy · memory · local clock.
     let (dot, avail) = presence_indicator(app);
-    let (push_label, push_colour) = match &app.push {
-        PushState::Off => ("push off", DIM),
-        PushState::Connecting => ("push …", Color::Yellow),
-        PushState::Live => ("push live", Color::Green),
-        PushState::Failed(_) => ("push FAILED", Color::Red),
-    };
+    let (poll_label, poll_colour) = poll_indicator(app.poll_elapsed());
+    let (ntfy_label, ntfy_colour) = ntfy_indicator(app);
     let ram = match app.rss_kb {
         Some(kb) if kb >= 1024 => format!("{:.0} MB", kb as f64 / 1024.0),
         Some(kb) => format!("{kb} KB"),
         None => "—".to_string(),
     };
-    let sync = match &app.last_sync {
-        Some(t) => format!("⟳ {t}"),
-        None => "⟳ …".to_string(),
-    };
+    let clock = chrono::Local::now().format("%H:%M").to_string();
     let sep = || Span::styled(" · ", Style::default().fg(DIM));
-    let state_spans = vec![
+    let state = Line::from(vec![
         Span::styled(format!("{dot} {avail}"), presence_style(app)),
         sep(),
-        Span::styled(push_label, Style::default().fg(push_colour)),
+        Span::styled(poll_label, Style::default().fg(poll_colour)),
+        sep(),
+        Span::styled(ntfy_label, Style::default().fg(ntfy_colour)),
         sep(),
         Span::styled(format!("rss {ram}"), Style::default().fg(Color::Gray)),
         sep(),
-        Span::styled(sync, Style::default().fg(Color::Green)),
+        Span::styled(clock, Style::default().fg(Color::Green)),
         Span::raw(" "),
-    ];
-    let state = Line::from(state_spans);
+    ]);
 
     let state_w = line_width(&state).min(area.width);
     let cols = Layout::default()
@@ -170,28 +197,48 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
     let bg = Color::Rgb(30, 30, 40);
     let hints = format!(" {} · ? help ", context_hints(app));
-    let hints_w = (hints.chars().count() as u16).min(area.width);
+    let requested_hints_w = (hints.chars().count() as u16).min(area.width);
+    let status_w = app.status.chars().count() as u16 + 2;
+    let hints_w =
+        if app.status.is_empty() || status_w.saturating_add(requested_hints_w) <= area.width {
+            requested_hints_w
+        } else {
+            0
+        };
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(hints_w)])
         .split(area);
 
+    let status_style = if app.status.is_empty() {
+        Style::default().fg(Color::White).bg(bg)
+    } else {
+        Style::default()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    };
+    let status_bg = if app.status.is_empty() { bg } else { ACCENT };
+
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(" {}", app.status),
-            Style::default().fg(Color::White).bg(bg),
+            status_style,
         )))
-        .style(Style::default().bg(bg)),
+        .style(Style::default().bg(status_bg)),
         cols[0],
     );
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            hints,
-            Style::default().fg(DIM).bg(bg),
-        ))),
-        cols[1],
-    );
+
+    if hints_w > 0 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hints,
+                Style::default().fg(DIM).bg(bg),
+            ))),
+            cols[1],
+        );
+    }
 }
 
 fn line_width(line: &Line) -> u16 {
@@ -213,7 +260,7 @@ fn context_hints(app: &App) -> &'static str {
             } => "1-9 jump · j/k next · Esc back",
             Overlay::MailImages { .. } => "1-9 fullscreen · j/k scroll · Esc close",
             Overlay::Attachments => "1-9 save · Esc close",
-            Overlay::React => "1-7 react · Esc close",
+            Overlay::React { .. } => "1-7 react · Esc close",
             Overlay::ViewImage { keys, .. } if keys.len() > 1 => "j/k next image · Esc close",
             Overlay::ViewImage { .. } => "Esc close",
             Overlay::Presence => "1-6 set · c clear · Esc close",
@@ -228,6 +275,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Diagnostics | Overlay::ContactDiagnostics => {
                 "c copy · l log · r refresh · j/k scroll · Esc close"
             }
+            _ => "Enter select · Esc close",
         };
     }
     match app.screen {
@@ -247,7 +295,7 @@ fn context_hints(app: &App) -> &'static str {
             TeamsFocus::Messages => {
                 "j/k select · g/G · h back · r reply · E edit · e react · v image"
             }
-            TeamsFocus::Composer if app.teams.editing.is_some() => "Enter save · Esc cancel",
+            TeamsFocus::Composer if app.teams.editing_message.is_some() => "Enter save · Esc cancel",
             TeamsFocus::Composer => "Enter send · Ctrl+V image · @path Tab · Esc leave",
         },
         Screen::Calendar => match app.calendar.view {
@@ -639,6 +687,10 @@ fn conversation_flow(app: &App, selectable: bool) -> (Vec<FlowItem>, Vec<usize>)
     let mut prev: Option<(String, Option<chrono::DateTime<chrono::Local>>)> = None;
 
     for (i, m) in app.teams.messages.iter().enumerate() {
+        if !app.teams_message_visible(m) {
+            starts.push(flow.len());
+            continue;
+        }
         let when = local_time(m.created_date_time.as_deref());
         let mut day_changed = false;
         // A deleted message can still render its tombstone, but it must not
@@ -694,6 +746,14 @@ fn conversation_flow(app: &App, selectable: bool) -> (Vec<FlowItem>, Vec<usize>)
             continue;
         }
 
+        if let Some(display) = m.system_event_display() {
+            flow.push(FlowItem::Line(lead(vec![Span::styled(
+                display.text,
+                Style::default().fg(DIM),
+            )])));
+            prev = None;
+            continue;
+        }
         let author = m.author();
         let grouped = !day_changed
             && prev
@@ -981,18 +1041,28 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     let me_id = app.me.as_ref().map(|m| m.id.as_str());
 
     // Left list: chats or channels
-    let (title, items, sel): (&str, Vec<ListItem>, usize) = match app.teams.mode {
+    //
+    // Chat rows render their selection explicitly instead of relying on the
+    // generic List highlight style. The generic style sets one foreground for
+    // the whole selected row, which would overwrite the contact-presence
+    // colour. Explicit row styling keeps the same selection background while
+    // allowing the presence glyph to retain its status colour.
+    match app.teams.mode {
         TeamsMode::Chats => {
-            let mut rows: Vec<Option<&m365_core::models::Chat>> = app
+            let focused = app.teams.focus == TeamsFocus::List;
+            let selected_bg = if focused { ACCENT } else { Color::Gray };
+            let inner_width = cols[0].width.saturating_sub(3) as usize;
+
+            let mut chat_rows: Vec<Option<&m365_core::models::Chat>> = app
                 .teams
                 .chats
                 .iter()
                 .filter(|chat| !app.teams_chat_is_archived(chat))
                 .map(Some)
                 .collect();
-            rows.push(None);
+            chat_rows.push(None);
             if app.teams.archive_expanded {
-                rows.extend(
+                chat_rows.extend(
                     app.teams
                         .chats
                         .iter()
@@ -1000,84 +1070,164 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
                         .map(Some),
                 );
             }
-            let items = rows
+
+            let items: Vec<ListItem> = chat_rows
                 .into_iter()
-                .map(|row| match row {
-                    None => {
+                .enumerate()
+                .map(|(index, row)| {
+                    let selected = index == app.teams.chat_sel;
+                    let selection_style = if selected {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(selected_bg)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+
+                    let Some(c) = row else {
+                        let marker = if selected { "▏" } else { " " };
                         let arrow = if app.teams.archive_expanded {
                             "▾"
                         } else {
                             "▸"
                         };
-                        ListItem::new(Span::styled(
-                            truncate(
-                                &format!("{arrow} Archive [{}]", app.teams_archive_count()),
-                                30,
-                            ),
-                            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
-                        ))
-                    }
-                    Some(chat) => {
-                        let stay = if app.teams_chat_is_stay_archived(&chat.id) {
-                            "S "
+                        let label = format!("{arrow} Archive [{}]", app.teams_archive_count());
+                        let label = truncate(&label, inner_width);
+                        let padding = inner_width.saturating_sub(label.chars().count());
+                        let style = if selected {
+                            selection_style
                         } else {
-                            ""
+                            Style::default().fg(DIM).add_modifier(Modifier::BOLD)
                         };
-                        let (marker, marker_color) =
-                            contact_presence_marker(app.teams_peer_presence(chat));
-                        let show_marker = chat
-                            .chat_type
-                            .as_deref()
-                            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
-                            && app.session.config.presence_read
-                            && app.teams_peer_presence(chat).is_some();
-                        let prefix = if show_marker {
-                            format!("{stay}{marker} ")
-                        } else {
-                            stay.to_string()
-                        };
-                        let label = truncate(
-                            &chat.label(me_id),
-                            30usize.saturating_sub(prefix.chars().count()),
-                        );
-                        let tier = if stay.is_empty() {
-                            match app.teams_chat_poll_tier(&chat.id) {
-                                crate::teams_chat::ChatPollTier::Hot => Style::default()
-                                    .fg(Color::LightCyan)
-                                    .add_modifier(Modifier::BOLD),
-                                crate::teams_chat::ChatPollTier::Warm => {
-                                    Style::default().fg(ACCENT)
-                                }
-                                crate::teams_chat::ChatPollTier::Cool => {
-                                    Style::default().fg(ACCENT).add_modifier(Modifier::DIM)
-                                }
-                                crate::teams_chat::ChatPollTier::Normal => Style::default(),
+
+                        return ListItem::new(Line::from(vec![
+                            Span::styled(marker, selection_style),
+                            Span::styled(label, style),
+                            Span::styled(" ".repeat(padding), selection_style),
+                        ]));
+                    };
+
+                    let marker = if app.teams_chat_is_stay_archived(&c.id) {
+                        "S"
+                    } else if selected {
+                        "▏"
+                    } else {
+                        " "
+                    };
+                    let tier_style = if selected {
+                        selection_style
+                    } else {
+                        match app.teams_chat_poll_tier(&c.id) {
+                            ChatPollTier::Hot => Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                            ChatPollTier::Warm => Style::default().fg(ACCENT),
+                            ChatPollTier::Cool => {
+                                Style::default().fg(ACCENT).add_modifier(Modifier::DIM)
                             }
-                        } else {
-                            Style::default().fg(DIM)
-                        };
-                        let mut spans = Vec::new();
-                        if show_marker {
-                            if !stay.is_empty() {
-                                spans
-                                    .push(Span::styled(stay.to_string(), Style::default().fg(DIM)));
-                            }
-                            spans.push(Span::styled(
-                                format!("{marker} "),
-                                Style::default().fg(marker_color),
-                            ));
-                        } else if !prefix.is_empty() {
-                            spans.push(Span::styled(prefix, Style::default().fg(DIM)));
+                            ChatPollTier::Normal => Style::default(),
                         }
-                        spans.push(Span::styled(label, tier));
-                        ListItem::new(Line::from(spans))
+                    };
+                    let label = app
+                        .teams
+                        .contact_names
+                        .get(&c.id)
+                        .cloned()
+                        .unwrap_or_else(|| c.label(me_id));
+                    let one_on_one = c
+                        .chat_type
+                        .as_deref()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"));
+                    let user_id = app
+                        .teams
+                        .contact_user_ids
+                        .get(&c.id)
+                        .map(String::as_str)
+                        .or_else(|| c.peer_user_id(me_id));
+
+                    let unread = if one_on_one {
+                        app.teams
+                            .chat_unread_counts
+                            .get(&c.id)
+                            .copied()
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let unread_suffix = match unread {
+                        0 => String::new(),
+                        1..=99 => format!("[{unread}]"),
+                        _ => "[+]".to_string(),
+                    };
+                    let external = app.teams.external_chats.contains(&c.id);
+                    let suffix = match (external, unread_suffix.is_empty()) {
+                        (true, true) => "↗".to_string(),
+                        (true, false) => format!("↗ {unread_suffix}"),
+                        (false, _) => unread_suffix,
+                    };
+                    let suffix_width = suffix.chars().count();
+
+                    if !app.session.config.presence_read || !one_on_one {
+                        let label_width = inner_width.saturating_sub(suffix_width);
+                        let label = truncate(&label, label_width);
+                        let padding =
+                            inner_width.saturating_sub(label.chars().count() + suffix_width);
+                        return ListItem::new(Line::from(vec![
+                            Span::styled(marker, selection_style),
+                            Span::styled(label, tier_style),
+                            Span::styled(" ".repeat(padding), selection_style),
+                            Span::styled(suffix, selection_style),
+                        ]));
                     }
+
+                    let presence = user_id.and_then(|id| app.teams.contact_presences.get(id));
+                    let (symbol, color) = match presence {
+                        Some(presence) => contact_presence_marker(Some(presence)),
+                        None => ("×", Color::DarkGray),
+                    };
+                    let prefix_width = 2usize;
+                    let label_width = inner_width.saturating_sub(prefix_width + suffix_width);
+                    let label = truncate(&label, label_width);
+                    let padding = inner_width
+                        .saturating_sub(prefix_width + label.chars().count() + suffix_width);
+                    let presence_style = if selected {
+                        let selected_color = match color {
+                            Color::Red => Color::LightRed,
+                            Color::Yellow => Color::LightYellow,
+                            Color::DarkGray => Color::White,
+                            other => other,
+                        };
+                        Style::default()
+                            .fg(selected_color)
+                            .bg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(color)
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        Span::styled(marker, selection_style),
+                        Span::styled(symbol, presence_style),
+                        Span::styled(" ", selection_style),
+                        Span::styled(label, tier_style),
+                        Span::styled(" ".repeat(padding), selection_style),
+                        Span::styled(suffix, selection_style),
+                    ]))
                 })
                 .collect();
-            ("Chats (x archive)", items, app.teams.chat_sel)
+
+            let mut state = ListState::default();
+            state.select(Some(app.teams.chat_sel));
+            f.render_stateful_widget(
+                List::new(items).block(panel_block("Chats (c→channels)", focused)),
+                cols[0],
+                &mut state,
+            );
         }
         TeamsMode::Channels => {
-            if app.teams.channels.is_empty() {
+            let (title, items, sel): (&str, Vec<ListItem>, usize) = if app.teams.channels.is_empty()
+            {
                 let items = app
                     .teams
                     .teams
@@ -1092,17 +1242,18 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
                     .iter()
                     .map(|c| ListItem::new(truncate(c.display_name.as_deref().unwrap_or(""), 30)))
                     .collect();
-                ("Channels (t→chats)", items, app.teams.channel_sel)
-            }
+                ("Channels (c→chats)", items, app.teams.channel_sel)
+            };
+
+            let mut state = ListState::default();
+            state.select(Some(sel));
+            f.render_stateful_widget(
+                selectable_list(items, title, app.teams.focus == TeamsFocus::List),
+                cols[0],
+                &mut state,
+            );
         }
-    };
-    let mut lstate = ListState::default();
-    lstate.select(Some(sel));
-    f.render_stateful_widget(
-        selectable_list(items, title, app.teams.focus == TeamsFocus::List),
-        cols[0],
-        &mut lstate,
-    );
+    }
 
     // Right: messages + composer. The composer grows with its content (handy for
     // multi-line pastes) up to a cap; Min(5) leaves room for the border, the
@@ -1110,7 +1261,8 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     let composer_width = cols[1].width.saturating_sub(2).max(1) as usize;
     let composer_rows = app.teams.composer.wrap(composer_width).len().clamp(1, 6) as u16;
     // One extra row while a reply or edit is in progress, for the banner.
-    let reply_row = u16::from(app.teams.replying_to.is_some() || app.teams.editing.is_some());
+    let reply_row =
+        u16::from(app.teams.replying_to.is_some() || app.teams.editing_message.is_some());
     let preview_h = composer_preview_height(app, composer_width as u16);
     let out_of_office = visible_chat_out_of_office(app);
     let oof_row = u16::from(out_of_office.is_some());
@@ -1179,7 +1331,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     render_display_rows(f, pane[1], &rows, scroll, app);
 
     let composing = app.teams.focus == TeamsFocus::Composer;
-    let title = if composing && app.teams.editing.is_some() {
+    let title = if composing && app.teams.editing_message.is_some() {
         "Message (Enter save · Esc cancel)"
     } else if composing {
         "Message (Enter send · Ctrl+V image · @path Tab)"
@@ -1207,7 +1359,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(composer_block, right[2]);
 
     // Show what's being replied to or edited, so Enter isn't a surprise.
-    if app.teams.editing.is_some() {
+    if app.teams.editing_message.is_some() {
         let banner = Rect {
             height: 1,
             ..composer_inner
@@ -1509,75 +1661,6 @@ fn render_mail_images(f: &mut Frame, app: &mut App, scroll: u16, fullscreen: Opt
     }
 }
 
-fn render_diagnostics_overlay(f: &mut Frame, app: &mut App, contact: bool) {
-    let area = centered(84, 86, f.area());
-    f.render_widget(Clear, area);
-    let title = if contact {
-        "Contact diagnostics — c copy/export · l log · r refresh · j/k scroll · Esc close"
-    } else {
-        "Diagnostics — c copy/export · l log · r refresh · j/k scroll · Esc close"
-    };
-    let block = popup_block(title);
-    let inner = block.inner(area);
-    let text = if contact {
-        crate::diagnostics::contact_text(app)
-    } else {
-        crate::diagnostics::text(app)
-    };
-
-    let lines: Vec<Line<'static>> = text
-        .lines()
-        .map(|line| {
-            if line.is_empty() {
-                return Line::raw("");
-            }
-            if !line.starts_with(' ') {
-                return Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ));
-            }
-
-            let marker = [
-                ('●', Color::Green),
-                ('○', Color::DarkGray),
-                ('!', Color::Yellow),
-                ('×', Color::Red),
-                ('?', Color::DarkGray),
-            ]
-            .into_iter()
-            .find_map(|(symbol, color)| line.find(symbol).map(|index| (symbol, color, index)));
-
-            if let Some((symbol, color, index)) = marker {
-                let end = index + symbol.len_utf8();
-                Line::from(vec![
-                    Span::raw(line[..index].to_string()),
-                    Span::styled(
-                        symbol.to_string(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(line[end..].to_string()),
-                ])
-            } else {
-                Line::raw(line.to_string())
-            }
-        })
-        .collect();
-
-    let (rows, _) = crate::wrap::wrap_all(&lines, inner.width.max(1) as usize);
-    let max = (rows.len() as u16).saturating_sub(inner.height);
-    let scroll = if contact {
-        app.contact_diagnostics_max_scroll.set(max);
-        app.contact_diagnostics_scroll.min(max)
-    } else {
-        app.diagnostics_max_scroll.set(max);
-        app.diagnostics_scroll.min(max)
-    };
-
-    f.render_widget(block, area);
-    f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
-}
-
 fn render_overlay(f: &mut Frame, app: &mut App) {
     if let Some(Overlay::ViewImage { keys, sel }) = &app.overlay {
         let keys = keys.clone();
@@ -1594,57 +1677,333 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
     let Some(overlay) = &app.overlay else {
         return;
     };
+
     match overlay {
-        Overlay::ViewImage { .. } | Overlay::MailImages { .. } => {}
+        Overlay::Notice(message) => {
+            let area = centered(66, 30, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(format!(
+                    "{message}\n\nAny key dismisses · auto-closes in 3s"
+                ))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(Color::Yellow))
+                .block(popup_block("Calendar notice")),
+                area,
+            );
+        }
+        Overlay::TeamsCommands => {
+            let area = centered(72, 66, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("Teams commands — j/k scroll · Esc close");
+            let inner = block.inner(area);
+            let text = " /topic <text>       set chat topic/title (group chats only)
+ /rename <name>      rename chat (group chats only; asks for confirmation)
+ /edit <text>        replace selected own message text
+ /pin                pin selected message (replaces current pin; asks confirmation)
+ /unpin              unpin selected message
+ /pins               show current pinned message; Enter jump · u unpin
+ /unread             mark current chat unread
+ /delete             delete selected own message (asks confirmation)
+ /ooo                show Out of Office
+ /ooo set            set/edit scheduled Out of Office
+ /ooo clear          disable Out of Office (asks confirmation)
+ /help               show this command list
+ /help all           show full application/key help
+
+ Formatting: **bold**  *italic*  ~~strike~~  `code`
+             > quote   - list item   [text](https://url)
+
+ Commands that act on a message use the currently selected ▶ message.";
+
+            let lines: Vec<Line<'static>> = text
+                .split('\n')
+                .map(|line| Line::raw(line.to_string()))
+                .collect();
+            let (rows, _) = crate::wrap::wrap_all(&lines, inner.width.max(1) as usize);
+            let max = (rows.len() as u16).saturating_sub(inner.height);
+            app.help_max_scroll.set(max);
+            let scroll = app.help_scroll.min(max);
+
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
+        }
         Overlay::Help => {
             let area = centered(60, 60, f.area());
             f.render_widget(Clear, area);
+            let block = popup_block("Help — j/k scroll · Esc close");
+            let inner = block.inner(area);
             let text = "\
  M365 TUI — keys\n\
  \n\
- Global:  F1 Outlook · F2 Teams · F3 Calendar · F6 diagnostics · F7 contact diagnostics\n\
-           Ctrl+P palette · p presence · s settings · | panes · ? help · q quit\n\
+ Global:  F1 Outlook · F2 Teams · F3 Calendar · F4 ntfy snooze · F5 force poll · F6 diagnostics · F7 contact diagnostics · Ctrl+P palette · p presence · ? help · q quit\n\
+  Presence: p menu · 1-6 state · m set/edit status message · c clear message · a automatic\n\
+ \n\
+ NTFY:    F4 menu · j/k choose · Enter apply · c/0 resume now · Esc cancel\n\
+          Snooze: 1h · 2h · 4h · 8h · 12h · 24h · Resume now\n\
  \n\
  Links:   o list links in the message · 1-9 open in browser\n\
- Images:  i list images in the open mail · 1-9 fullscreen\n\
  Attach:  A list attachments · 1-9 save to your Downloads folder\n\
-          when writing: Tab to Attach, type a path, Tab complete, Enter attach\n\
+          when writing: Tab to Attach, type a path, Enter to attach\n\
  \n\
  Copying: y yank focused message · Y yank whole view\n\
           z copy mode (full-width, borderless — drag-select cleanly)\n\
  \n\
  Moving:  h/← out a pane · l/→ into it (opens what's selected)\n\
-          j/k or ↑/↓ move · g/G top/bottom · arrows work everywhere hjkl does\n\
-          | or \\ toggle horizontal/vertical panes\n\
-          Outlook: Shift+H/L resize the Folders panel\n\
+          j/k or ↑/↓ move · arrows work everywhere hjkl does\n\
  \n\
- Outlook: Enter open · c compose · r reply · a reply-all · f forward\n\
-           u read/unread · m move folder · d trash · / search · e calendar\n\
-           t toggles threads/individual messages\n\
-          folders pane / finds a folder · reading pane j/k scroll · g/G\n\
+ Outlook: Enter open · u read/unread · c compose · r reply · a reply-all\n\
+          f forward · / search · g calendar · in the reading pane j/k scroll\n\
  \n\
- Calendar: F3 full screen · j/k event · Enter details · a accept · d decline · t tentative\n\
-           o join meeting · w agenda range · v month/agenda · n today · r refresh\n\
+ Teams:   c chats/channels · x archive/restore · X toggle Stay archived\n\
+          g profile on chat · g newest in messages · t react · e edit\n\
+          a/i type message · r reply to selected · Enter send/save\n\
+          /topic <text> (group only) · /rename <name> (group only)\n\
+          /edit <text> · /pin · /unpin · /pins · /unread · /delete\n\
+          /ooo · /ooo set · /ooo clear\n\
+          /help commands only · /help all full help\n\
+          Markdown: **bold** · *italic* · ~~strike~~ · `code` · > quote · - list · [text](url)\n\
  \n\
-  Teams:   n new chat (chat list) · t chats/channels · x archive/restore · X Stay archived · j/k select · g/G · e react · v image\n\
-          i type · r reply · E edit (Up in empty composer = last of yours) · Enter send\n\
-          Ctrl+V paste image · @path Tab complete image · Ctrl+X remove last image\n\
-          j/k in chat list shows a cached preview without marking the chat read\n\
+ Calendar agenda: j/k select · Enter/g detail · o open meeting · n today\n\
+           a accept · d decline · t tentative · r refresh · w range · v month\n\
+ Calendar month:  j/k event · Enter/g detail · o open meeting · n today\n\
+           ←/→ previous/next month · a/d/t RSVP · v agenda\n\
  \n\
- Compose: To/Cc/Bcc autocomplete from seen mail · ↑/↓ + Tab/Enter choose\n\
-          Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
-          replies: Ctrl+R reply/reply-all · Ctrl+E edit recipients\n\
-          body: @path Tab completes and embeds an inline image\n\
-          Ctrl+X e $EDITOR (body + subject) · Ctrl+X x unstage last file\n\
+ Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
           Backspace/Delete · Ctrl+W word · Ctrl+U to line start · Ctrl+K to end\n\
           Enter newline in body · paste works (bracketed paste)\n\
  \n\
- Press Esc to close.";
+ Help:    j/k or ↑/↓ scroll · PgUp/PgDn · Home/End · Esc close.";
+            let lines: Vec<Line<'static>> = text
+                .split('\n')
+                .map(|line| Line::raw(line.to_string()))
+                .collect();
+            let (rows, _) = crate::wrap::wrap_all(&lines, inner.width as usize);
+            let max = (rows.len() as u16).saturating_sub(inner.height);
+            app.help_max_scroll.set(max);
+            let scroll = app.help_scroll.min(max);
+
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
+        }
+        Overlay::Diagnostics => {
+            let area = centered(84, 86, f.area());
+            f.render_widget(Clear, area);
+
+            let block = popup_block(
+                "Diagnostics — c copy/export · l log · r refresh · j/k scroll · Esc close",
+            );
+            let inner = block.inner(area);
+            let text = diagnostics::text(app);
+
+            let lines: Vec<Line<'static>> = text
+                .lines()
+                .map(|line| {
+                    if line.is_empty() {
+                        return Line::raw("");
+                    }
+                    if !line.starts_with(' ') {
+                        return Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+
+                    let marker = [
+                        ('●', Color::Green),
+                        ('○', Color::DarkGray),
+                        ('!', Color::Yellow),
+                        ('×', Color::Red),
+                        ('?', Color::DarkGray),
+                    ]
+                    .into_iter()
+                    .find_map(|(symbol, color)| {
+                        line.find(symbol).map(|index| (symbol, color, index))
+                    });
+
+                    if let Some((symbol, color, index)) = marker {
+                        let end = index + symbol.len_utf8();
+                        Line::from(vec![
+                            Span::styled(
+                                line[..index].to_string(),
+                                Style::default().fg(Color::White),
+                            ),
+                            Span::styled(
+                                symbol.to_string(),
+                                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                line[end..].to_string(),
+                                Style::default().fg(Color::White),
+                            ),
+                        ])
+                    } else {
+                        Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::White),
+                        ))
+                    }
+                })
+                .collect();
+
+            let (rows, _) = crate::wrap::wrap_all(&lines, inner.width.max(1) as usize);
+            let max = (rows.len() as u16).saturating_sub(inner.height);
+            app.diagnostics_max_scroll.set(max);
+            let scroll = app.diagnostics_scroll.min(max);
+
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
+        }
+        Overlay::ContactDiagnostics => {
+            let area = centered(84, 86, f.area());
+            f.render_widget(Clear, area);
+
+            let block = popup_block("Contact diagnostics");
+            let inner = block.inner(area);
+            let text = diagnostics::contact_text(app);
+
+            let lines: Vec<Line<'static>> = text
+                .lines()
+                .map(|line| {
+                    if line.is_empty() {
+                        return Line::raw("");
+                    }
+                    if !line.starts_with(' ') {
+                        return Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+
+                    let marker = [
+                        ('●', Color::Green),
+                        ('○', Color::DarkGray),
+                        ('!', Color::Yellow),
+                        ('×', Color::Red),
+                        ('?', Color::DarkGray),
+                    ]
+                    .into_iter()
+                    .find_map(|(symbol, color)| {
+                        line.find(symbol).map(|index| (symbol, color, index))
+                    });
+
+                    if let Some((symbol, color, index)) = marker {
+                        let end = index + symbol.len_utf8();
+                        Line::from(vec![
+                            Span::styled(
+                                line[..index].to_string(),
+                                Style::default().fg(Color::White),
+                            ),
+                            Span::styled(
+                                symbol.to_string(),
+                                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                line[end..].to_string(),
+                                Style::default().fg(Color::White),
+                            ),
+                        ])
+                    } else {
+                        Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::White),
+                        ))
+                    }
+                })
+                .collect();
+
+            let (rows, _) = crate::wrap::wrap_all(&lines, inner.width.max(1) as usize);
+            let max = (rows.len() as u16).saturating_sub(inner.height);
+            app.contact_diagnostics_max_scroll.set(max);
+            let scroll = app.contact_diagnostics_scroll.min(max);
+
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
+        }
+        Overlay::ContactProfile => {
+            let area = centered(76, 72, f.area());
+            f.render_widget(Clear, area);
+
+            let block = popup_block("Contact profile — j/k scroll · Esc close");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let profile = app.contact_profile.as_ref();
+
+            // Keep the contact text at a stable x-position regardless of whether
+            // an avatar exists or has finished loading. Reserve at most 25% of
+            // the profile width for the image, capped at the previous 18 cells.
+            let avatar_width = (inner.width / 4).min(18);
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(avatar_width), Constraint::Min(1)])
+                .split(inner);
+            let avatar_area = columns[0];
+            let text_area = columns[1];
+
+            let lines = contact_profile_lines(app);
+            let (rows, _) = crate::wrap::wrap_all(&lines, text_area.width.max(1) as usize);
+            let max = (rows.len() as u16).saturating_sub(text_area.height);
+            app.contact_profile_max_scroll.set(max);
+            let scroll = app.contact_profile_scroll.min(max);
+
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), text_area);
+
+            if let Some(profile) = profile {
+                if let Some(avatar) = profile.avatar.as_ref() {
+                    if avatar_area.width > 0 && avatar_area.height > 0 {
+                        if let Ok(mut state) = avatar.state.try_borrow_mut() {
+                            let bounds =
+                                Rect::new(0, 0, avatar_area.width, avatar_area.height.clamp(1, 12));
+                            let fitted = state.size_for(Resize::Fit(None), bounds);
+                            if fitted.width > 0 && fitted.height > 0 {
+                                let image_area = Rect::new(
+                                    avatar_area.x
+                                        + avatar_area.width.saturating_sub(fitted.width) / 2,
+                                    avatar_area.y
+                                        + avatar_area.height.saturating_sub(fitted.height) / 2,
+                                    fitted.width.min(avatar_area.width),
+                                    fitted.height.min(avatar_area.height),
+                                );
+                                f.render_stateful_widget(
+                                    StatefulImage::new().resize(Resize::Fit(None)),
+                                    image_area,
+                                    &mut *state,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Overlay::Calendar => {
+            let area = centered(70, 70, f.area());
+            f.render_widget(Clear, area);
+            let mut previous_day = String::new();
+            let items: Vec<ListItem> = app
+                .calendar
+                .events
+                .iter()
+                .map(|event| {
+                    let day = calendar_day_label(event);
+                    let show_day = day != previous_day;
+                    previous_day = day;
+                    ListItem::new(calendar_plain_line(event, show_day))
+                })
+                .collect();
+            let list = if items.is_empty() {
+                List::new(vec![ListItem::new(
+                    "No events in the next 7 days (or still loading).",
+                )])
+            } else {
+                List::new(items)
+            };
             f.render_widget(
-                Paragraph::new(text)
-                    .block(popup_block("Help"))
-                    .wrap(Wrap { trim: false }),
+                list.block(popup_block(&format!(
+                    "Calendar — next {} days (Esc to close)",
+                    app.calendar.days
+                ))),
                 area,
             );
         }
@@ -1664,8 +2023,6 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
                 area,
             );
         }
-        Overlay::Diagnostics => render_diagnostics_overlay(f, app, false),
-        Overlay::ContactDiagnostics => render_diagnostics_overlay(f, app, true),
         Overlay::Search { query } => {
             let area = centered(60, 20, f.area());
             f.render_widget(Clear, area);
@@ -1677,6 +2034,734 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
                 area,
             );
         }
+        Overlay::Palette { query, sel } => {
+            let area = centered(50, 60, f.area());
+            f.render_widget(Clear, area);
+            let matches = filter_commands(query);
+            let block = popup_block("Command palette");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(0)])
+                .split(inner);
+            f.render_widget(Paragraph::new(format!("> {query}▏")), rows[0]);
+            let items: Vec<ListItem> = matches
+                .iter()
+                .map(|(_, label)| ListItem::new(*label))
+                .collect();
+            let mut st = ListState::default();
+            st.select(Some(*sel));
+            f.render_stateful_widget(
+                List::new(items).highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                rows[1],
+                &mut st,
+            );
+        }
+        Overlay::Compose(c) => render_compose(f, c, app),
+        Overlay::React { row, col } => {
+            // Tele-style picker: 4 lines × 7 fixed four-column cells. Keeping
+            // each row as one Line avoids per-cell wrapping and wcwidth drift.
+            let frame = f.area();
+            let width = 33u16.min(frame.width.max(1));
+            let height = 8u16.min(frame.height.max(1));
+            let area = Rect {
+                x: frame.x + frame.width.saturating_sub(width) / 2,
+                y: frame.y + frame.height.saturating_sub(height) / 2,
+                width,
+                height,
+            };
+
+            f.render_widget(Clear, area);
+            let block = popup_block("React");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let mut lines = Vec::with_capacity(4);
+            for (row_index, chunk) in crate::app::REACTIONS
+                .chunks(crate::app::REACTION_COLS)
+                .enumerate()
+            {
+                let mut spans = Vec::with_capacity(chunk.len());
+                for (col_index, emoji) in chunk.iter().enumerate() {
+                    let style = if row_index == *row && col_index == *col {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(ACCENT)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    spans.push(Span::styled(format!(" {emoji} "), style));
+                }
+                lines.push(Line::from(spans));
+            }
+
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+            f.render_widget(Paragraph::new(lines), rows[0]);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "hjkl/arrows · Enter react · Esc close",
+                    Style::default().fg(DIM),
+                )),
+                rows[2],
+            );
+        }
+        Overlay::PinnedMessages { messages, sel, .. } => {
+            let area = centered(76, 60, f.area());
+            f.render_widget(Clear, area);
+            let title = if messages.len() <= 1 {
+                "Pinned message — Enter jump · u unpin · Esc close"
+            } else {
+                "Pinned messages — j/k move · Enter jump · u unpin · Esc close"
+            };
+            let block = popup_block(title);
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            if messages.is_empty() {
+                f.render_widget(Paragraph::new("No pinned messages."), inner);
+            } else {
+                let items: Vec<ListItem> = messages
+                    .iter()
+                    .map(|message| {
+                        let author = message.author();
+                        let preview = message.text_preview(100);
+                        ListItem::new(Line::from(vec![
+                            Span::styled(
+                                format!("{author}: "),
+                                Style::default()
+                                    .fg(Color::LightGreen)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(preview),
+                        ]))
+                    })
+                    .collect();
+                let mut state = ListState::default();
+                state.select(Some((*sel).min(messages.len().saturating_sub(1))));
+                f.render_stateful_widget(
+                    List::new(items)
+                        .highlight_style(
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(ACCENT)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .highlight_symbol("▏"),
+                    inner,
+                    &mut state,
+                );
+            }
+        }
+        Overlay::ConfirmAutomationPeer {
+            peer_id,
+            dotenv_path,
+        } => {
+            let area = centered(90, 80, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(format!(
+                    "Add this one-to-one peer to M365_TEAMS_AUTOMATION_PEERS?\n\nPeer ID: {peer_id}\nConfig:  {dotenv_path}\n\nWorkflows \"Post as User\" messages in this chat will be treated as incoming automation messages.\n\nPress y to add. Any other key cancels."
+                ))
+                .wrap(Wrap { trim: false })
+                .block(popup_block("Add automation peer?")),
+                area,
+            );
+        }
+        Overlay::ConfirmRename { name, .. } => {
+            let area = centered(66, 32, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(format!(
+                    "Rename this group chat to:\n\n{name}\n\nMicrosoft Graph stores the chat title in the topic property.\n\nPress y to rename. Any other key cancels."
+                ))
+                .wrap(Wrap { trim: false })
+                .block(popup_block("Rename group chat?")),
+                area,
+            );
+        }
+        Overlay::ConfirmReplacePin { .. } => {
+            let area = centered(62, 28, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(
+                    "Teams chat supports only one pinned message at a time.\n\nPinning this message will replace the current pinned message, if there is one.\n\nPress y to continue. Any other key cancels.",
+                )
+                .wrap(Wrap { trim: false })
+                .block(popup_block("Replace pinned message?")),
+                area,
+            );
+        }
+        Overlay::ConfirmDelete { .. } => {
+            let area = centered(58, 24, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(
+                    "Soft-delete the selected Teams message?\n\nPress y to delete. Any other key cancels.",
+                )
+                .wrap(Wrap { trim: false })
+                .block(popup_block("Delete message")),
+                area,
+            );
+        }
+        Overlay::Attachments => {
+            let area = centered(70, 50, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("Attachments — press 1-9 to save · Esc close");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let items: Vec<ListItem> = app
+                .outlook
+                .reading_attachments
+                .iter()
+                .take(9)
+                .enumerate()
+                .map(|(i, a)| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{} ", i + 1),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(a.display_name()),
+                        Span::styled(
+                            format!(
+                                "  {}  {}",
+                                a.human_size(),
+                                a.content_type.clone().unwrap_or_default()
+                            ),
+                            Style::default().fg(DIM),
+                        ),
+                    ]))
+                })
+                .collect();
+            f.render_widget(List::new(items), inner);
+            let hint = format!("saves to {}", crate::files::download_dir().display());
+            let hint_area = Rect {
+                y: inner.y + inner.height.saturating_sub(1),
+                height: 1,
+                ..inner
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
+                hint_area,
+            );
+        }
+        Overlay::Links => {
+            let links = app.focused_links();
+            let area = centered(80, 60, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("Links — press 1-9 to open · y copy first · Esc close");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let width = inner.width.saturating_sub(4).max(10) as usize;
+            let items: Vec<ListItem> = links
+                .iter()
+                .take(9)
+                .enumerate()
+                .map(|(i, url)| {
+                    // Wrap long URLs across lines so the whole target is visible.
+                    let mut lines = vec![Line::from(vec![
+                        Span::styled(
+                            format!("{} ", i + 1),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(host_of(url), Style::default().fg(Color::LightGreen)),
+                    ])];
+                    for chunk in chunks_of(url, width) {
+                        lines.push(Line::styled(format!("  {chunk}"), Style::default().fg(DIM)));
+                    }
+                    ListItem::new(lines)
+                })
+                .collect();
+            f.render_widget(List::new(items), inner);
+        }
+        Overlay::NtfySnooze { sel } => {
+            let area = centered(42, 50, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("ntfy snooze — F4");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min((NTFY_SNOOZE_HOURS.len() + 1) as u16),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+            let current = app
+                .ntfy_snooze_remaining()
+                .map(|remaining| format!("Current: {}", format_snooze_remaining(remaining)))
+                .unwrap_or_else(|| "Current: no snooze".to_string());
+            f.render_widget(
+                Paragraph::new(Span::styled(current, Style::default().fg(Color::Gray))),
+                rows[0],
+            );
+
+            let mut items: Vec<ListItem> = NTFY_SNOOZE_HOURS
+                .iter()
+                .map(|hours| {
+                    ListItem::new(format!(
+                        "{hours} hour{}",
+                        if *hours == 1 { "" } else { "s" }
+                    ))
+                })
+                .collect();
+            items.push(ListItem::new("Resume now"));
+            let mut state = ListState::default();
+            state.select(Some((*sel).min(NTFY_SNOOZE_HOURS.len())));
+            f.render_stateful_widget(
+                List::new(items)
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("▏"),
+                rows[1],
+                &mut state,
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "Enter set · c/0 resume now · Esc cancel",
+                    Style::default().fg(DIM),
+                )),
+                rows[2],
+            );
+        }
+        Overlay::OutOfOffice(view) => {
+            let area = centered(82, 74, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(view.text())
+                    .wrap(Wrap { trim: false })
+                    .block(popup_block("Out of office")),
+                area,
+            );
+        }
+        Overlay::ConfirmOutOfOfficeClear => {
+            let area = centered(62, 26, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(
+                    "Disable automatic Out of Office replies?\n\nPress y to clear. Any other key cancels.",
+                )
+                .wrap(Wrap { trim: false })
+                .block(popup_block("Clear Out of Office?")),
+                area,
+            );
+        }
+        Overlay::OutOfOfficeEdit(editor) => {
+            const FORM_HEIGHT: u16 = 17;
+
+            let area = centered(96, 94, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("Set Out of Office · PgUp/PgDn scroll");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            if inner.width == 0 || inner.height == 0 {
+                return;
+            }
+
+            let viewport_h = inner.height;
+            let max_scroll = FORM_HEIGHT.saturating_sub(viewport_h);
+            let mut scroll = editor.scroll.min(max_scroll);
+            let focus_y = editor.focus_row();
+
+            if focus_y < scroll {
+                scroll = focus_y;
+            } else if focus_y >= scroll.saturating_add(viewport_h) {
+                scroll = focus_y
+                    .saturating_add(1)
+                    .saturating_sub(viewport_h)
+                    .min(max_scroll);
+            }
+
+            let line_rect = |virtual_y: u16| -> Option<Rect> {
+                if virtual_y < scroll || virtual_y >= scroll.saturating_add(viewport_h) {
+                    None
+                } else {
+                    Some(Rect::new(
+                        inner.x,
+                        inner.y + virtual_y - scroll,
+                        inner.width,
+                        1,
+                    ))
+                }
+            };
+
+            let render_segment = |f: &mut Frame,
+                                  area: Rect,
+                                  input: &crate::editor::TextInput,
+                                  focused: bool,
+                                  digits: usize| {
+                let text = input.text();
+                let shown = format!(" {:width$} ", text, width = digits);
+                let style = if focused {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().bg(Color::DarkGray)
+                };
+                f.render_widget(Paragraph::new(shown).style(style), area);
+
+                if focused {
+                    let col = area
+                        .x
+                        .saturating_add(1)
+                        .saturating_add(input.cursor().min(digits) as u16)
+                        .min(area.x + area.width.saturating_sub(1));
+                    f.set_cursor_position((col, area.y));
+                }
+            };
+
+            if let Some(row) = line_rect(0) {
+                f.render_widget(
+                    Paragraph::new(format!("Time zone: {} · DST-aware", editor.local_zone))
+                        .style(Style::default().fg(DIM)),
+                    row,
+                );
+            }
+
+            if let Some(row) = line_rect(1) {
+                let zone_note = editor
+                    .mailbox_zone
+                    .as_deref()
+                    .filter(|zone| *zone != editor.local_zone)
+                    .map(|zone| format!("Mailbox zone: {zone}"))
+                    .unwrap_or_default();
+                f.render_widget(
+                    Paragraph::new(zone_note).style(Style::default().fg(DIM)),
+                    row,
+                );
+            }
+
+            let render_date = |f: &mut Frame,
+                               row: Rect,
+                               label: &str,
+                               year: &crate::editor::TextInput,
+                               month: &crate::editor::TextInput,
+                               day: &crate::editor::TextInput,
+                               field: usize,
+                               year_field: usize,
+                               month_field: usize,
+                               day_field: usize| {
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(12),
+                        Constraint::Length(6),
+                        Constraint::Length(1),
+                        Constraint::Length(4),
+                        Constraint::Length(1),
+                        Constraint::Length(4),
+                        Constraint::Min(0),
+                    ])
+                    .split(row);
+                f.render_widget(Paragraph::new(label), cols[0]);
+                render_segment(f, cols[1], year, field == year_field, 4);
+                f.render_widget(Paragraph::new("-"), cols[2]);
+                render_segment(f, cols[3], month, field == month_field, 2);
+                f.render_widget(Paragraph::new("-"), cols[4]);
+                render_segment(f, cols[5], day, field == day_field, 2);
+            };
+
+            let render_time = |f: &mut Frame,
+                               row: Rect,
+                               label: &str,
+                               hour: &crate::editor::TextInput,
+                               minute: &crate::editor::TextInput,
+                               detail: String,
+                               field: usize,
+                               hour_field: usize,
+                               minute_field: usize| {
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(12),
+                        Constraint::Length(4),
+                        Constraint::Length(1),
+                        Constraint::Length(4),
+                        Constraint::Length(2),
+                        Constraint::Min(0),
+                    ])
+                    .split(row);
+                f.render_widget(Paragraph::new(label), cols[0]);
+                render_segment(f, cols[1], hour, field == hour_field, 2);
+                f.render_widget(Paragraph::new(":"), cols[2]);
+                render_segment(f, cols[3], minute, field == minute_field, 2);
+                f.render_widget(Paragraph::new("  "), cols[4]);
+                f.render_widget(
+                    Paragraph::new(detail).style(Style::default().fg(DIM)),
+                    cols[5],
+                );
+            };
+
+            if let Some(row) = line_rect(2) {
+                render_date(
+                    f,
+                    row,
+                    "Start date:",
+                    &editor.start_year,
+                    &editor.start_month,
+                    &editor.start_day,
+                    editor.field,
+                    crate::out_of_office::START_YEAR,
+                    crate::out_of_office::START_MONTH,
+                    crate::out_of_office::START_DAY,
+                );
+            }
+
+            if let Some(row) = line_rect(3) {
+                render_time(
+                    f,
+                    row,
+                    "Start time:",
+                    &editor.start_hour,
+                    &editor.start_minute,
+                    editor.start_detail(),
+                    editor.field,
+                    crate::out_of_office::START_HOUR,
+                    crate::out_of_office::START_MINUTE,
+                );
+            }
+
+            if let Some(row) = line_rect(4) {
+                render_date(
+                    f,
+                    row,
+                    "End date:",
+                    &editor.end_year,
+                    &editor.end_month,
+                    &editor.end_day,
+                    editor.field,
+                    crate::out_of_office::END_YEAR,
+                    crate::out_of_office::END_MONTH,
+                    crate::out_of_office::END_DAY,
+                );
+            }
+
+            if let Some(row) = line_rect(5) {
+                render_time(
+                    f,
+                    row,
+                    "End time:",
+                    &editor.end_hour,
+                    &editor.end_minute,
+                    editor.end_detail(),
+                    editor.field,
+                    crate::out_of_office::END_HOUR,
+                    crate::out_of_office::END_MINUTE,
+                );
+            }
+
+            if let Some(row) = line_rect(6) {
+                let audience_style = if editor.is_audience_field() {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().bg(Color::DarkGray)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(" Audience: {} ", editor.audience.label()))
+                        .style(audience_style),
+                    row,
+                );
+            }
+
+            if let Some(row) = line_rect(7) {
+                let validation = editor
+                    .validation_error
+                    .as_deref()
+                    .map(|error| format!("Validation: {error}"))
+                    .unwrap_or_default();
+                f.render_widget(
+                    Paragraph::new(validation).style(Style::default().fg(Color::Red)),
+                    row,
+                );
+            }
+
+            if let Some(row) = line_rect(8) {
+                let mut schedule_note = String::new();
+                if editor.dst_transition() {
+                    schedule_note.push_str("DST transition occurs inside this interval. ");
+                }
+                if let Some(stored_zone) = editor.stored_zone.as_deref() {
+                    if stored_zone != "UTC" && stored_zone != editor.local_zone {
+                        schedule_note.push_str(&format!(
+                            "Existing schedule used {stored_zone}; saving uses the configured local zone."
+                        ));
+                    }
+                }
+                f.render_widget(
+                    Paragraph::new(schedule_note).style(Style::default().fg(Color::Yellow)),
+                    row,
+                );
+            }
+
+            if let Some(row) = line_rect(9) {
+                let label_style = if editor.is_message_field() {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "Message{}:",
+                        if app.session.config.teams_markdown {
+                            " · Markdown enabled"
+                        } else {
+                            " · plain text"
+                        }
+                    ))
+                    .style(label_style),
+                    row,
+                );
+            }
+
+            let message_start = 10u16;
+            let message_end = 15u16;
+            let visible_start = message_start.max(scroll);
+            let visible_end = message_end.min(scroll.saturating_add(viewport_h));
+            if visible_start < visible_end {
+                let message_area = Rect::new(
+                    inner.x,
+                    inner.y + visible_start - scroll,
+                    inner.width,
+                    visible_end - visible_start,
+                );
+
+                let message_bg = if editor.is_message_field() {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                f.render_widget(Block::default().style(message_bg), message_area);
+
+                if let Some((x, y)) =
+                    render_text_area(f, message_area, &editor.message, editor.is_message_field())
+                {
+                    f.set_cursor_position((x, y));
+                }
+            }
+
+            if let Some(row) = line_rect(15) {
+                let scroll_note = if max_scroll > 0 {
+                    format!("Scroll: {scroll}/{max_scroll} · PgUp/PgDn")
+                } else {
+                    "Tab validates/next · Shift+Tab previous · ←/→ changes Audience".to_string()
+                };
+                f.render_widget(
+                    Paragraph::new(scroll_note).style(Style::default().fg(DIM)),
+                    row,
+                );
+            }
+
+            if let Some(row) = line_rect(16) {
+                f.render_widget(
+                    Paragraph::new(
+                        "Enter save · Shift+Enter newline · Ctrl+J fallback · Esc cancel",
+                    )
+                    .style(Style::default().fg(DIM)),
+                    row,
+                );
+            }
+        }
+        Overlay::Presence => {
+            let area = centered(64, 82, f.area());
+            f.render_widget(Clear, area);
+            let mut body = String::new();
+            if let Some(a) = app
+                .my_presence
+                .as_ref()
+                .and_then(|p| p.availability.as_deref())
+            {
+                body.push_str(&format!("Current: {a}\n"));
+            }
+            let status_message = app
+                .my_presence
+                .as_ref()
+                .and_then(m365_core::models::Presence::status_message_text)
+                .map(|message| truncate(message, 48))
+                .unwrap_or_else(|| "(none)".to_string());
+            body.push_str(&format!("Status message: {status_message}\n\n"));
+            for (i, opt) in crate::app::PRESENCE_OPTIONS.iter().enumerate() {
+                let label = if i == 0 && app.session.config.presence_primary {
+                    "Available (automatic)"
+                } else {
+                    opt.label
+                };
+                body.push_str(&format!("{}  {}\n", i + 1, label));
+            }
+            body.push_str(
+                "\nm  Set/edit status message\nc  Clear status message\na  Automatic (clear manual presence)\nEsc cancel",
+            );
+            if !app.session.config.can_write_presence() {
+                body.push_str("\n\nread-only: set M365_PRESENCE_WRITE=1 and grant\nPresence.ReadWrite to enable changing status");
+            }
+            f.render_widget(
+                Paragraph::new(body)
+                    .wrap(Wrap { trim: false })
+                    .block(popup_block("Set presence")),
+                area,
+            );
+        }
+        Overlay::PresenceMessage(input) => {
+            let area = centered(72, 28, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("Set Teams status message");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ])
+                .split(inner);
+
+            f.render_widget(
+                Paragraph::new("Text shown as your Teams presence status message.\nNo expiry is set; use c in the presence menu to clear it."),
+                rows[0],
+            );
+
+            if let Some((x, y)) = render_line_field(f, rows[1], "> ", input, true) {
+                f.set_cursor_position((x, y));
+            }
+
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "Enter set · ←/→ move · Ctrl+←/→ word · Ctrl+W/U/K delete · Esc cancel",
+                    Style::default().fg(DIM),
+                )),
+                rows[2],
+            );
+        }
+        Overlay::ViewImage { .. } | Overlay::MailImages { .. } => {}
         Overlay::FolderSearch { query, sel } => {
             let area = centered(50, 60, f.area());
             f.render_widget(Clear, area);
@@ -1760,124 +2845,6 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
                 &mut state,
             );
         }
-        Overlay::Palette { query, sel } => {
-            let area = centered(50, 60, f.area());
-            f.render_widget(Clear, area);
-            let matches = filter_commands(query);
-            let block = popup_block("Command palette");
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(2), Constraint::Min(0)])
-                .split(inner);
-            f.render_widget(Paragraph::new(format!("> {query}▏")), rows[0]);
-            let items: Vec<ListItem> = matches
-                .iter()
-                .map(|(_, label)| ListItem::new(*label))
-                .collect();
-            let mut st = ListState::default();
-            st.select(Some(*sel));
-            f.render_stateful_widget(
-                List::new(items).highlight_style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                rows[1],
-                &mut st,
-            );
-        }
-        Overlay::Compose(c) => render_compose(f, c, app),
-        Overlay::React => {
-            let area = centered(50, 24, f.area());
-            f.render_widget(Clear, area);
-            let picks: String = crate::app::REACTIONS
-                .iter()
-                .enumerate()
-                .map(|(i, e)| format!("{}  {e}   ", i + 1))
-                .collect();
-            f.render_widget(
-                Paragraph::new(format!(
-                    "React to the selected message:\n\n{picks}\n\nPress 1-7 · Esc cancel"
-                ))
-                .wrap(Wrap { trim: false })
-                .block(popup_block("Add reaction")),
-                area,
-            );
-        }
-        Overlay::Attachments => {
-            let area = centered(70, 50, f.area());
-            f.render_widget(Clear, area);
-            let block = popup_block("Attachments — press 1-9 to save · Esc close");
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-            let items: Vec<ListItem> = app
-                .outlook
-                .reading_attachments
-                .iter()
-                .take(9)
-                .enumerate()
-                .map(|(i, a)| {
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("{} ", i + 1),
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(a.display_name()),
-                        Span::styled(
-                            format!(
-                                "  {}  {}",
-                                a.human_size(),
-                                a.content_type.clone().unwrap_or_default()
-                            ),
-                            Style::default().fg(DIM),
-                        ),
-                    ]))
-                })
-                .collect();
-            f.render_widget(List::new(items), inner);
-            let hint = format!("saves to {}", crate::files::download_dir().display());
-            let hint_area = Rect {
-                y: inner.y + inner.height.saturating_sub(1),
-                height: 1,
-                ..inner
-            };
-            f.render_widget(
-                Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
-                hint_area,
-            );
-        }
-        Overlay::Links => {
-            let links = app.focused_links();
-            let area = centered(80, 60, f.area());
-            f.render_widget(Clear, area);
-            let block = popup_block("Links — press 1-9 to open · y copy first · Esc close");
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-            let width = inner.width.saturating_sub(4).max(10) as usize;
-            let items: Vec<ListItem> = links
-                .iter()
-                .take(9)
-                .enumerate()
-                .map(|(i, url)| {
-                    // Wrap long URLs across lines so the whole target is visible.
-                    let mut lines = vec![Line::from(vec![
-                        Span::styled(
-                            format!("{} ", i + 1),
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(host_of(url), Style::default().fg(Color::LightGreen)),
-                    ])];
-                    for chunk in chunks_of(url, width) {
-                        lines.push(Line::styled(format!("  {chunk}"), Style::default().fg(DIM)));
-                    }
-                    ListItem::new(lines)
-                })
-                .collect();
-            f.render_widget(List::new(items), inner);
-        }
         Overlay::MoveMail { sel } => {
             let area = centered(50, 70, f.area());
             f.render_widget(Clear, area);
@@ -1900,32 +2867,6 @@ fn render_overlay(f: &mut Frame, app: &mut App) {
                     ),
                 area,
                 &mut st,
-            );
-        }
-        Overlay::Presence => {
-            let area = centered(46, 55, f.area());
-            f.render_widget(Clear, area);
-            let mut body = String::new();
-            if let Some(a) = app
-                .my_presence
-                .as_ref()
-                .and_then(|p| p.availability.as_deref())
-            {
-                body.push_str(&format!("Current: {a}\n\n"));
-            }
-            for (i, opt) in crate::app::PRESENCE_OPTIONS.iter().enumerate() {
-                body.push_str(&format!("{}  {}\n", i + 1, opt.label));
-            }
-            body.push_str("\nc  Clear (revert to automatic)\nEsc cancel");
-            body.push_str(
-                "\n\nThis app publishes its own presence session, so the status\nshows even with no Teams client running. Quitting clears it.",
-            );
-            if !app.session.config.can_write_presence() {
-                body.push_str("\n\nread-only: set M365_PRESENCE_WRITE=1 and grant\nPresence.ReadWrite to enable changing status");
-            }
-            f.render_widget(
-                Paragraph::new(body).block(popup_block("Set presence")),
-                area,
             );
         }
         Overlay::Settings { sel } => {
@@ -2267,13 +3208,20 @@ fn compact_presence_message(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    let looks_like_html = raw.contains('<');
+
+    let looks_like_html = raw.contains("<p")
+        || raw.contains("<br")
+        || raw.contains("</")
+        || raw.contains("<div")
+        || raw.contains("<span");
+
     let text = if looks_like_html {
         let rendered = crate::content::render_body(Some("html"), raw);
         crate::content::plain(&rendered.text)
     } else {
         raw.to_string()
     };
+
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -2281,6 +3229,7 @@ fn presence_out_of_office_message(presence: &m365_core::models::Presence) -> Opt
     if !presence_is_out_of_office(presence) {
         return None;
     }
+
     Some(
         presence
             .out_of_office_settings
@@ -2292,11 +3241,10 @@ fn presence_out_of_office_message(presence: &m365_core::models::Presence) -> Opt
 }
 
 fn visible_chat_out_of_office(app: &App) -> Option<String> {
-    let chat_id = app
-        .teams
-        .open_chat_id
-        .as_deref()
-        .or(app.teams.preview_chat_id.as_deref())?;
+    let chat_id = teams_ooo_chat_id(
+        app.teams.open_chat_id.as_deref(),
+        app.teams.preview_chat_id.as_deref(),
+    )?;
     let chat = app.teams.chats.iter().find(|chat| chat.id == chat_id)?;
     if !chat
         .chat_type
@@ -2305,7 +3253,16 @@ fn visible_chat_out_of_office(app: &App) -> Option<String> {
     {
         return None;
     }
-    presence_out_of_office_message(app.teams_peer_presence(chat)?)
+
+    let me_id = app.me.as_ref().map(|me| me.id.as_str());
+    let user_id = app
+        .teams
+        .contact_user_ids
+        .get(chat_id)
+        .map(String::as_str)
+        .or_else(|| chat.peer_user_id(me_id))?;
+    let presence = app.teams.contact_presences.get(user_id)?;
+    presence_out_of_office_message(presence)
 }
 
 fn contact_presence_marker(
@@ -2313,13 +3270,14 @@ fn contact_presence_marker(
 ) -> (&'static str, Color) {
     let out_of_office = presence.is_some_and(presence_is_out_of_office);
     let availability = presence
-        .and_then(|presence| presence.availability.as_deref())
+        .and_then(|p| p.availability.as_deref())
         .unwrap_or("")
         .to_ascii_lowercase();
     let activity = presence
-        .and_then(|presence| presence.activity.as_deref())
+        .and_then(|p| p.activity.as_deref())
         .unwrap_or("")
         .to_ascii_lowercase();
+
     if out_of_office {
         ("◒", Color::LightMagenta)
     } else if activity == "presenting" || availability == "donotdisturb" {
@@ -2467,8 +3425,451 @@ fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
         .split(v[1])[1]
 }
 
+fn contact_profile_field(
+    lines: &mut Vec<Line<'static>>,
+    label: &'static str,
+    value: Option<String>,
+) {
+    let Some(value) = value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(format!("{label:<12}"), Style::default().fg(Color::Gray)),
+        Span::raw(value),
+    ]));
+}
+
+fn format_snooze_remaining(remaining: std::time::Duration) -> String {
+    let minutes = remaining.as_secs().saturating_add(59) / 60;
+    if minutes >= 60 {
+        format!("N:{}h{:02}", minutes / 60, minutes % 60)
+    } else {
+        format!("N:{}m", minutes.max(1))
+    }
+}
+
+fn calendar_day_label(event: &m365_core::models::Event) -> String {
+    event
+        .start
+        .as_ref()
+        .and_then(calendar_local_datetime)
+        .map(|value| value.format("%d.%m.").to_string())
+        .unwrap_or_else(|| "--.--.".into())
+}
+
+fn ntfy_indicator(app: &App) -> (String, Color) {
+    let (label, colour) = if !app.session.config.ntfy.enabled() {
+        (String::new(), DIM)
+    } else if let Some(remaining) = app.ntfy_snooze_remaining() {
+        (format_snooze_remaining(remaining), Color::Red)
+    } else {
+        ("NTFY ON".to_string(), Color::White)
+    };
+
+    // Fixed 7-column slot: "NTFY ON" and the longest snooze form "N:24h00"
+    // both fit exactly, so neighbouring status fields never jump.
+    (format!("{label:<7}"), colour)
+}
+
+fn contact_profile_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(profile) = app.contact_profile.as_ref() else {
+        return vec![Line::raw("No contact selected.")];
+    };
+
+    let presence = profile
+        .user_id
+        .as_deref()
+        .and_then(|id| app.teams.contact_presences.get(id));
+    let (symbol, color) = contact_presence_marker(presence);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{symbol} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                profile.display_name.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+    ];
+
+    if let Some(presence) = presence {
+        let status = match (
+            presence.availability.as_deref(),
+            presence.activity.as_deref(),
+        ) {
+            (Some(availability), Some(activity))
+                if !availability.eq_ignore_ascii_case(activity) =>
+            {
+                Some(format!("{availability} · {activity}"))
+            }
+            (Some(availability), _) => Some(availability.to_string()),
+            (_, Some(activity)) => Some(activity.to_string()),
+            _ => None,
+        };
+        contact_profile_field(&mut lines, "Status:", status);
+        if let Some(message) = presence_out_of_office_message(presence) {
+            contact_profile_field(
+                &mut lines,
+                "Out of office:",
+                Some(if message.is_empty() {
+                    "active".to_string()
+                } else {
+                    message
+                }),
+            );
+        }
+    }
+
+    if let Some(person) = profile.person.as_ref() {
+        contact_profile_field(&mut lines, "Position:", person.job_title.clone());
+        contact_profile_field(&mut lines, "Department:", person.department.clone());
+        contact_profile_field(&mut lines, "Company:", person.company_name.clone());
+        contact_profile_field(&mut lines, "Office:", person.office_location.clone());
+
+        let email = person
+            .scored_email_addresses
+            .iter()
+            .find_map(|address| address.address.clone())
+            .or_else(|| person.user_principal_name.clone())
+            .or_else(|| profile.fallback_email.clone());
+        contact_profile_field(&mut lines, "E-mail:", email);
+
+        let phones = person
+            .phones
+            .iter()
+            .filter_map(|phone| {
+                let number = phone.number.as_deref()?.trim();
+                if number.is_empty() {
+                    return None;
+                }
+                Some(match phone.phone_type.as_deref() {
+                    Some(kind) if !kind.trim().is_empty() => {
+                        format!("{number} ({kind})")
+                    }
+                    _ => number.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        for (index, phone) in phones.into_iter().enumerate() {
+            contact_profile_field(
+                &mut lines,
+                if index == 0 { "Phone:" } else { "" },
+                Some(phone),
+            );
+        }
+
+        contact_profile_field(&mut lines, "IM:", person.im_address.clone());
+    } else {
+        contact_profile_field(&mut lines, "E-mail:", profile.fallback_email.clone());
+    }
+
+    contact_profile_field(&mut lines, "Account:", Some(profile.account.clone()));
+
+    if profile.loading {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Loading profile…", Style::default().fg(DIM)));
+    }
+
+    lines
+}
+
+fn calendar_has_join_url(event: &m365_core::models::Event) -> bool {
+    event
+        .online_meeting
+        .as_ref()
+        .and_then(|meeting| meeting.join_url.as_deref())
+        .is_some_and(|url| !url.trim().is_empty())
+}
+
+fn calendar_response_marker(event: &m365_core::models::Event) -> (&'static str, Color) {
+    if event.is_cancelled.unwrap_or(false) {
+        return ("!", Color::Red);
+    }
+    if event.is_organizer.unwrap_or(false) {
+        return ("O", ACCENT);
+    }
+
+    let response = event
+        .response_status
+        .as_ref()
+        .and_then(|status| status.response.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match response.as_str() {
+        "accepted" => ("A", Color::Green),
+        "tentativelyaccepted" => ("T", Color::Yellow),
+        "declined" => ("D", Color::Red),
+        "notresponded" | "none" => ("?", Color::Yellow),
+        "organizer" => ("O", ACCENT),
+        _ => (" ", DIM),
+    }
+}
+
+fn poll_indicator(elapsed: std::time::Duration) -> (String, Color) {
+    let seconds = elapsed.as_secs();
+
+    if seconds >= POLL_STALE_SECONDS {
+        return (bar_with_label("STALE"), Color::Red);
+    }
+
+    if seconds > POLL_SECONDS {
+        let late = seconds - POLL_SECONDS;
+        let label = if late < 60 {
+            format!("+{late}s")
+        } else {
+            format!("+{}m", late / 60)
+        };
+        return (bar_with_label(&label), Color::Yellow);
+    }
+
+    let filled = ((seconds.saturating_mul(10) / POLL_SECONDS) as usize).min(10);
+    (
+        format!("[{}{}]", "█".repeat(filled), "░".repeat(10 - filled)),
+        DIM,
+    )
+}
+
+fn calendar_plain_line(event: &m365_core::models::Event, show_day: bool) -> String {
+    let day = if show_day {
+        calendar_day_label(event)
+    } else {
+        "      ".into()
+    };
+    let time = calendar_time_label(event);
+    let marker = calendar_response_marker(event).0;
+    let meeting = if calendar_has_join_url(event) {
+        "M"
+    } else {
+        " "
+    };
+    let subject = event.subject.as_deref().unwrap_or("(no subject)");
+    format!("{day}  {time:<11}  [{marker}] [{meeting}] {subject}")
+}
+
+fn calendar_time_label(event: &m365_core::models::Event) -> String {
+    if event.is_all_day.unwrap_or(false) {
+        return "all day    ".to_string();
+    }
+
+    let start = event
+        .start
+        .as_ref()
+        .and_then(calendar_local_datetime)
+        .map(|value| value.format("%H:%M").to_string())
+        .unwrap_or_else(|| "--:--".into());
+    let end = event
+        .end
+        .as_ref()
+        .and_then(calendar_local_datetime)
+        .map(|value| value.format("%H:%M").to_string())
+        .unwrap_or_else(|| "--:--".into());
+    format!("{start}-{end}")
+}
+
+fn calendar_local_datetime(
+    value: &m365_core::models::DateTimeTimeZone,
+) -> Option<chrono::DateTime<chrono::Local>> {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&value.date_time) {
+        return Some(parsed.with_timezone(&chrono::Local));
+    }
+
+    let naive = chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S"))
+        .ok()?;
+
+    Some(
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+            .with_timezone(&chrono::Local),
+    )
+}
+
+fn bar_with_label(label: &str) -> String {
+    const INNER: usize = 10;
+    let label_len = label.chars().count().min(INNER);
+    let remaining = INNER.saturating_sub(label_len);
+    let left = remaining / 2;
+    let right = remaining - left;
+    format!("[{}{}{}]", "█".repeat(left), label, "█".repeat(right))
+}
+
+fn teams_ooo_chat_id<'a>(
+    open_chat_id: Option<&'a str>,
+    preview_chat_id: Option<&'a str>,
+) -> Option<&'a str> {
+    open_chat_id.or(preview_chat_id)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    #[test]
+    fn contact_presence_marker_matches_teams_status_colors() {
+        use m365_core::models::Presence;
+
+        fn presence(availability: &str, activity: &str) -> Presence {
+            Presence {
+                id: None,
+                availability: Some(availability.to_string()),
+                activity: Some(activity.to_string()),
+                out_of_office_settings: None,
+                status_message: None,
+            }
+        }
+
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Available", "Available"))),
+            ("●", Color::LightGreen)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Busy", "Busy"))),
+            ("●", Color::Red)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Busy", "InAMeeting"))),
+            ("●", Color::Red)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Busy", "InACall"))),
+            ("●", Color::Red)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("DoNotDisturb", "DoNotDisturb"))),
+            ("×", Color::Red)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Away", "Away"))),
+            ("◐", Color::Yellow)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("BeRightBack", "BeRightBack"))),
+            ("◐", Color::Yellow)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Offline", "Offline"))),
+            ("○", Color::DarkGray)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("OutOfOffice", "OutOfOffice"))),
+            ("◒", Color::LightMagenta)
+        );
+    }
+    #[test]
+    fn out_of_office_message_comes_from_presence_settings() {
+        let active: m365_core::models::Presence = serde_json::from_value(serde_json::json!({
+            "availability": "Available",
+            "activity": "OutOfOffice",
+            "outOfOfficeSettings": {
+                "isOutOfOffice": true,
+                "message": "<p>Back on Monday</p>"
+            }
+        }))
+        .unwrap();
+        let inactive: m365_core::models::Presence = serde_json::from_value(serde_json::json!({
+            "availability": "Available",
+            "activity": "Available",
+            "outOfOfficeSettings": {
+                "isOutOfOffice": false,
+                "message": "This must stay hidden"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            presence_out_of_office_message(&active).as_deref(),
+            Some("Back on Monday")
+        );
+        assert_eq!(presence_out_of_office_message(&inactive), None);
+    }
+    #[test]
+    fn poll_indicator_keeps_normal_bar_then_reports_late_and_stale() {
+        assert_eq!(
+            poll_indicator(std::time::Duration::from_secs(18)).0,
+            "[█████████░]"
+        );
+        assert_eq!(
+            poll_indicator(std::time::Duration::from_secs(22)).0,
+            "[███+2s████]"
+        );
+        assert_eq!(
+            poll_indicator(std::time::Duration::from_secs(120)).0,
+            "[██STALE███]"
+        );
+    }
+    #[test]
+    fn snooze_status_is_compact() {
+        assert_eq!(
+            format_snooze_remaining(std::time::Duration::from_secs(47 * 60)),
+            "N:47m"
+        );
+        assert_eq!(
+            format_snooze_remaining(std::time::Duration::from_secs(97 * 60)),
+            "N:1h37"
+        );
+    }
+    #[test]
+    fn teams_ooo_banner_follows_preview_selection() {
+        use super::teams_ooo_chat_id;
+
+        assert_eq!(teams_ooo_chat_id(None, Some("preview")), Some("preview"));
+        assert_eq!(
+            teams_ooo_chat_id(Some("open"), Some("preview")),
+            Some("open")
+        );
+        assert_eq!(teams_ooo_chat_id(Some("open"), None), Some("open"));
+        assert_eq!(teams_ooo_chat_id(None, None), None);
+    }
+
+    #[test]
+    fn integrated_screens_and_overlays_render_without_a_live_account() {
+        use crate::app::{Overlay, Screen};
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = crate::app::test_app();
+        for (width, height) in [(40, 12), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for screen in [Screen::Outlook, Screen::Teams, Screen::Calendar] {
+                app.screen = screen;
+                terminal
+                    .draw(|frame| super::render(frame, &mut app))
+                    .unwrap();
+            }
+            for overlay in [
+                Overlay::Help,
+                Overlay::TeamsCommands,
+                Overlay::Calendar,
+                Overlay::CalendarEvent,
+                Overlay::ContactProfile,
+                Overlay::Diagnostics,
+                Overlay::ContactDiagnostics,
+                Overlay::React { row: 0, col: 0 },
+                Overlay::NtfySnooze { sel: 0 },
+                Overlay::Settings { sel: 0 },
+                Overlay::ViewImage {
+                    keys: Vec::new(),
+                    sel: 0,
+                },
+                Overlay::MailImages {
+                    scroll: 0,
+                    fullscreen: None,
+                },
+            ] {
+                app.overlay = Some(overlay);
+                terminal
+                    .draw(|frame| super::render(frame, &mut app))
+                    .unwrap();
+            }
+            app.overlay = None;
+        }
+    }
+
     use super::{day_label, local_time};
 
     #[test]

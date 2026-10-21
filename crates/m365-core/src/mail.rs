@@ -40,6 +40,15 @@ pub async fn list_folders(graph: &GraphClient) -> Result<Vec<MailFolder>> {
     Ok(folders)
 }
 
+/// Return the direct child folders of `folder_id`.
+///
+/// Microsoft Graph exposes child folders as a separate collection. The TUI
+/// recursively walks this endpoint and flattens the result for its folder pane.
+pub async fn list_child_folders(graph: &GraphClient, folder_id: &str) -> Result<Vec<MailFolder>> {
+    let url = format!("me/mailFolders/{folder_id}/childFolders?$top=100&$select=id,displayName,unreadItemCount,childFolderCount,totalItemCount");
+    graph.get_collection(&url).await
+}
+
 /// List the first page of messages in a folder, newest first. Returns the page
 /// and the `@odata.nextLink` for "load more" (if the folder has more).
 pub async fn list_messages(

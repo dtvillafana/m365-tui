@@ -12,6 +12,7 @@
 //! configured. Anything else would greet a first-time user with a device-code
 //! prompt for asking what the flags are.
 
+mod activity;
 mod app;
 mod calendar_ui;
 mod clipboard;
@@ -23,9 +24,10 @@ mod images;
 mod navigation;
 mod notify;
 mod opener;
+pub mod out_of_office;
+mod presence_state;
 mod settings;
 mod teams_cache;
-mod teams_chat;
 mod termimg;
 mod ui;
 mod wrap;
@@ -34,9 +36,14 @@ use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use app::{format_compose_file, parse_compose_file, App, AppMessage, PushState};
+use app::{
+    format_compose_file, parse_compose_file, App, AppMessage, PushState, HOT_POLL_TICK_SECONDS,
+    POLL_SECONDS,
+};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -44,13 +51,10 @@ use crossterm::terminal::{
 };
 use futures_util::StreamExt;
 use m365_core::events::ChangeEvent;
-use m365_core::{subscriptions, DeviceCodePrompt, Session};
+use m365_core::{subscriptions, teams_presence, DeviceCodePrompt, Session};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
-
-/// How often to poll the server to refresh the current view.
-const POLL_SECONDS: u64 = 20;
 
 /// Lightweight local tick: refreshes memory usage and ages out status text.
 /// Costs nothing on the network.
@@ -67,6 +71,7 @@ enum Command {
         to: Vec<String>,
         comment: String,
     },
+    TeamsConsentProbe,
 }
 
 const USAGE: &str = "\
@@ -77,16 +82,17 @@ USAGE:
 
 COMMANDS:
     (none)      launch the TUI
-    login       sign in and cache the token, then exit
-    whoami      print the signed-in account, then exit
-    forward     forward a message: m365 forward --to ADDR[,ADDR...] [--comment TEXT] (--id ID | --query TEXT | ID)
+    login                sign in and cache the Graph token, then exit
+    whoami               print the signed-in account, then exit
+    forward              forward an Outlook message, then exit
+    teams-consent-probe   one-off Teams/Skype resource consent diagnostic
 
 OPTIONS:
     -h, --help     print this help
     -V, --version  print the version
 
 Configuration is read from the environment or a .env file; M365_CLIENT_ID is
-the only required value. See https://github.com/rootHytx/m365-tui for setup.";
+the only required value. See https://github.com/Pitriss/m365-tui for setup.";
 
 const FORWARD_USAGE: &str = "\
 m365 forward — send an existing Outlook message to new recipients
@@ -121,6 +127,7 @@ where
                 std::process::exit(2);
             }
         },
+        Some("teams-consent-probe") => Command::TeamsConsentProbe,
         Some("-h") | Some("--help") | Some("help") => {
             println!("{USAGE}");
             std::process::exit(0);
@@ -236,6 +243,25 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
+    let compatibility_warning = session.config.compatibility_warning();
+
+    // The Teams resource-consent diagnostic is intentionally isolated from
+    // the normal Graph login/cache. It never writes the primary token cache and
+    // requests no refresh token of its own.
+    if matches!(&command, Command::TeamsConsentProbe) {
+        let result =
+            teams_presence::consent_probe(&session.auth, |p| print_teams_consent_prompt(&p)).await;
+        print_diagnostic_step("Interactive consent", &result.interactive_consent);
+        print_diagnostic_step(
+            "Existing Graph refresh token",
+            &result.existing_refresh_token,
+        );
+        println!("Primary Graph token cache: untouched");
+        if let Some(warning) = compatibility_warning.as_deref() {
+            eprintln!("\n{warning}");
+        }
+        return Ok(());
+    }
 
     // Device-code login up front (prints the code to stdout, before the TUI).
     session
@@ -243,7 +269,7 @@ async fn main() -> Result<()> {
         .await
         .context("sign-in failed")?;
 
-    match command {
+    let result = match command {
         Command::WhoAmI => {
             let me = session.whoami().await?;
             println!(
@@ -263,8 +289,17 @@ async fn main() -> Result<()> {
             to,
             comment,
         } => run_forward(&session, id, query, to, comment).await,
+        Command::TeamsConsentProbe => unreachable!("handled before primary Graph login"),
         Command::Tui => run_tui(session).await,
+    };
+
+    // Never print deprecated-configuration compatibility warnings while the alternate
+    // screen is active. For TUI mode run_tui() has already restored the terminal.
+    if let Some(warning) = compatibility_warning.as_deref() {
+        eprintln!("\n{warning}");
     }
+
+    result
 }
 
 async fn run_forward(
@@ -316,6 +351,27 @@ fn print_device_prompt(p: &DeviceCodePrompt) {
     println!(" (waiting for you to finish in the browser…)\n");
 }
 
+fn print_teams_consent_prompt(p: &DeviceCodePrompt) {
+    println!("\n──────────────────────────────────────────────");
+    println!(" Teams/Skype resource consent diagnostic");
+    println!(" 1. Open: {}", p.verification_uri);
+    println!(" 2. Enter code: {}", p.user_code);
+    println!("──────────────────────────────────────────────");
+    println!(" This one-off flow does NOT modify the local Graph token cache.");
+    println!(" The issued resource token is discarded after consent.");
+    println!(" (waiting for you to finish in the browser…)\n");
+}
+
+fn print_diagnostic_step(label: &str, step: &teams_presence::DiagnosticStep) {
+    match step {
+        teams_presence::DiagnosticStep::Ok(detail) => println!("{label}: OK — {detail}"),
+        teams_presence::DiagnosticStep::Skipped(detail) => {
+            println!("{label}: skipped — {detail}")
+        }
+        teams_presence::DiagnosticStep::Error(detail) => println!("{label}: ERROR — {detail}"),
+    }
+}
+
 async fn run_tui(session: Session) -> Result<()> {
     // Channels: background task results, and Graph change events.
     let (tx, mut app_rx) = mpsc::channel::<AppMessage>(256);
@@ -348,25 +404,6 @@ async fn run_tui(session: Session) -> Result<()> {
         });
     }
 
-    // Accelerated Teams polling has its own one-second local scheduler. The
-    // event itself performs no I/O; App decides which chats are due and all
-    // resulting GETs pass through the shared conservative Teams limiter.
-    {
-        let hot_poll_tx = tx.clone();
-        tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(Duration::from_secs(teams_chat::HOT_POLL_TICK_SECONDS));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                if hot_poll_tx.send(AppMessage::HotPollTick).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
     {
         let tick_tx = tx.clone();
         tokio::spawn(async move {
@@ -375,6 +412,24 @@ async fn run_tui(session: Session) -> Result<()> {
             loop {
                 ticker.tick().await;
                 if tick_tx.send(AppMessage::Tick).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Accelerated Teams polling has its own one-second local scheduler. The
+    // event itself performs no I/O; App decides which chats are due and all
+    // resulting GETs pass through the shared conservative Teams limiter.
+    {
+        let hot_poll_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(HOT_POLL_TICK_SECONDS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if hot_poll_tx.send(AppMessage::HotPollTick).await.is_err() {
                     break;
                 }
             }
@@ -390,14 +445,37 @@ async fn run_tui(session: Session) -> Result<()> {
     app.set_graphics(crate::termimg::Graphics::detect());
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
+
+    // Kitty keyboard progressive enhancement makes modified Enter distinct
+    // from plain Enter. Query before EventStream starts, otherwise the query
+    // response could race with the async event reader.
+    let keyboard_enhancement =
+        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhancement {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        )?;
+    }
+
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let res = event_loop(&mut terminal, &mut app, &mut app_rx, &mut change_rx).await;
 
-    // Terminal teardown (best-effort even on error).
+    // Terminal teardown (best-effort even on error). Keyboard enhancement
+    // was pushed on the alternate-screen stack, so pop it before leaving that
+    // screen.
+    if keyboard_enhancement {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).ok();
+    }
     disable_raw_mode().ok();
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )
@@ -406,7 +484,7 @@ async fn run_tui(session: Session) -> Result<()> {
 
     // Drop our presence session on the way out, otherwise the user would keep
     // showing the status we published for up to the session lease.
-    if app.presence_session.is_some() {
+    if app.presence_session_active_on_exit() {
         let client_id = app.session.config.client_id.clone();
         if let Err(e) =
             m365_core::people::clear_session_presence(&app.session.graph, &client_id).await
@@ -427,7 +505,17 @@ async fn event_loop(
     loop {
         {
             let mut reader = EventStream::new();
+            let mut mouse_capture = false;
             loop {
+                let capture = app.wants_mouse_capture();
+                if capture != mouse_capture {
+                    if capture {
+                        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                    } else {
+                        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+                    }
+                    mouse_capture = capture;
+                }
                 terminal.draw(|f| ui::render(f, app))?;
 
                 tokio::select! {
@@ -435,6 +523,7 @@ async fn event_loop(
                         match maybe_event {
                             Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => app.on_key(k),
                             Some(Ok(Event::Paste(text))) => app.on_paste(text),
+                            Some(Ok(Event::Mouse(event))) => app.on_mouse(event),
                             Some(Ok(_)) => {}
                             Some(Err(e)) => return Err(e.into()),
                             None => return Ok(()),
@@ -472,6 +561,7 @@ fn edit_compose_in_editor(
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;

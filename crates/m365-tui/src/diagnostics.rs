@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Local, Utc};
 use m365_core::auth::TokenInfo;
+use m365_core::config::NtfyMode;
+use m365_core::models::{Chat, ChatMessage, ConversationMember};
 use m365_core::work_plan::WorkPlanDiagnostics;
 
 use crate::app::{App, PushState};
@@ -34,12 +36,50 @@ pub enum PresenceProbe {
 }
 
 #[derive(Debug, Clone)]
+pub struct ContactChatNameProbe {
+    pub member_count: usize,
+    pub peer_member_found: bool,
+    pub member_display_name: bool,
+    pub member_email: bool,
+    pub member_user_id_shape: String,
+    pub preview_present: bool,
+    pub preview_sender_present: bool,
+    pub preview_sender_is_peer: bool,
+    pub preview_display_name: bool,
+    pub preview_sender_id_shape: String,
+    pub preview_sender_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContactMembersNameProbe {
+    pub member_count: usize,
+    pub peer_member_found: bool,
+    pub member_display_name: bool,
+    pub member_email: bool,
+    pub member_user_id_shape: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContactMessagesNameProbe {
+    pub messages_scanned: usize,
+    pub peer_messages: usize,
+    pub peer_messages_with_display_name: usize,
+    pub peer_message_found: bool,
+    pub sender_display_name: bool,
+    pub sender_id_shape: String,
+    pub sender_type: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ContactDiagnosticsRemote {
     pub generated_at: DateTime<Utc>,
     pub presence_read_all: Result<bool, String>,
     pub batch: PresenceProbe,
     pub direct: PresenceProbe,
     pub teams: m365_core::teams_presence::Diagnostics,
+    pub expanded_name: Result<ContactChatNameProbe, String>,
+    pub members_name: Result<ContactMembersNameProbe, String>,
+    pub messages_name: Result<ContactMessagesNameProbe, String>,
 }
 
 #[derive(Debug, Default)]
@@ -60,31 +100,162 @@ pub struct ContactDiagnosticsState {
     pub tenant_relation: String,
     pub cross_tenant_candidate: bool,
     pub presence_supported: bool,
+    pub current_member_count: usize,
+    pub topic_available: bool,
+    pub member_display_name_available: bool,
+    pub member_email_available: bool,
+    pub preview_present: bool,
+    pub preview_sender_available: bool,
+    pub preview_sender_is_peer: bool,
+    pub preview_display_name_available: bool,
+    pub cached_name_available: bool,
+    pub chat_label_source: String,
+    pub list_label_source: String,
+    /// Raw one-to-one peer ID explicitly exposed by F7 for automation setup.
+    pub automation_peer_id: Option<String>,
+    pub automation_peer_configured: bool,
+    pub automation_config_source: String,
     pub remote: Option<ContactDiagnosticsRemote>,
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn peer_member<'a>(
+    members: &'a [ConversationMember],
+    me_id: Option<&str>,
+) -> Option<&'a ConversationMember> {
+    members.iter().find(|member| {
+        me_id
+            .map(|id| member.user_id.as_deref() != Some(id))
+            .unwrap_or(true)
+    })
+}
+
+fn safe_identity_type(value: Option<&str>) -> String {
+    let Some(value) = nonempty(value) else {
+        return "missing".into();
+    };
+    if value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        value.to_string()
+    } else {
+        "other".into()
+    }
+}
+
+pub fn contact_chat_name_probe(chat: &Chat, me_id: Option<&str>) -> ContactChatNameProbe {
+    let peer = peer_member(&chat.members, me_id);
+    let preview_user = chat
+        .last_message_preview
+        .as_ref()
+        .and_then(|preview| preview.from.as_ref())
+        .and_then(|from| from.user.as_ref());
+    let preview_sender_is_peer = preview_user.is_some_and(|user| {
+        me_id
+            .map(|id| user.id.as_deref() != Some(id))
+            .unwrap_or(true)
+    });
+
+    ContactChatNameProbe {
+        member_count: chat.members.len(),
+        peer_member_found: peer.is_some(),
+        member_display_name: peer
+            .and_then(|member| nonempty(member.display_name.as_deref()))
+            .is_some(),
+        member_email: peer
+            .and_then(|member| nonempty(member.email.as_deref()))
+            .is_some(),
+        member_user_id_shape: identifier_shape(peer.and_then(|member| member.user_id.as_deref()))
+            .to_string(),
+        preview_present: chat.last_message_preview.is_some(),
+        preview_sender_present: preview_user.is_some(),
+        preview_sender_is_peer,
+        preview_display_name: preview_sender_is_peer
+            && preview_user
+                .and_then(|user| nonempty(user.display_name.as_deref()))
+                .is_some(),
+        preview_sender_id_shape: identifier_shape(preview_user.and_then(|user| user.id.as_deref()))
+            .to_string(),
+        preview_sender_type: safe_identity_type(
+            preview_user.and_then(|user| user.user_identity_type.as_deref()),
+        ),
+    }
+}
+
+pub fn contact_members_name_probe(
+    members: &[ConversationMember],
+    me_id: Option<&str>,
+) -> ContactMembersNameProbe {
+    let peer = peer_member(members, me_id);
+    ContactMembersNameProbe {
+        member_count: members.len(),
+        peer_member_found: peer.is_some(),
+        member_display_name: peer
+            .and_then(|member| nonempty(member.display_name.as_deref()))
+            .is_some(),
+        member_email: peer
+            .and_then(|member| nonempty(member.email.as_deref()))
+            .is_some(),
+        member_user_id_shape: identifier_shape(peer.and_then(|member| member.user_id.as_deref()))
+            .to_string(),
+    }
+}
+
+pub fn contact_messages_name_probe(
+    messages: &[ChatMessage],
+    me_id: Option<&str>,
+) -> ContactMessagesNameProbe {
+    let peers: Vec<_> = messages
+        .iter()
+        .filter_map(|message| message.from.as_ref()?.user.as_ref())
+        .filter(|user| {
+            me_id
+                .map(|id| user.id.as_deref() != Some(id))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    let named_peer = peers
+        .iter()
+        .copied()
+        .find(|user| nonempty(user.display_name.as_deref()).is_some());
+    let representative_peer = named_peer.or_else(|| peers.first().copied());
+    let peer_messages_with_display_name = peers
+        .iter()
+        .filter(|user| nonempty(user.display_name.as_deref()).is_some())
+        .count();
+
+    ContactMessagesNameProbe {
+        messages_scanned: messages.len(),
+        peer_messages: peers.len(),
+        peer_messages_with_display_name,
+        peer_message_found: !peers.is_empty(),
+        sender_display_name: named_peer.is_some(),
+        sender_id_shape: identifier_shape(representative_peer.and_then(|user| user.id.as_deref()))
+            .to_string(),
+        sender_type: safe_identity_type(
+            representative_peer.and_then(|user| user.user_identity_type.as_deref()),
+        ),
+    }
 }
 
 fn row(label: &str, value: impl AsRef<str>) -> String {
     format!("  {label:<30} {}", value.as_ref())
 }
 
-fn local_timezone_name() -> String {
-    if let Ok(value) = std::env::var("TZ") {
-        let value = value.trim();
-        if !value.is_empty() {
-            return value.to_string();
-        }
+fn ntfy_mode(mode: NtfyMode) -> &'static str {
+    match mode {
+        NtfyMode::Never => "never",
+        NtfyMode::Always => "always",
+        NtfyMode::Away => "away",
+        NtfyMode::AlwaysWd => "alwayswd",
+        NtfyMode::AwayWd => "awaywd",
     }
-
-    if let Ok(target) = std::fs::read_link("/etc/localtime") {
-        let value = target.to_string_lossy();
-        if let Some((_, zone)) = value.split_once("/zoneinfo/") {
-            if !zone.trim().is_empty() {
-                return zone.to_string();
-            }
-        }
-    }
-
-    chrono::Local::now().offset().to_string()
 }
 
 fn yes_no(value: bool, yes: &str, no: &str) -> String {
@@ -109,10 +280,10 @@ fn compact_error(value: &str) -> String {
 fn permission_lines(app: &App, token: Option<&TokenInfo>) -> Vec<String> {
     const SCOPES: &[&str] = &[
         "User.Read",
-        "ProfilePhoto.Read.All",
         "People.Read",
         "Mail.ReadWrite",
         "Mail.Send",
+        "MailboxSettings.ReadWrite",
         "Calendars.ReadWrite",
         "Chat.ReadWrite",
         "ChannelMessage.Send",
@@ -373,6 +544,34 @@ pub fn contact_text(app: &App) -> String {
     ));
     out.push(String::new());
 
+    out.push(String::new());
+
+    out.push("Automation".into());
+    out.push(row(
+        "Peer ID",
+        state
+            .automation_peer_id
+            .as_deref()
+            .unwrap_or("○ unavailable"),
+    ));
+    out.push(row(
+        "Automation peer",
+        if state.automation_peer_configured {
+            "● configured"
+        } else {
+            "○ not configured"
+        },
+    ));
+    out.push(row("Config variable", "M365_TEAMS_AUTOMATION_PEERS"));
+    out.push(row(
+        "Config source",
+        if state.automation_config_source.is_empty() {
+            "unknown"
+        } else {
+            &state.automation_config_source
+        },
+    ));
+
     out.push("Identity sources".into());
     out.push(row("Member resource ID", &state.member_id_shape));
     out.push(row("Member userId", &state.member_user_id_shape));
@@ -402,6 +601,193 @@ pub fn contact_text(app: &App) -> String {
             "○ unavailable"
         },
     ));
+    out.push(String::new());
+
+    out.push("Name resolution".into());
+    out.push(row(
+        "Current roster members",
+        state.current_member_count.to_string(),
+    ));
+    out.push(row(
+        "Current topic",
+        yes_no(state.topic_available, "available", "unavailable"),
+    ));
+    out.push(row(
+        "Current member displayName",
+        yes_no(
+            state.member_display_name_available,
+            "available",
+            "unavailable",
+        ),
+    ));
+    out.push(row(
+        "Current member email",
+        yes_no(state.member_email_available, "available", "unavailable"),
+    ));
+    out.push(row(
+        "Current preview",
+        yes_no(state.preview_present, "present", "missing"),
+    ));
+    out.push(row(
+        "Current preview sender",
+        yes_no(state.preview_sender_available, "present", "missing"),
+    ));
+    out.push(row(
+        "Preview sender is peer",
+        yes_no(state.preview_sender_is_peer, "yes", "no / unknown"),
+    ));
+    out.push(row(
+        "Preview sender displayName",
+        yes_no(
+            state.preview_display_name_available,
+            "available",
+            "unavailable",
+        ),
+    ));
+    out.push(row(
+        "Cached / learned name",
+        yes_no(state.cached_name_available, "available", "unavailable"),
+    ));
+    out.push(row(
+        "Chat::label source",
+        if state.chat_label_source.is_empty() {
+            "unknown"
+        } else {
+            &state.chat_label_source
+        },
+    ));
+    out.push(row(
+        "Rendered list source",
+        if state.list_label_source.is_empty() {
+            "unknown"
+        } else {
+            &state.list_label_source
+        },
+    ));
+    out.push(String::new());
+
+    out.push("Fresh Graph name probes".into());
+    match state.remote.as_ref().map(|remote| &remote.expanded_name) {
+        Some(Ok(probe)) => {
+            out.push(row("Expanded chat probe", "● loaded"));
+            out.push(row(
+                "Expanded roster members",
+                probe.member_count.to_string(),
+            ));
+            out.push(row(
+                "Expanded peer member",
+                yes_no(probe.peer_member_found, "found", "missing"),
+            ));
+            out.push(row(
+                "Expanded member displayName",
+                yes_no(probe.member_display_name, "available", "unavailable"),
+            ));
+            out.push(row(
+                "Expanded member email",
+                yes_no(probe.member_email, "available", "unavailable"),
+            ));
+            out.push(row("Expanded member userId", &probe.member_user_id_shape));
+            out.push(row(
+                "Expanded preview",
+                yes_no(probe.preview_present, "present", "missing"),
+            ));
+            out.push(row(
+                "Expanded preview sender",
+                yes_no(probe.preview_sender_present, "present", "missing"),
+            ));
+            out.push(row(
+                "Expanded sender is peer",
+                yes_no(probe.preview_sender_is_peer, "yes", "no / unknown"),
+            ));
+            out.push(row(
+                "Expanded sender displayName",
+                yes_no(probe.preview_display_name, "available", "unavailable"),
+            ));
+            out.push(row("Expanded sender ID", &probe.preview_sender_id_shape));
+            out.push(row("Expanded sender type", &probe.preview_sender_type));
+        }
+        Some(Err(error)) => out.push(row(
+            "Expanded chat probe",
+            format!("× {}", compact_error(error)),
+        )),
+        None => out.push(row(
+            "Expanded chat probe",
+            if state.loading {
+                "? loading"
+            } else {
+                "? not loaded"
+            },
+        )),
+    }
+
+    match state.remote.as_ref().map(|remote| &remote.members_name) {
+        Some(Ok(probe)) => {
+            out.push(row("Dedicated /members probe", "● loaded"));
+            out.push(row(
+                "/members roster members",
+                probe.member_count.to_string(),
+            ));
+            out.push(row(
+                "/members peer member",
+                yes_no(probe.peer_member_found, "found", "missing"),
+            ));
+            out.push(row(
+                "/members displayName",
+                yes_no(probe.member_display_name, "available", "unavailable"),
+            ));
+            out.push(row(
+                "/members email",
+                yes_no(probe.member_email, "available", "unavailable"),
+            ));
+            out.push(row("/members userId", &probe.member_user_id_shape));
+        }
+        Some(Err(error)) => out.push(row(
+            "Dedicated /members probe",
+            format!("× {}", compact_error(error)),
+        )),
+        None => out.push(row(
+            "Dedicated /members probe",
+            if state.loading {
+                "? loading"
+            } else {
+                "? not loaded"
+            },
+        )),
+    }
+
+    match state.remote.as_ref().map(|remote| &remote.messages_name) {
+        Some(Ok(probe)) => {
+            out.push(row("Recent messages probe", "● loaded"));
+            out.push(row("Messages scanned", probe.messages_scanned.to_string()));
+            out.push(row("Peer messages", probe.peer_messages.to_string()));
+            out.push(row(
+                "Peer messages with displayName",
+                probe.peer_messages_with_display_name.to_string(),
+            ));
+            out.push(row(
+                "Recent peer message",
+                yes_no(probe.peer_message_found, "found", "not found"),
+            ));
+            out.push(row(
+                "Any peer sender displayName",
+                yes_no(probe.sender_display_name, "available", "unavailable"),
+            ));
+            out.push(row("Recent sender ID", &probe.sender_id_shape));
+            out.push(row("Recent sender type", &probe.sender_type));
+        }
+        Some(Err(error)) => out.push(row(
+            "Recent messages probe",
+            format!("× {}", compact_error(error)),
+        )),
+        None => out.push(row(
+            "Recent messages probe",
+            if state.loading {
+                "? loading"
+            } else {
+                "? not loaded"
+            },
+        )),
+    }
     out.push(String::new());
 
     out.push("Presence capability".into());
@@ -612,7 +998,11 @@ pub fn text(app: &App) -> String {
     out.push(String::new());
 
     out.push("Microsoft 365 work settings".into());
-    out.push(row("Local time zone", local_timezone_name()));
+    out.push(row(
+        "Local time zone",
+        crate::out_of_office::local_timezone_name(),
+    ));
+    out.push(row("NTFY mode", ntfy_mode(app.session.config.ntfy)));
     match remote.map(|remote| &remote.work_plan) {
         Some(Ok(plan)) => {
             out.push(row(
@@ -666,24 +1056,20 @@ pub fn text(app: &App) -> String {
         yes_no(app.session.config.presence_read, "enabled", "disabled"),
     ));
     out.push(row(
-        "Presence write",
-        yes_no(
-            app.session.config.can_write_presence(),
-            "enabled",
-            "disabled",
-        ),
+        "Primary presence",
+        yes_no(app.session.config.presence_primary, "enabled", "disabled"),
     ));
     out.push(row(
         "Teams channels",
         yes_no(app.session.config.can_read_teams(), "enabled", "disabled"),
     ));
     out.push(row(
-        "People search",
-        yes_no(
-            app.session.config.can_search_people(),
-            "enabled",
-            "disabled",
-        ),
+        "Teams file images",
+        yes_no(app.session.config.teams_file_images, "enabled", "disabled"),
+    ));
+    out.push(row(
+        "Teams Markdown",
+        yes_no(app.session.config.teams_markdown, "enabled", "disabled"),
     ));
     out.push(row(
         "Profile photos",
@@ -694,20 +1080,12 @@ pub fn text(app: &App) -> String {
         ),
     ));
     out.push(row(
-        "Cache warmup",
-        yes_no(app.session.config.teams_cache_warmup, "enabled", "disabled"),
+        "Directory profile",
+        yes_no(app.session.config.directory_profile, "enabled", "disabled"),
     ));
-    let teams_poll = app.teams_poll_diagnostics();
     out.push(row(
-        "Teams hot poll",
-        format!(
-            "hot {} · warm {} · cool {} · pending {} · {:.1} rps",
-            teams_poll.hot,
-            teams_poll.warm,
-            teams_poll.cool,
-            teams_poll.hot_pending,
-            teams_poll.runtime_budget_rps
-        ),
+        "Out of office",
+        yes_no(app.session.config.out_of_office, "enabled", "disabled"),
     ));
     out.push(String::new());
 
@@ -723,8 +1101,80 @@ pub fn text(app: &App) -> String {
         }
         None => out.push(row("Graph presence", "? not loaded")),
     }
+    let managed = app.presence_state_diagnostics();
+    out.push(row("Presence manager", managed.mode.label()));
+    out.push(row("App session target", managed.desired.label()));
+    out.push(row(
+        "App session confirmed",
+        managed
+            .confirmed
+            .map(|target| target.label())
+            .unwrap_or_else(|| "unknown".into()),
+    ));
+    out.push(row(
+        "Presence write",
+        managed
+            .in_flight
+            .map(|write| write.label())
+            .unwrap_or_else(|| {
+                if managed.retry_waiting {
+                    "retry waiting".into()
+                } else {
+                    "idle".into()
+                }
+            }),
+    ));
     out.push(row("Skype Presence Service", "? not verified"));
     out.push(row("Skype Presence R/W", "? no Skype resource token"));
+
+    let activity = app.presence_activity_diagnostics();
+    out.push(row("Presence activity source", activity.requested));
+    out.push(row(
+        "Activity backend",
+        if activity.degraded {
+            format!("! {}", activity.backend)
+        } else {
+            format!("● {}", activity.backend)
+        },
+    ));
+    out.push(row("Session type", &activity.session_type));
+    out.push(row("Desktop state", activity.state));
+    out.push(row(
+        "Desktop idle",
+        activity
+            .idle_for
+            .map(|idle| format!("{:.1}s", idle.as_secs_f64()))
+            .unwrap_or_else(|| "unknown".into()),
+    ));
+    out.push(row(
+        "Screen locked",
+        match activity.locked {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        },
+    ));
+    out.push(row(
+        "Lock restore",
+        if app.presence_lock_restore_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    ));
+    if let Some(detail) = activity.detail.as_deref() {
+        out.push(row("Activity detail", detail));
+    }
+    out.push(row(
+        "Idle threshold",
+        format!(
+            "{}s",
+            app.session
+                .config
+                .presence_available_timeout_min
+                .saturating_mul(60)
+        ),
+    ));
     out.push(String::new());
 
     out.push("Runtime".into());
@@ -738,14 +1188,45 @@ pub fn text(app: &App) -> String {
     out.push(row(
         "Persistent Teams cache",
         yes_no(
-            app.session.config.teams_image_cache_dir.is_some(),
+            app.session.config.cache_dir.is_some(),
             "enabled",
             "disabled",
         ),
     ));
     out.push(row(
-        "Terminal image protocol",
-        yes_no(app.graphics.is_some(), "available", "unavailable"),
+        "Persistent cache limit",
+        format!("{} MiB", app.session.config.cache_max_mb),
+    ));
+    let teams_poll = app.teams_poll_diagnostics();
+    out.push(row(
+        "Teams hot chats",
+        format!("{} configured", app.session.config.teams_hot_chats),
+    ));
+    out.push(row(
+        "Teams poll budget",
+        format!(
+            "{:.1} rps configured · {:.1} rps runtime",
+            app.session.config.teams_poll_budget_rps, teams_poll.runtime_budget_rps
+        ),
+    ));
+    out.push(row(
+        "Teams poll tiers",
+        format!(
+            "HOT {} · WARM {} · COOL {} · NORMAL {}",
+            teams_poll.hot, teams_poll.warm, teams_poll.cool, teams_poll.normal
+        ),
+    ));
+    out.push(row(
+        "Teams poll work",
+        format!(
+            "{} hot pending · {} foreground · {} reserved",
+            teams_poll.hot_pending, teams_poll.foreground_in_flight, teams_poll.reserved_chats
+        ),
+    ));
+
+    out.push(row(
+        "Kitty image protocol",
+        yes_no(app.kitty_images_available(), "available", "unavailable"),
     ));
     out.push(row(
         "Clipboard helper",

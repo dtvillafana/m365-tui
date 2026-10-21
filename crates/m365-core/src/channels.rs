@@ -1,11 +1,12 @@
 //! Teams team/channel endpoints.
 
+use crate::hosted::{outgoing_payload, update_payload, OutgoingBody};
 use anyhow::Result;
 use serde_json::json;
 
 use crate::graph::GraphClient;
-use crate::hosted::{outgoing_payload, update_payload, OutgoingBody};
 use crate::models::{Channel, ChatMessage, Team};
+use crate::teams_format::outgoing_body;
 
 /// Teams the signed-in user has joined.
 pub async fn joined_teams(graph: &GraphClient) -> Result<Vec<Team>> {
@@ -50,12 +51,20 @@ pub async fn send_reply(
     team_id: &str,
     channel_id: &str,
     message_id: &str,
-    body: OutgoingBody<'_>,
+    text: &str,
+    markdown: bool,
 ) -> Result<ChatMessage> {
+    let body = outgoing_body(text, markdown);
+    let payload = json!({
+        "body": {
+            "contentType": body.content_type,
+            "content": body.content,
+        }
+    });
     graph
         .post_json(
             &format!("teams/{team_id}/channels/{channel_id}/messages/{message_id}/replies"),
-            &outgoing_payload(body),
+            &payload,
         )
         .await
 }
@@ -76,9 +85,73 @@ pub async fn set_reaction(
         .await
 }
 
-/// Replace the body of an existing channel message. Replies use the nested
-/// `/replies/{id}` path; Graph 403s without `ChannelMessage.ReadWrite`.
-pub async fn update_message(
+/// Post a plain-text message to a channel.
+pub async fn send_message(
+    graph: &GraphClient,
+    team_id: &str,
+    channel_id: &str,
+    text: &str,
+    markdown: bool,
+) -> Result<ChatMessage> {
+    let body = outgoing_body(text, markdown);
+    let payload = json!({
+        "body": {
+            "contentType": body.content_type,
+            "content": body.content,
+        }
+    });
+    graph
+        .post_json(
+            &format!("teams/{team_id}/channels/{channel_id}/messages"),
+            &payload,
+        )
+        .await
+}
+
+/// Download one Teams-hosted inline content item from a channel message.
+pub async fn hosted_content_bytes(
+    graph: &GraphClient,
+    team_id: &str,
+    channel_id: &str,
+    message_id: &str,
+    hosted_content_id: &str,
+) -> Result<Vec<u8>> {
+    graph
+        .get_bytes(&format!(
+            "teams/{team_id}/channels/{channel_id}/messages/{message_id}/hostedContents/{hosted_content_id}/$value"
+        ))
+        .await
+}
+
+// Hosted-content variants retain support for inline image composition.
+pub async fn send_message_with_body(
+    graph: &GraphClient,
+    team_id: &str,
+    channel_id: &str,
+    body: OutgoingBody<'_>,
+) -> Result<ChatMessage> {
+    graph
+        .post_json(
+            &format!("teams/{team_id}/channels/{channel_id}/messages"),
+            &outgoing_payload(body),
+        )
+        .await
+}
+pub async fn send_reply_with_body(
+    graph: &GraphClient,
+    team_id: &str,
+    channel_id: &str,
+    message_id: &str,
+    body: OutgoingBody<'_>,
+) -> Result<ChatMessage> {
+    graph
+        .post_json(
+            &format!("teams/{team_id}/channels/{channel_id}/messages/{message_id}/replies"),
+            &outgoing_payload(body),
+        )
+        .await
+}
+pub async fn update_message_with_body(
     graph: &GraphClient,
     team_id: &str,
     channel_id: &str,
@@ -96,19 +169,4 @@ pub async fn update_message(
         ),
     };
     graph.patch(&path, &update_payload(original, body)).await
-}
-
-/// Post a message to a channel — plain text, or HTML with inline images.
-pub async fn send_message(
-    graph: &GraphClient,
-    team_id: &str,
-    channel_id: &str,
-    body: OutgoingBody<'_>,
-) -> Result<ChatMessage> {
-    graph
-        .post_json(
-            &format!("teams/{team_id}/channels/{channel_id}/messages"),
-            &outgoing_payload(body),
-        )
-        .await
 }
