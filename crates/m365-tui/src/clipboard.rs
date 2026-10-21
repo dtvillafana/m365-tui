@@ -63,6 +63,7 @@ type CopyHelper<'a> = (&'static str, &'a str, &'a [&'a str]);
 
 const COPY_HELPERS: &[CopyHelper<'_>] = &[
     ("wl-copy", "wl-copy", &[]),
+    ("pbcopy", "pbcopy", &[]),
     ("xclip", "xclip", &["-selection", "clipboard"]),
     ("xsel", "xsel", &["--clipboard", "--input"]),
 ];

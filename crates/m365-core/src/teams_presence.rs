@@ -127,9 +127,7 @@ where
             }
         }
         Err(error) => ConsentProbe {
-            interactive_consent: DiagnosticStep::Error(explain_resource_error(
-                &error.to_string(),
-            )),
+            interactive_consent: DiagnosticStep::Error(explain_resource_error(&error.to_string())),
             existing_refresh_token: DiagnosticStep::Skipped(
                 "interactive consent did not complete".into(),
             ),
@@ -226,10 +224,7 @@ pub async fn diagnose(
         )
     } else if let Some(address) = lookup_address {
         match lookup_mri(&client, &token, &session, address, prefer_consumer).await {
-            Ok(Some(mri)) => (
-                Some(mri),
-                DiagnosticStep::Ok("user MRI resolved".into()),
-            ),
+            Ok(Some(mri)) => (Some(mri), DiagnosticStep::Ok("user MRI resolved".into())),
             Ok(None) => (
                 None,
                 DiagnosticStep::Error("no unambiguous user MRI returned".into()),
@@ -355,8 +350,7 @@ async fn lookup_mri(
         segments.push(lookup_address);
         segments.push("externalsearchv3");
     }
-    url.query_pairs_mut()
-        .append_pair("includeTFLUsers", "true");
+    url.query_pairs_mut().append_pair("includeTFLUsers", "true");
 
     let response = client
         .get(url)
@@ -470,12 +464,10 @@ fn safe_region(value: &str) -> bool {
 fn safe_presence_host(value: &str) -> bool {
     reqwest::Url::parse(value).ok().is_some_and(|url| {
         url.scheme() == "https"
-            && url
-                .host_str()
-                .is_some_and(|host| {
-                    host.eq_ignore_ascii_case("presence.teams.microsoft.com")
-                        || host.ends_with(".teams.microsoft.com")
-                })
+            && url.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("presence.teams.microsoft.com")
+                    || host.ends_with(".teams.microsoft.com")
+            })
     })
 }
 

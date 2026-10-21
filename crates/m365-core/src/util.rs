@@ -119,6 +119,34 @@ pub fn graph_error_summary(err: &str) -> String {
     flat.chars().take(160).collect()
 }
 
+/// RFC 4648 URL-safe base64 without padding.
+pub fn base64_url_no_pad(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    let mut out = String::with_capacity((input.len() * 4).div_ceil(3));
+    let mut i = 0;
+
+    while i < input.len() {
+        let b0 = input[i];
+        let b1 = input.get(i + 1).copied().unwrap_or(0);
+        let b2 = input.get(i + 2).copied().unwrap_or(0);
+
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+
+        if i + 1 < input.len() {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if i + 2 < input.len() {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        }
+
+        i += 3;
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +197,18 @@ mod tests {
             "a &lt;b&gt; &amp; &quot;c&quot;<br>d"
         );
         assert_eq!(html_escape_attr("a \"b\"\nc"), "a &quot;b&quot; c");
+    }
+}
+
+#[cfg(test)]
+mod base64_url_tests {
+    use super::base64_url_no_pad;
+
+    #[test]
+    fn encodes_without_padding() {
+        assert_eq!(
+            base64_url_no_pad(b"https://example.com/a.jpg"),
+            "aHR0cHM6Ly9leGFtcGxlLmNvbS9hLmpwZw"
+        );
     }
 }

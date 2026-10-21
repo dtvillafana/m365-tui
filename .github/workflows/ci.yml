@@ -1,11 +1,16 @@
 name: ci
 
 # Every push and pull request: the checks that must hold before a tag is worth
-# cutting. The release workflow assumes these already passed.
+# cutting. A versioned release is triggered only when vX.Y.Z points at the exact
+# tested main commit.
 on:
   push:
     branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,3 +50,58 @@ jobs:
 
       - name: Validate the compose file
         run: docker compose -f deploy/docker-compose.yml --profile quick config -q
+
+  release:
+    name: Trigger release
+    needs:
+      - rust
+      - scripts
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve versioned release tag
+        id: release-meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          tag="v${version}"
+
+          if ! git fetch --quiet --force origin "refs/tags/${tag}:refs/tags/${tag}"; then
+            echo "No ${tag} tag exists for ${GITHUB_SHA}; skipping release."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tag_commit="$(git rev-list -n 1 "$tag")"
+          if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+            echo "${tag} points to ${tag_commit}, not ${GITHUB_SHA}; skipping release."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger release workflow
+        if: steps.release-meta.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release-meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f commit_sha="$GITHUB_SHA" \
+            -f release_tag="$RELEASE_TAG"

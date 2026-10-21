@@ -63,8 +63,8 @@ pub struct MailFolder {
     pub unread_item_count: Option<i64>,
     #[serde(default)]
     pub total_item_count: Option<i64>,
-    #[serde(default)]
-    pub child_folder_count: Option<i64>,
+    #[serde(rename = "childFolderCount", default)]
+    pub child_folder_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,7 +106,6 @@ impl MailMessage {
             .as_deref()
             .or(self.sent_date_time.as_deref())
     }
-
     pub fn sender_name(&self) -> String {
         self.from
             .as_ref()
@@ -127,12 +126,38 @@ impl MailMessage {
 // Calendar
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DateTimeTimeZone {
     pub date_time: String,
     #[serde(default)]
     pub time_zone: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomaticRepliesSetting {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_audience: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_start_date_time: Option<DateTimeTimeZone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_end_date_time: Option<DateTimeTimeZone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_reply_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_reply_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailboxSettingsSnapshot {
+    #[serde(default)]
+    pub time_zone: Option<String>,
+    #[serde(default)]
+    pub automatic_replies_setting: AutomaticRepliesSetting,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -219,7 +244,6 @@ pub struct Chat {
     pub members: Vec<ConversationMember>,
     #[serde(default)]
     pub last_message_preview: Option<LastMessagePreview>,
-    /// Signed-in user's view of this chat, including the server archive flag.
     #[serde(default)]
     pub viewpoint: Option<ChatViewpoint>,
 }
@@ -235,25 +259,69 @@ pub struct ChatViewpoint {
 
 impl Chat {
     /// A display label: the explicit topic, else the member names joined.
+    ///
+    /// Federated one-to-one chats can omit `members[].displayName`. In that
+    /// case, prefer the already-expanded last-message sender name before
+    /// falling back to the peer email or the raw chat type.
     pub fn label(&self, me_id: Option<&str>) -> String {
         if let Some(t) = self.topic.as_ref().filter(|t| !t.is_empty()) {
             return t.clone();
         }
+
+        let peer = |member: &&ConversationMember| {
+            me_id
+                .map(|id| member.user_id.as_deref() != Some(id))
+                .unwrap_or(true)
+        };
+
         let names: Vec<String> = self
             .members
             .iter()
-            .filter(|m| {
-                me_id
-                    .map(|id| m.user_id.as_deref() != Some(id))
-                    .unwrap_or(true)
-            })
-            .filter_map(|m| m.display_name.clone())
+            .filter(peer)
+            .filter_map(|m| m.display_name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
             .collect();
-        if names.is_empty() {
-            self.chat_type.clone().unwrap_or_else(|| "chat".into())
-        } else {
-            names.join(", ")
+        if !names.is_empty() {
+            return names.join(", ");
         }
+
+        if self
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+        {
+            if let Some(name) = self
+                .last_message_preview
+                .as_ref()
+                .and_then(|preview| preview.from.as_ref())
+                .and_then(|from| from.user.as_ref())
+                .filter(|user| {
+                    me_id
+                        .map(|id| user.id.as_deref() != Some(id))
+                        .unwrap_or(true)
+                })
+                .and_then(|user| user.display_name.as_deref())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                return name.to_string();
+            }
+
+            if let Some(email) = self
+                .members
+                .iter()
+                .filter(peer)
+                .filter_map(|member| member.email.as_deref())
+                .map(str::trim)
+                .find(|email| !email.is_empty())
+            {
+                return email.to_string();
+            }
+        }
+
+        self.chat_type.clone().unwrap_or_else(|| "chat".into())
     }
 
     /// Directory user id of the other participant in a one-to-one chat.
@@ -265,6 +333,7 @@ impl Chat {
         {
             return None;
         }
+
         self.members
             .iter()
             .filter_map(|member| member.user_id.as_deref())
@@ -356,11 +425,13 @@ pub struct Identity {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
+    #[serde(default)]
+    pub last_edited_date_time: Option<String>,
+    #[serde(default)]
+    pub reply_to_id: Option<String>,
     pub id: String,
     #[serde(default)]
     pub created_date_time: Option<String>,
-    #[serde(default)]
-    pub last_edited_date_time: Option<String>,
     #[serde(default)]
     pub from: Option<IdentitySet>,
     #[serde(default)]
@@ -368,13 +439,14 @@ pub struct ChatMessage {
     #[serde(default)]
     pub message_type: Option<String>,
     /// Raw Microsoft Graph details for a `systemEventMessage`.
+    ///
+    /// Keep this data-form representation in the model/cache and derive the
+    /// human-readable UI text at render time so presentation changes never
+    /// require a cache migration.
     #[serde(default)]
     pub event_detail: Option<serde_json::Value>,
     #[serde(default)]
     pub deleted_date_time: Option<String>,
-    /// Parent message id when this is a channel reply. Unused in chats.
-    #[serde(default)]
-    pub reply_to_id: Option<String>,
     #[serde(default)]
     pub reactions: Vec<MessageReaction>,
     #[serde(default)]
@@ -388,6 +460,101 @@ pub struct ChatMessage {
 pub struct MessageReaction {
     #[serde(default)]
     pub reaction_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemEventClass {
+    Useful,
+    Noise,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemEventDisplay {
+    pub class: SystemEventClass,
+    pub text: String,
+    pub url: Option<String>,
+}
+
+fn event_kind(detail: &serde_json::Value) -> Option<&str> {
+    detail
+        .get("@odata.type")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.rsplit('.').next())
+        .map(|value| value.trim_start_matches('#'))
+}
+
+fn identity_display_name(value: &serde_json::Value) -> Option<String> {
+    for kind in ["user", "application", "device"] {
+        if let Some(name) = value
+            .get(kind)
+            .and_then(|identity| identity.get("displayName"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(name.to_string());
+        }
+    }
+
+    value
+        .get("displayName")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn event_initiator(detail: &serde_json::Value) -> Option<String> {
+    detail.get("initiator").and_then(identity_display_name)
+}
+
+fn event_members(detail: &serde_json::Value) -> Vec<String> {
+    detail
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(identity_display_name)
+        .collect()
+}
+
+fn names_label(names: &[String], singular: &str, plural: &str) -> String {
+    match names {
+        [] => singular.to_string(),
+        [one] => one.clone(),
+        [one, two] => format!("{one} and {two}"),
+        _ => format!("{} {plural}", names.len()),
+    }
+}
+
+fn with_initiator(text: String, detail: &serde_json::Value) -> String {
+    match event_initiator(detail) {
+        Some(name) => format!("{text} (by {name})"),
+        None => text,
+    }
+}
+
+fn system_event_label(kind: &str) -> String {
+    let value = kind
+        .trim_end_matches("EventMessageDetail")
+        .trim_end_matches("MessageDetail");
+    let mut out = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index > 0 && ch.is_uppercase() {
+            out.push(' ');
+        }
+        if index == 0 {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        "System event".to_string()
+    } else {
+        out
+    }
 }
 
 impl ChatMessage {
@@ -409,6 +576,182 @@ impl ChatMessage {
             .as_ref()
             .and_then(|b| b.content.clone())
             .unwrap_or_default()
+    }
+
+    pub fn is_system_event(&self) -> bool {
+        if self
+            .message_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("systemEventMessage"))
+        {
+            return true;
+        }
+
+        // eventDetail is specific to Teams system-event messages and also
+        // covers Graph responses where messageType arrived as unknownFutureValue.
+        if self.event_detail.is_some() {
+            return true;
+        }
+
+        // Old persistent-cache entries written before eventDetail was stored
+        // still carry the Teams marker in the message body.
+        self.body
+            .as_ref()
+            .and_then(|body| body.content.as_deref())
+            .is_some_and(|content| content.to_ascii_lowercase().contains("<systemeventmessage"))
+    }
+
+    /// Classify and humanize a Teams system event without changing the raw
+    /// Graph payload stored in this message.
+    pub fn system_event_display(&self) -> Option<SystemEventDisplay> {
+        if !self.is_system_event() {
+            return None;
+        }
+
+        let Some(detail) = self.event_detail.as_ref() else {
+            return Some(SystemEventDisplay {
+                class: SystemEventClass::Unknown,
+                text: "System event (details not cached)".to_string(),
+                url: None,
+            });
+        };
+
+        let Some(kind) = event_kind(detail) else {
+            return Some(SystemEventDisplay {
+                class: SystemEventClass::Unknown,
+                text: "System event (unknown type)".to_string(),
+                url: None,
+            });
+        };
+
+        let members = event_members(detail);
+        let (class, text, url) = match kind {
+            "callRecordingEventMessageDetail" => {
+                let name = detail
+                    .get("callRecordingDisplayName")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let text = match name {
+                    Some(name) => format!("🎥 Recording available: {name}"),
+                    None => "🎥 Meeting recording available".to_string(),
+                };
+                let url = detail
+                    .get("callRecordingUrl")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                (SystemEventClass::Useful, text, url)
+            }
+            "callTranscriptEventMessageDetail" => (
+                SystemEventClass::Useful,
+                "📝 Meeting transcript available".to_string(),
+                None,
+            ),
+            "chatRenamedEventMessageDetail" => {
+                let name = detail
+                    .get("chatDisplayName")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("(unnamed)");
+                (
+                    SystemEventClass::Useful,
+                    with_initiator(format!("Chat renamed to \"{name}\""), detail),
+                    None,
+                )
+            }
+            "membersAddedEventMessageDetail" => (
+                SystemEventClass::Useful,
+                with_initiator(
+                    format!(
+                        "{} added to the chat",
+                        names_label(&members, "A member was", "members were")
+                    ),
+                    detail,
+                ),
+                None,
+            ),
+            "membersDeletedEventMessageDetail" => (
+                SystemEventClass::Useful,
+                with_initiator(
+                    format!(
+                        "{} removed from the chat",
+                        names_label(&members, "A member was", "members were")
+                    ),
+                    detail,
+                ),
+                None,
+            ),
+            "messagePinnedEventMessageDetail" => (
+                SystemEventClass::Useful,
+                with_initiator("📌 A message was pinned".to_string(), detail),
+                None,
+            ),
+            "messageUnpinnedEventMessageDetail" => (
+                SystemEventClass::Useful,
+                with_initiator("A message was unpinned".to_string(), detail),
+                None,
+            ),
+
+            "callStartedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                with_initiator("Call started".to_string(), detail),
+                None,
+            ),
+            "callEndedEventMessageDetail" => {
+                (SystemEventClass::Noise, "Call ended".to_string(), None)
+            }
+            "membersJoinedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                format!(
+                    "{} joined the chat",
+                    names_label(&members, "A member", "members")
+                ),
+                None,
+            ),
+            "membersLeftEventMessageDetail" => (
+                SystemEventClass::Noise,
+                format!(
+                    "{} left the chat",
+                    names_label(&members, "A member", "members")
+                ),
+                None,
+            ),
+            "meetingPolicyUpdatedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Meeting policy updated".to_string(),
+                None,
+            ),
+            "tabUpdatedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Teams tab updated".to_string(),
+                None,
+            ),
+            "teamsAppInstalledEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Teams app installed".to_string(),
+                None,
+            ),
+            "teamsAppRemovedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Teams app removed".to_string(),
+                None,
+            ),
+            "teamsAppUpgradedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Teams app upgraded".to_string(),
+                None,
+            ),
+            _ => (
+                SystemEventClass::Unknown,
+                format!("System event: {}", system_event_label(kind)),
+                None,
+            ),
+        };
+
+        Some(SystemEventDisplay { class, text, url })
     }
 
     /// A short plain-text excerpt of the body, for quoting.
@@ -485,7 +828,206 @@ impl ChatMessage {
             Some(out)
         }
     }
+}
 
+// ---------------------------------------------------------------------------
+// People & presence
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Person {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub given_name: Option<String>,
+    #[serde(default)]
+    pub surname: Option<String>,
+    #[serde(default)]
+    pub job_title: Option<String>,
+    #[serde(default)]
+    pub company_name: Option<String>,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub office_location: Option<String>,
+    #[serde(default)]
+    pub user_principal_name: Option<String>,
+    #[serde(default)]
+    pub im_address: Option<String>,
+    #[serde(default)]
+    pub phones: Vec<Phone>,
+    #[serde(default)]
+    pub person_type: Option<PersonType>,
+    #[serde(default, rename = "scoredEmailAddresses")]
+    pub scored_email_addresses: Vec<ScoredEmailAddress>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Phone {
+    #[serde(default, rename = "type")]
+    pub phone_type: Option<String>,
+    #[serde(default)]
+    pub number: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonType {
+    #[serde(default)]
+    pub class: Option<String>,
+    #[serde(default)]
+    pub subclass: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoredEmailAddress {
+    #[serde(default)]
+    pub address: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutOfOfficeSettings {
+    #[serde(default)]
+    pub is_out_of_office: Option<bool>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceStatusMessage {
+    #[serde(default)]
+    pub message: Option<ItemBody>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Presence {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub availability: Option<String>,
+    #[serde(default)]
+    pub activity: Option<String>,
+    #[serde(default)]
+    pub out_of_office_settings: Option<OutOfOfficeSettings>,
+    #[serde(default)]
+    pub status_message: Option<PresenceStatusMessage>,
+}
+
+impl Presence {
+    /// User-authored Teams presence status message, if one is currently set.
+    pub fn status_message_text(&self) -> Option<&str> {
+        self.status_message
+            .as_ref()?
+            .message
+            .as_ref()?
+            .content
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+    }
+}
+
+/// A mail attachment. Listing deliberately omits `contentBytes` — those are
+/// fetched separately so a big file isn't pulled just to show its name.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub size: Option<i64>,
+    #[serde(default)]
+    pub is_inline: Option<bool>,
+    #[serde(default)]
+    pub content_id: Option<String>,
+    /// Present when Graph returned the file body (inline image listing).
+    #[serde(default)]
+    pub content_bytes: Option<String>,
+    /// `#microsoft.graph.fileAttachment`, `itemAttachment`, `referenceAttachment`.
+    #[serde(default, rename = "@odata.type")]
+    pub odata_type: Option<String>,
+}
+
+impl Attachment {
+    pub fn display_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| "(unnamed)".into())
+    }
+
+    /// Only file attachments have bytes to download.
+    pub fn is_file(&self) -> bool {
+        self.odata_type
+            .as_deref()
+            .map(|t| t.ends_with("fileAttachment"))
+            .unwrap_or(true)
+    }
+
+    pub fn human_size(&self) -> String {
+        match self.size {
+            Some(b) if b >= 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+            Some(b) if b >= 1024 => format!("{:.0} KB", b as f64 / 1024.0),
+            Some(b) => format!("{b} B"),
+            None => String::new(),
+        }
+    }
+}
+
+/// Something attached to a Teams message: a shared file, or — for a reply —
+/// a `messageReference` pointing at the message being answered.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageAttachment {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub content_url: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// For `messageReference`, a JSON *string* describing the quoted message.
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+/// The message a reply is answering.
+#[derive(Debug, Clone)]
+pub struct QuotedMessage {
+    pub message_id: String,
+    pub author: String,
+    pub preview: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageReference {
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    message_preview: Option<String>,
+    #[serde(default)]
+    message_sender: Option<IdentitySet>,
+}
+
+/// Outbound draft used by the compose views for both mail and Teams messages.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Draft {
+    pub to: Vec<String>,
+    pub subject: String,
+    pub body: String,
+}
+
+impl ChatMessage {
     /// Whether this message has been edited after sending.
     pub fn was_edited(&self) -> bool {
         self.last_edited_date_time
@@ -508,7 +1050,6 @@ impl ChatMessage {
         html_to_editable(&self.text())
     }
 }
-
 /// Convert a Teams HTML body into the plain text a user would retype.
 fn html_to_editable(html: &str) -> String {
     let chars: Vec<char> = html.chars().collect();
@@ -588,148 +1129,90 @@ fn html_to_editable(html: &str) -> String {
         .to_string()
 }
 
-// ---------------------------------------------------------------------------
-// People & presence
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Person {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default, rename = "scoredEmailAddresses")]
-    pub scored_email_addresses: Vec<ScoredEmailAddress>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScoredEmailAddress {
-    #[serde(default)]
-    pub address: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OutOfOfficeSettings {
-    #[serde(default)]
-    pub is_out_of_office: Option<bool>,
-    #[serde(default)]
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Presence {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub availability: Option<String>,
-    #[serde(default)]
-    pub activity: Option<String>,
-    #[serde(default)]
-    pub out_of_office_settings: Option<OutOfOfficeSettings>,
-}
-
-/// A mail attachment. Listing deliberately omits `contentBytes` — those are
-/// fetched separately so a big file isn't pulled just to show its name.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Attachment {
-    pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub content_type: Option<String>,
-    #[serde(default)]
-    pub size: Option<i64>,
-    #[serde(default)]
-    pub is_inline: Option<bool>,
-    #[serde(default)]
-    pub content_id: Option<String>,
-    /// Present when Graph returned the file body (inline image listing).
-    #[serde(default)]
-    pub content_bytes: Option<String>,
-    /// `#microsoft.graph.fileAttachment`, `itemAttachment`, `referenceAttachment`.
-    #[serde(default, rename = "@odata.type")]
-    pub odata_type: Option<String>,
-}
-
-impl Attachment {
-    pub fn display_name(&self) -> String {
-        self.name.clone().unwrap_or_else(|| "(unnamed)".into())
-    }
-
-    /// Only file attachments have bytes to download.
-    pub fn is_file(&self) -> bool {
-        self.odata_type
-            .as_deref()
-            .map(|t| t.ends_with("fileAttachment"))
-            .unwrap_or(true)
-    }
-
-    pub fn human_size(&self) -> String {
-        match self.size {
-            Some(b) if b >= 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
-            Some(b) if b >= 1024 => format!("{:.0} KB", b as f64 / 1024.0),
-            Some(b) => format!("{b} B"),
-            None => String::new(),
-        }
-    }
-}
-
-/// Something attached to a Teams message: a shared file, or — for a reply —
-/// a `messageReference` pointing at the message being answered.
-///
-/// `Serialize` is needed so an edit can send the existing attachments back:
-/// Graph `PATCH` treats omitted fields as cleared, which would drop the quote.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MessageAttachment {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
-    /// For `messageReference`, a JSON *string* describing the quoted message.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-}
-
-/// The message a reply is answering.
-#[derive(Debug, Clone)]
-pub struct QuotedMessage {
-    pub message_id: String,
-    pub author: String,
-    pub preview: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MessageReference {
-    #[serde(default)]
-    message_id: Option<String>,
-    #[serde(default)]
-    message_preview: Option<String>,
-    #[serde(default)]
-    message_sender: Option<IdentitySet>,
-}
-
-/// Outbound draft used by the compose views for both mail and Teams messages.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Draft {
-    pub to: Vec<String>,
-    pub subject: String,
-    pub body: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_on_one_label_uses_last_message_sender_for_federated_peer() {
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat-1",
+            "chatType": "oneOnOne",
+            "members": [
+                {
+                    "userId": "me",
+                    "displayName": "Local User",
+                    "email": "me@example.com"
+                },
+                {
+                    "userId": "external-user"
+                }
+            ],
+            "lastMessagePreview": {
+                "id": "message-1",
+                "from": {
+                    "user": {
+                        "id": "external-user",
+                        "displayName": "External Person"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(chat.label(Some("me")), "External Person");
+    }
+
+    #[test]
+    fn one_on_one_label_does_not_use_own_preview_name() {
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat-2",
+            "chatType": "oneOnOne",
+            "members": [
+                {
+                    "userId": "me",
+                    "displayName": "Local User",
+                    "email": "me@example.com"
+                },
+                {
+                    "userId": "external-user",
+                    "email": "external@example.net"
+                }
+            ],
+            "lastMessagePreview": {
+                "id": "message-2",
+                "from": {
+                    "user": {
+                        "id": "me",
+                        "displayName": "Local User"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(chat.label(Some("me")), "external@example.net");
+    }
+
+    #[test]
+    fn one_on_one_label_keeps_chat_type_as_final_fallback() {
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat-3",
+            "chatType": "oneOnOne",
+            "members": [
+                {
+                    "userId": "me",
+                    "displayName": "Local User"
+                },
+                {
+                    "userId": "external-user"
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(chat.label(Some("me")), "oneOnOne");
+    }
 
     /// The exact shape Graph returns for a reply in a chat.
     fn reply_message() -> ChatMessage {
@@ -770,6 +1253,110 @@ mod tests {
     }
 
     #[test]
+    fn humanizes_useful_system_events() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-1",
+            "messageType": "systemEventMessage",
+            "body": { "contentType": "html", "content": "<systemEventMessage/>" },
+            "eventDetail": {
+                "@odata.type": "#microsoft.graph.callRecordingEventMessageDetail",
+                "callRecordingDisplayName": "Weekly sync.mp4",
+                "callRecordingUrl": "https://example.invalid/recording"
+            }
+        }))
+        .unwrap();
+
+        let display = message.system_event_display().unwrap();
+        assert_eq!(display.class, SystemEventClass::Useful);
+        assert!(display.text.contains("Weekly sync.mp4"));
+        assert_eq!(
+            display.url.as_deref(),
+            Some("https://example.invalid/recording")
+        );
+    }
+
+    #[test]
+    fn classifies_known_noise_and_unknown_system_events() {
+        let noise: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-2",
+            "messageType": "systemEventMessage",
+            "eventDetail": {
+                "@odata.type": "#microsoft.graph.callStartedEventMessageDetail"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            noise.system_event_display().unwrap().class,
+            SystemEventClass::Noise
+        );
+
+        let unknown: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-3",
+            "messageType": "systemEventMessage",
+            "eventDetail": {
+                "@odata.type": "#microsoft.graph.futureImportantEventMessageDetail"
+            }
+        }))
+        .unwrap();
+        let display = unknown.system_event_display().unwrap();
+        assert_eq!(display.class, SystemEventClass::Unknown);
+        assert!(display.text.contains("Future Important"));
+    }
+
+    #[test]
+    fn old_cached_system_event_without_detail_is_unknown() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-old",
+            "messageType": "unknownFutureValue",
+            "body": {
+                "contentType": "html",
+                "content": "<systemEventMessage/>"
+            }
+        }))
+        .unwrap();
+
+        assert!(message.is_system_event());
+        assert_eq!(
+            message.system_event_display().unwrap().class,
+            SystemEventClass::Unknown
+        );
+    }
+
+    #[test]
+    fn event_detail_identifies_system_event_even_with_unknown_message_type() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-future",
+            "messageType": "unknownFutureValue",
+            "body": { "contentType": "html", "content": "" },
+            "eventDetail": {
+                "@odata.type": "#microsoft.graph.callStartedEventMessageDetail"
+            }
+        }))
+        .unwrap();
+
+        assert!(message.is_system_event());
+        assert_eq!(
+            message.system_event_display().unwrap().class,
+            SystemEventClass::Noise
+        );
+    }
+
+    #[test]
+    fn chat_message_round_trips_for_persistent_cache() {
+        let original = reply_message();
+        let encoded = serde_json::to_vec(&original).expect("serialize chat message");
+        let restored: ChatMessage =
+            serde_json::from_slice(&encoded).expect("deserialize chat message");
+
+        assert_eq!(restored.id, original.id);
+        assert_eq!(restored.text(), original.text());
+        assert_eq!(
+            restored.quoted().map(|quote| quote.message_id),
+            original.quoted().map(|quote| quote.message_id)
+        );
+    }
+
+    #[test]
     fn preview_flattens_html_and_bounds_length() {
         let m: ChatMessage = serde_json::from_value(serde_json::json!({
             "id": "1",
@@ -779,7 +1366,6 @@ mod tests {
         assert_eq!(m.text_preview(100), "one two three");
         assert_eq!(m.text_preview(5).chars().count(), 6); // 5 + the ellipsis
     }
-
     #[test]
     fn editable_text_keeps_line_breaks_and_drops_quote_markup() {
         let m = reply_message();
@@ -795,7 +1381,6 @@ mod tests {
         .unwrap();
         assert_eq!(html.editable_text(), "one\ntwo & three\nfour");
     }
-
     #[test]
     fn only_the_author_can_edit_a_live_message() {
         let mut m = reply_message();
@@ -814,7 +1399,6 @@ mod tests {
         m.deleted_date_time = Some("2026-08-04T16:00:00Z".into());
         assert!(!m.can_edit(Some("me")));
     }
-
     #[test]
     fn edited_flag_follows_last_edited_date_time() {
         let mut m = reply_message();

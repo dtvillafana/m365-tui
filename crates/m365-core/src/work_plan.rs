@@ -183,10 +183,7 @@ pub async fn diagnostics(graph: &GraphClient, now: DateTime<Utc>) -> Result<Work
 
     Ok(WorkPlanDiagnostics {
         working_now,
-        recurrences: recurrences
-            .into_iter()
-            .map(summarize_recurrence)
-            .collect(),
+        recurrences: recurrences.into_iter().map(summarize_recurrence).collect(),
     })
 }
 
